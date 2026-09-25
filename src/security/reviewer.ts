@@ -1,0 +1,675 @@
+import { spawn } from "node:child_process"
+import { lstatSync, realpathSync } from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import { fileURLToPath } from "node:url"
+import { STATIC_BYPASS_CATEGORIES } from "../categories"
+
+export type CloudReviewDecision = "ALLOW" | "DENY"
+
+export type CloudReviewResult = {
+  decision: CloudReviewDecision
+  reason: string
+  /** Present only for the strict policy, which performs bypass detection. */
+  bypassing?: boolean
+}
+
+export type PreviousRejectedCommand = {
+  command: string
+  reason: string
+  classifier: "STATIC" | "DYNAMIC" | "FAIL_POLICY"
+}
+
+export type PreviousFailedCommand = {
+  command: string
+  exitCode: number
+  outputTail?: string
+}
+
+export type CloudReviewRequest = {
+  command: string
+  localScripts: Array<{
+    path: string
+    content: string
+    sha256: string
+  }>
+  uninspectedLocalScripts: string[]
+  targetDirectories: Array<{
+    path: string
+    entries: Array<{
+      name: string
+      type: "directory" | "file" | "symlink" | "other"
+    }>
+    truncated: boolean
+  }>
+  uninspectedTargetDirectories: string[]
+  referencedPaths: string[]
+  referencedPathsTruncated: boolean
+  worktree: string
+  cwd: string
+  previousRejectedCommand?: PreviousRejectedCommand
+  previousFailedCommand?: PreviousFailedCommand
+  /** User-armed bypass categories for this session. `dynamic` never reaches
+   * the auditor (the reviewer is skipped); the rest relax the auditor prompt. */
+  userBypass?: string[]
+  /** Environment awareness: OS description and shell path, e.g.
+   * { system: "Ubuntu 24.04 WSL", bash: "/bin/bash" }. */
+  environment?: { system?: string; bash?: string }
+  /** Session rwx ceiling. When `w` is absent the session is read-only and the
+   * auditor system prompt gains the SESSION PERMISSION NOTICE advisory. */
+  permScope?: { r: boolean; w: boolean; x: boolean }
+}
+
+export type ReviewCommandOptions = {
+  endpoint: string
+  model: string
+  apiKey: string
+  maxRounds: number
+  policy: "LOOSE" | "HARD"
+  allowFullReadAccess?: boolean
+  python?: string
+  auditorPath?: string
+  timeout?: number
+  signal?: AbortSignal
+}
+
+type PythonCandidate = {
+  executable: string
+  prefixArgs: string[]
+}
+
+/**
+ * Error thrown when a dynamic review fails. Carries a coarse classification so
+ * callers can distinguish security/protocol violations (fail-close) from
+ * infrastructure failures (honor fail policy). `exitCode` is the auditor
+ * process exit code (when available); `reads`/`transcript` are recovered from
+ * the auditor's structured side-channel on non-zero exit. `code` mirrors the
+ * errno for spawn failures so candidate fallback can still detect ENOENT.
+ */
+export class ReviewError extends Error {
+  kind: "protocol" | "infra"
+  exitCode?: number
+  reads?: Array<{ path: string; size: number }>
+  transcript?: Array<{ role: string; content: string }>
+  code?: string
+  constructor(
+    message: string,
+    kind: "protocol" | "infra",
+    extras?: {
+      exitCode?: number
+      reads?: Array<{ path: string; size: number }>
+      transcript?: Array<{ role: string; content: string }>
+      code?: string
+    },
+  ) {
+    super(message)
+    this.name = "ReviewError"
+    this.kind = kind
+    if (extras) {
+      if (extras.exitCode !== undefined) this.exitCode = extras.exitCode
+      if (extras.reads) this.reads = extras.reads
+      if (extras.transcript) this.transcript = extras.transcript
+      if (extras.code !== undefined) this.code = extras.code
+    }
+  }
+}
+
+const MAX_STDOUT_CHARS = 64_000
+const MAX_STDERR_CHARS = 8_000
+// 256KB preflight budget (≈6.4万 token, 15x余量). Exceeding it is a defensive
+// failure signal (possible injection/DoS attempting to overwhelm the reviewer)
+// and is thrown as a protocol ReviewError so callers fail-close.
+const MAX_REVIEW_INPUT_BYTES = 262_144
+const DEFAULT_TIMEOUT_MS = 30_000
+// The auditor's review deadline sits strictly below the child-process kill
+// for every positive budget (grace shrinks to half the budget under 4 s), so
+// a slow endpoint ends in a clean transport error, not a SIGKILL.
+const HTTP_DEADLINE_GRACE_MS = 2_000
+function pythonDeadlineSeconds(timeoutMs: number): number {
+  const graceMs = Math.min(HTTP_DEADLINE_GRACE_MS, timeoutMs / 2)
+  return Math.max(0.001, (timeoutMs - graceMs) / 1000)
+}
+const ISOLATED_FLAGS = ["-I", "-B"]
+
+function isRegularFile(filePath: string): boolean {
+  try {
+    return lstatSync(filePath).isFile()
+  } catch {
+    return false
+  }
+}
+
+function bundledAuditorPath() {
+  const moduleDirectory = path.dirname(fileURLToPath(import.meta.url))
+  const candidates = [
+    path.join(moduleDirectory, "auditor.py"),
+    path.join(moduleDirectory, "security", "auditor.py"),
+    path.join(moduleDirectory, "..", "src", "security", "auditor.py"),
+  ]
+  // existsSync would accept directories; require a regular file so a stray
+  // directory never gets handed to the Python interpreter.
+  return candidates.find((candidate) => isRegularFile(candidate))
+}
+
+function pythonCandidates(configured?: string): PythonCandidate[] {
+  if (configured) return [{ executable: configured, prefixArgs: [...ISOLATED_FLAGS] }]
+  if (process.platform === "win32") {
+    return [
+      { executable: "python", prefixArgs: [...ISOLATED_FLAGS] },
+      { executable: "py", prefixArgs: ["-3", ...ISOLATED_FLAGS] },
+      { executable: "python3", prefixArgs: [...ISOLATED_FLAGS] },
+    ]
+  }
+  return [
+    { executable: "python3", prefixArgs: [...ISOLATED_FLAGS] },
+    { executable: "python", prefixArgs: [...ISOLATED_FLAGS] },
+  ]
+}
+
+function reviewerEnvironment(options: {
+  endpoint: string
+  model: string
+  apiKey: string
+  maxRounds: number
+  policy: "LOOSE" | "HARD"
+  allowFullReadAccess?: boolean
+  /** Resolved child-process budget; forwarded as the review deadline. */
+  timeoutMs?: number
+}): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = {}
+  // Minimal whitelist: no HOME/USERPROFILE or legacy provider/key/model variables.
+  const names = [
+    "PATH",
+    "Path",
+    "SystemRoot",
+    "SYSTEMROOT",
+    "WINDIR",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+  ]
+  for (const name of names) {
+    if (process.env[name] !== undefined) result[name] = process.env[name]
+  }
+  result.PYTHONIOENCODING = "utf-8"
+  result.PYTHONUTF8 = "1"
+  result.OPENCODE_V2_SECURITY_REVIEW_ENDPOINT = options.endpoint
+  result.OPENCODE_V2_SECURITY_REVIEW_MODEL = options.model
+  result.OPENCODE_V2_SECURITY_REVIEW_API_KEY = options.apiKey
+  result.OPENCODE_V2_SECURITY_REVIEW_MAX_ROUNDS = String(options.maxRounds)
+  result.OPENCODE_V2_SECURITY_REVIEW_POLICY = options.policy
+  result.OPENCODE_V2_SECURITY_REVIEW_FULL_READ = options.allowFullReadAccess === true ? "1" : "0"
+  if (typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0) {
+    result.OPENCODE_V2_SECURITY_REVIEW_DEADLINE_S = String(
+      pythonDeadlineSeconds(options.timeoutMs),
+    )
+  }
+  const tempRoots = [os.tmpdir()]
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA
+    if (localAppData) tempRoots.push(path.join(localAppData, "Temp"))
+  } else if (process.platform === "linux") {
+    tempRoots.push("/tmp")
+  }
+  result.OPENCODE_V2_SECURITY_REVIEW_TEMP_ROOTS = JSON.stringify([...new Set(tempRoots.map((root) => {
+    const resolved = path.resolve(root)
+    try { return realpathSync.native(resolved) } catch { return resolved }
+  }))])
+  return result
+}
+
+// JSON.parse silently keeps the last value for duplicate keys, so the three-field
+// check alone could not detect them. This scanner walks only the top-level object
+// members (string-aware, depth-aware) and returns every member key, letting callers
+// compare the raw count against Object.keys(parsed).length to flag duplicates.
+function collectTopLevelJsonKeys(text: string): string[] | null {
+  const keys: string[] = []
+  let pos = 0
+  const len = text.length
+
+  const skipWs = () => {
+    while (pos < len) {
+      const code = text.charCodeAt(pos)
+      if (code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d) pos++
+      else break
+    }
+  }
+  const readString = (): string => {
+    pos++ // opening quote
+    let result = ""
+    while (pos < len) {
+      const c = text[pos]
+      if (c === "\\") {
+        pos++
+        if (pos >= len) return result
+        const e = text[pos]
+        switch (e) {
+          case '"': result += '"'; break
+          case "\\": result += "\\"; break
+          case "/": result += "/"; break
+          case "b": result += "\b"; break
+          case "f": result += "\f"; break
+          case "n": result += "\n"; break
+          case "r": result += "\r"; break
+          case "t": result += "\t"; break
+          case "u": {
+            const code = parseInt(text.slice(pos + 1, pos + 5), 16)
+            if (Number.isFinite(code)) result += String.fromCharCode(code)
+            pos += 4
+            break
+          }
+          default: result += e
+        }
+        pos++
+      } else if (c === '"') {
+        pos++
+        return result
+      } else {
+        result += c
+        pos++
+      }
+    }
+    return result
+  }
+  const skipValue = () => {
+    skipWs()
+    if (pos >= len) return
+    const c = text[pos]
+    if (c === '"') { readString(); return }
+    if (c === "{" || c === "[") {
+      const close = c === "{" ? "}" : "]"
+      let depth = 0
+      while (pos < len) {
+        const cc = text[pos]
+        if (cc === '"') { readString(); continue }
+        if (cc === "{" || cc === "[") { depth++; pos++; continue }
+        if (cc === "}" || cc === "]") {
+          depth--
+          pos++
+          if (depth === 0 && cc === close) return
+          continue
+        }
+        pos++
+      }
+      return
+    }
+    while (pos < len) {
+      const cc = text[pos]
+      if (cc === "," || cc === "}" || cc === "]" || cc === " " || cc === "\t" || cc === "\n" || cc === "\r") break
+      pos++
+    }
+  }
+
+  skipWs()
+  if (text[pos] !== "{") return null
+  pos++ // consume '{'
+  skipWs()
+  if (text[pos] === "}") { pos++; return keys }
+  while (pos < len) {
+    skipWs()
+    if (text[pos] !== '"') return null
+    keys.push(readString())
+    skipWs()
+    if (text[pos] !== ":") return null
+    pos++ // ':'
+    skipValue()
+    skipWs()
+    if (text[pos] === ",") { pos++; continue }
+    if (text[pos] === "}") { pos++; break }
+    return null
+  }
+  return keys
+}
+
+function parseReviewResult(stdout: string, policy: "LOOSE" | "HARD"): CloudReviewResult {
+  if (policy !== "LOOSE" && policy !== "HARD") throw new Error("Invalid review policy")
+  const trimmed = stdout.trim()
+  const parsed = JSON.parse(trimmed) as Partial<CloudReviewResult>
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("The auditor returned a non-object result")
+  }
+  const rawKeys = collectTopLevelJsonKeys(trimmed)
+  if (rawKeys !== null && rawKeys.length !== Object.keys(parsed).length) {
+    throw new Error("The auditor returned duplicate JSON keys")
+  }
+  const keys = Object.keys(parsed).sort()
+  const expectedKeys = policy === "HARD" ? ["bypassing", "decision", "reason"] : ["decision", "reason"]
+  if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index])) {
+    throw new Error("The auditor returned unexpected fields")
+  }
+  if (!["ALLOW", "DENY"].includes(parsed.decision ?? "")) {
+    throw new Error("The auditor returned an invalid decision")
+  }
+  if (typeof parsed.reason !== "string") {
+    throw new Error("The auditor returned a non-string reason")
+  }
+  if (policy === "HARD" && typeof parsed.bypassing !== "boolean") {
+    throw new Error("The auditor returned a non-boolean bypassing")
+  }
+  const decision = parsed.decision as CloudReviewDecision
+  // ALLOW must carry an empty reason. The strict policy additionally carries
+  // bypassing; the caller decides whether to interrupt. DENY needs a reason.
+  if (decision === "ALLOW" && parsed.reason !== "") {
+    throw new Error("The auditor returned a reason for ALLOW")
+  }
+  if (decision === "DENY" && !parsed.reason.trim()) {
+    throw new Error("The auditor returned an empty reason for DENY")
+  }
+  const result: CloudReviewResult = {
+    decision,
+    reason:
+      decision === "ALLOW" ? "" : parsed.reason.trim().replace(/\s+/g, " ").slice(0, 80),
+  }
+  if (policy === "HARD") result.bypassing = parsed.bypassing
+  return result
+}
+
+// Auditor non-zero exit codes that are infrastructure failures (honor fail
+// policy): 4 = HTTP error, 5 = network error. Every other non-zero exit —
+// including 2 (input validation), 6 (mandatory-inspection violation), 7
+// (generic review exception), unrecognized codes, and signal deaths — defaults
+// to "protocol" so a defensive failure closes the gate rather than letting an
+// ambiguous failure fall through to fail_open.
+const INFRA_EXIT_CODES = new Set([4, 5])
+
+function classifyExitCode(code: number | null): "protocol" | "infra" {
+  if (code !== null && INFRA_EXIT_CODES.has(code)) return "infra"
+  return "protocol"
+}
+
+type AuditorSideChannel = {
+  message?: string
+  reads?: Array<{ path: string; size: number }>
+  transcript?: Array<{ role: string; content: string }>
+}
+
+// On non-zero exit the auditor may write one line of structured JSON to stdout
+// ({"error":{"exit","message"},"reads":[{path,size}],"transcript":[{role,content}],
+// "truncated":bool}). Parse defensively: any missing/malformed field is treated
+// as absent so a half-written side channel never corrupts the error path.
+function parseAuditorSideChannel(stdout: string): AuditorSideChannel | null {
+  const trimmed = stdout.trim()
+  if (!trimmed) return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    // The contract is a single JSON line; if the whole stdout is not JSON, try
+    // the last non-empty line (auditor diagnostics may precede it).
+    const lines = trimmed.split(/\r?\n/).filter((line) => line.trim())
+    const last = lines[lines.length - 1]
+    if (!last) return null
+    try {
+      parsed = JSON.parse(last)
+    } catch {
+      return null
+    }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
+  const obj = parsed as Record<string, unknown>
+  const result: AuditorSideChannel = {}
+  const error = obj.error
+  if (error && typeof error === "object" && !Array.isArray(error)) {
+    const e = error as Record<string, unknown>
+    if (typeof e.message === "string") result.message = e.message
+  }
+  if (Array.isArray(obj.reads)) {
+    const reads: Array<{ path: string; size: number }> = []
+    for (const entry of obj.reads) {
+      if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+        const r = entry as Record<string, unknown>
+        if (typeof r.path === "string" && typeof r.size === "number" && Number.isFinite(r.size)) {
+          reads.push({ path: r.path, size: r.size })
+        }
+      }
+    }
+    if (reads.length) result.reads = reads
+  }
+  if (Array.isArray(obj.transcript)) {
+    const transcript: Array<{ role: string; content: string }> = []
+    for (const entry of obj.transcript) {
+      if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+        const t = entry as Record<string, unknown>
+        if (typeof t.role === "string" && typeof t.content === "string") {
+          transcript.push({ role: t.role, content: t.content })
+        }
+      }
+    }
+    if (transcript.length) result.transcript = transcript
+  }
+  return result
+}
+
+async function runCandidate(
+  candidate: PythonCandidate,
+  auditorPath: string,
+  reviewInput: string,
+  timeoutMs: number,
+  options: {
+    endpoint: string
+    model: string
+    apiKey: string
+    maxRounds: number
+    policy: "LOOSE" | "HARD"
+    signal?: AbortSignal
+  },
+) {
+  return await new Promise<CloudReviewResult>((resolve, reject) => {
+    const child = spawn(candidate.executable, [...candidate.prefixArgs, auditorPath], {
+      env: reviewerEnvironment({ ...options, timeoutMs }),
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+      cwd: path.dirname(auditorPath),
+      shell: false,
+    })
+
+    let stdout = ""
+    let stderr = ""
+    let settled = false
+    let timedOut = false
+    const signal = options.signal
+
+    const finish = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      signal?.removeEventListener("abort", abort)
+      callback()
+    }
+    const abort = () => {
+      child.kill()
+      finish(() => reject(new ReviewError("The auditor was aborted", "infra")))
+    }
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill()
+    }, timeoutMs)
+
+    signal?.addEventListener("abort", abort, { once: true })
+    if (signal?.aborted) {
+      abort()
+      return
+    }
+
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      stdout += chunk.toString()
+      if (stdout.length > MAX_STDOUT_CHARS) {
+        child.kill()
+        finish(() => reject(new ReviewError("The auditor returned too much output", "protocol")))
+      }
+    })
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      stderr = (stderr + chunk.toString()).slice(-MAX_STDERR_CHARS)
+    })
+    child.stdin?.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code !== "EPIPE") {
+        finish(() => reject(new ReviewError(error.message, "infra", { code: error.code })))
+      }
+    })
+    child.stdin?.end(reviewInput)
+    child.once("error", (error: NodeJS.ErrnoException) =>
+      finish(() => reject(new ReviewError(error.message, "infra", { code: error.code }))),
+    )
+    child.once("close", (code: number | null) => {
+      finish(() => {
+        if (timedOut) {
+          reject(new ReviewError(`The auditor timed out after ${timeoutMs}ms`, "infra"))
+          return
+        }
+        if (code !== 0) {
+          const side = parseAuditorSideChannel(stdout)
+          const kind = classifyExitCode(code)
+          const fallback =
+            code === null
+              ? "The auditor was killed by a signal"
+              : `The auditor exited with code ${code}`
+          const detail = side?.message || stderr.trim().replace(/\s+/g, " ").slice(0, 500) || fallback
+          reject(
+            new ReviewError(detail, kind, {
+              exitCode: code === null ? undefined : code,
+              reads: side?.reads,
+              transcript: side?.transcript,
+            }),
+          )
+          return
+        }
+        try {
+          resolve(parseReviewResult(stdout, options.policy))
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          reject(new ReviewError(message, "protocol"))
+        }
+      })
+    })
+  })
+}
+
+function normalizeReviewRequest(request: CloudReviewRequest | string): CloudReviewRequest {
+  if (typeof request === "string") {
+    const cwd = process.cwd()
+    return {
+      command: request,
+      localScripts: [],
+      uninspectedLocalScripts: [],
+      targetDirectories: [],
+      uninspectedTargetDirectories: [],
+      referencedPaths: [],
+      referencedPathsTruncated: false,
+      worktree: cwd,
+      cwd,
+    }
+  }
+  return request
+}
+
+// Categories the auditor accepts in userBypass. `dynamic` is resolved before
+// the auditor runs (the review is skipped entirely), so it never appears here.
+const AUDITOR_BYPASS_CATEGORIES = new Set<string>(STATIC_BYPASS_CATEGORIES)
+
+function requestForPolicy(request: CloudReviewRequest, policy: "LOOSE" | "HARD"): CloudReviewRequest {
+  const legacy = request as CloudReviewRequest & { strictness?: unknown }
+  const {
+    strictness: _ignoredMode,
+    previousRejectedCommand,
+    userBypass,
+    environment,
+    permScope,
+    ...rest
+  } = legacy
+  const normalized: CloudReviewRequest = {
+    ...rest,
+    referencedPaths: Array.isArray(rest.referencedPaths) ? rest.referencedPaths : [],
+    referencedPathsTruncated:
+      typeof rest.referencedPathsTruncated === "boolean" ? rest.referencedPathsTruncated : false,
+  }
+  if (policy === "HARD" && previousRejectedCommand) {
+    normalized.previousRejectedCommand = previousRejectedCommand
+  }
+  if (Array.isArray(userBypass)) {
+    const categories = [...new Set(userBypass.filter((item): item is string => typeof item === "string"))].filter(
+      (item) => AUDITOR_BYPASS_CATEGORIES.has(item),
+    )
+    if (categories.length > 0) normalized.userBypass = categories
+  }
+  if (
+    environment &&
+    typeof environment === "object" &&
+    (typeof environment.system === "string" || typeof environment.bash === "string")
+  ) {
+    normalized.environment = {
+      system: typeof environment.system === "string" ? environment.system.slice(0, 200) : undefined,
+      bash: typeof environment.bash === "string" ? environment.bash.slice(0, 200) : undefined,
+    }
+  }
+  if (permScope && typeof permScope === "object") {
+    const scope = permScope as Record<string, unknown>
+    if (typeof scope.r === "boolean" && typeof scope.w === "boolean" && typeof scope.x === "boolean") {
+      normalized.permScope = { r: scope.r, w: scope.w, x: scope.x }
+    }
+  }
+  return normalized
+}
+
+export async function reviewCommandWithAuditor(
+  request: CloudReviewRequest | string,
+  options: ReviewCommandOptions,
+) {
+  if (!options || typeof options.endpoint !== "string" || !options.endpoint) {
+    throw new Error("reviewCommandWithAuditor requires a valid endpoint")
+  }
+  if (typeof options.model !== "string" || !options.model) {
+    throw new Error("reviewCommandWithAuditor requires a valid model")
+  }
+  if (typeof options.apiKey !== "string" || !options.apiKey) {
+    throw new Error("reviewCommandWithAuditor requires a valid apiKey")
+  }
+  if (typeof options.maxRounds !== "number" || !Number.isInteger(options.maxRounds)) {
+    throw new Error("reviewCommandWithAuditor requires an integer maxRounds")
+  }
+  if (options.policy !== "LOOSE" && options.policy !== "HARD") {
+    throw new Error("reviewCommandWithAuditor requires a valid policy")
+  }
+  const maxRoundsLimit = options.policy === "LOOSE" ? 3 : 5
+  if (options.maxRounds < 1 || options.maxRounds > maxRoundsLimit) {
+    throw new Error(`reviewCommandWithAuditor maxRounds must be between 1 and ${maxRoundsLimit}`)
+  }
+  const routedOptions = { ...options, policy: options.policy }
+
+  const auditorPath = options.auditorPath ?? bundledAuditorPath()
+  if (!auditorPath) {
+    throw new Error("The bundled auditor script could not be found or is not a regular file")
+  }
+  const timeoutMs = options.timeout ?? DEFAULT_TIMEOUT_MS
+  const reviewInput = JSON.stringify(requestForPolicy(normalizeReviewRequest(request), routedOptions.policy))
+  if (Buffer.byteLength(reviewInput, "utf8") > MAX_REVIEW_INPUT_BYTES) {
+    throw new ReviewError("The review input exceeded the safety limit", "protocol")
+  }
+
+  const failures: Error[] = []
+  for (const candidate of pythonCandidates(options.python)) {
+    try {
+      return await runCandidate(candidate, auditorPath, reviewInput, timeoutMs, routedOptions)
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error))
+      failures.push(failure)
+      const code = (failure as NodeJS.ErrnoException).code
+      if (options.python || code !== "ENOENT") throw failure
+    }
+  }
+
+  throw failures.at(-1) ?? new ReviewError("No Python 3 interpreter was found for the auditor", "infra")
+}
+
+/**
+ * @deprecated Use {@link reviewCommandWithAuditor} instead. This alias is kept only
+ * for backwards-compatible imports and will be removed in a future release.
+ */
+export const reviewCommandWithDeepSeek = reviewCommandWithAuditor
+
+export { bundledAuditorPath, normalizeReviewRequest, parseReviewResult, requestForPolicy, reviewerEnvironment }

@@ -1,0 +1,280 @@
+// TUI companion for opencode-v2-security.
+//
+// User-facing half of the notification design: the server plugin cannot
+// publish toasts (its context has only `event.subscribe`), and it must not
+// report state through a session message because every message type is
+// model-visible. Instead the server emits ephemeral RPC events
+// (`src/bypass-rpc.ts`); this companion turns them into toasts and keeps a
+// persistent permission/bypass indicator right above the composer.
+//
+// Still build-free: the TUI host compiles this .tsx at load time (runtime
+// solid transform) and injects its own solid-js/@opentui modules — the same
+// mechanism opencode-tokenwatch's published artifact relies on in production.
+//
+// The RPC events are ephemeral (live-only), so the companion also pulls the
+// full state via the `status` method whenever the visible session changes: a
+// reconnected or freshly mounted TUI can never show a stale ceiling — a
+// stale indicator would be worse than none at all.
+import { createEffect, For, Show } from "solid-js"
+import type { Plugin } from "@opencode-ai/plugin/tui"
+import { BypassRpc, type BypassChangedData, type BypassStatusData } from "./bypass-rpc"
+
+type Context = Plugin.Context
+
+/** Per-session state backing the persistent indicator. */
+type IndicatorState = {
+  /** Effective triple rendered unix-style ("rwx", "r-x", "--x"). */
+  permission: string
+  /** Bypass categories currently in effect (temporary + permanent). */
+  active: string[]
+}
+
+/** Structural slice of the reactive theme the indicator reads (kept loose so
+ * the entrypoint stays free of runtime imports beyond solid-js). */
+type IndicatorTheme = {
+  readonly text: {
+    readonly subdued: string
+    readonly feedback: {
+      readonly success: { readonly subdued: string }
+      readonly warning: { readonly default: string }
+      /** Optional danger/error tokens — the ALL-OFF badge prefers the first
+       * present, falling back to warning.default. */
+      readonly danger?: { readonly default?: string; readonly subdued?: string }
+      readonly error?: { readonly default?: string; readonly subdued?: string }
+    }
+  }
+}
+
+type Segment = { readonly text: string; readonly fg: string }
+
+/** The `all` kill switch rides the same `active` list as a literal "all"
+ * entry (RPC schema is closed, so no separate flag field). */
+function allIsOff(active: readonly string[]): boolean {
+  return active.includes("ALL")
+}
+
+function dangerColor(theme: IndicatorTheme): string {
+  return (
+    theme.text.feedback.danger?.default ??
+    theme.text.feedback.danger?.subdued ??
+    theme.text.feedback.error?.default ??
+    theme.text.feedback.error?.subdued ??
+    theme.text.feedback.warning.default
+  )
+}
+
+/** [RO] light green (success.subdued) · [RW, Bypassing:...] orange
+ * (warning.default) · [ALL OFF] danger/error · plain [RW] subdued.
+ * `permission` keeps the raw triple for anything outside the two named modes.
+ * With the kill switch armed the danger badge REPLACES the bypass label —
+ * individual categories are moot while all enforcement is off. */
+function segmentsFor(state: IndicatorState, theme: IndicatorTheme): Segment[] {
+  const writable = state.permission.includes("w")
+  if (allIsOff(state.active)) {
+    // While the kill switch is armed the badge is just [ALL OFF] — category
+    // and permission detail is moot while every enforcement layer is off.
+    return [{ text: "[ALL OFF]", fg: dangerColor(theme) }]
+  }
+  if (state.active.length > 0) {
+    return [
+      {
+        text: `[${writable ? "RW" : "RO"}, Bypassing:${state.active.join(",")}]`,
+        fg: theme.text.feedback.warning.default,
+      },
+    ]
+  }
+  if (!writable) {
+    return [{ text: state.permission.includes("r") ? "[RO]" : `[${state.permission}]`, fg: theme.text.feedback.success.subdued }]
+  }
+  return [{ text: "[RW]", fg: theme.text.subdued }]
+}
+
+type Toast = { title: string; message: string; variant: "info" | "success" | "warning" | "error"; duration: number }
+
+function toastFor(data: BypassChangedData): Toast {
+  const active = data.active.length > 0 ? data.active.join(", ") : "none"
+  const temporary = data.temporary.length > 0 ? data.temporary.join(", ") : "none"
+  // Kill-switch transitions get their own loud error toast: "armed" with
+  // "ALL" in the active list means every plugin enforcement layer is off.
+  if (allIsOff(data.active) && (data.reason === "armed" || data.reason === "updated")) {
+    return {
+      title: "ALL plugin enforcement OFF",
+      message:
+        "Static/dynamic classification, slow-command checks, injection detection, sandbox wrapping, and permission gates are all disabled for this session. /bypass off restores them.",
+      variant: "error",
+      duration: 10000,
+    }
+  }
+  switch (data.reason) {
+    case "armed":
+      return {
+        title: "Classifier bypass armed",
+        message: `Active: ${active}. Protections relaxed for this session; expires after inactivity. Run /bypass for details.`,
+        variant: "warning",
+        duration: 8000,
+      }
+    case "updated":
+      return {
+        title: "Classifier bypass updated",
+        message: `Active: ${active} (temporary: ${temporary}).`,
+        variant: "warning",
+        duration: 6000,
+      }
+    case "expired":
+      return {
+        title: "Classifier bypass expired",
+        message: "Normal command-safety checks are active again.",
+        variant: "info",
+        duration: 8000,
+      }
+    case "cleared":
+      return {
+        title: "Classifier bypass cleared",
+        message: "Normal command-safety checks are active again.",
+        variant: "info",
+        duration: 6000,
+      }
+    default:
+      return {
+        title: "Classifier bypass status",
+        message: `Active: ${active} (temporary: ${temporary}; permanent: ${data.permanent.length > 0 ? data.permanent.join(", ") : "none"}).`,
+        variant: "info",
+        duration: 6000,
+      }
+  }
+}
+
+const plugin: Plugin.Definition = {
+  id: "opencode-v2-security",
+  setup(context: Context) {
+    const cleanups: Array<() => void> = []
+    const runCleanups = () => {
+      for (const fn of cleanups) fn()
+    }
+
+    const client = context.client as Context["client"] & {
+      rpc?: (definition: unknown) => {
+        events: {
+          on: (name: string, handler: (event: { data: unknown; location?: unknown }) => void) => () => void
+        }
+        status?: (input: { sessionID: string }) => Promise<BypassStatusData>
+      }
+    }
+    if (!client?.rpc) return () => {}
+
+    // The server RPC event is not location-scoped, so a host with several
+    // locations would deliver all of them. Only filter when the reliable
+    // identity (workspaceID) is present on both sides and actually differs;
+    // never drop on a directory spelling/timing mismatch. `context.location`
+    // is a live getter: read it per event, not once at setup.
+    const sameWorkspace = (event: { location?: unknown }) => {
+      const here = context.location as { workspaceID?: string } | undefined
+      const there = event.location as { workspaceID?: string } | undefined
+      return !(
+        here?.workspaceID !== undefined &&
+        there?.workspaceID !== undefined &&
+        here.workspaceID !== there.workspaceID
+      )
+    }
+
+    const rpc = client.rpc(BypassRpc)
+
+    // Bypass category transitions: user toast (unchanged) + indicator store.
+    try {
+      cleanups.push(
+        rpc.events.on("changed", (event) => {
+          try {
+            if (!sameWorkspace(event)) return
+            const data = event.data as BypassChangedData
+            context.ui.toast.show(toastFor(data))
+            if (context.storage?.memory) {
+              const [indicator, mutateIndicator] = context.storage.memory("opencode-v2-security.indicator", {
+                initial: {} as Record<string, IndicatorState>,
+              })
+              mutateIndicator((draft) => {
+                const current = draft[data.sessionID] ?? { permission: "rwx", active: [] }
+                draft[data.sessionID] = { ...current, active: [...data.active] }
+              })
+            }
+          } catch (error) {
+            console.error("[opencode-v2-security] bypass toast failed", error)
+          }
+        }),
+      )
+    } catch (error) {
+      console.error("[opencode-v2-security] bypass notification setup failed", error)
+    }
+
+    // Persistent indicator: ephemeral store keyed by sessionID, fed by the
+    // permission event, bypass events and the status pull below.
+    if (context.storage?.memory && context.ui?.slot) {
+      try {
+        const [indicator, mutateIndicator] = context.storage.memory("opencode-v2-security.indicator", {
+          initial: {} as Record<string, IndicatorState>,
+        })
+        const writeIndicator = (sessionID: string, patch: Partial<IndicatorState>) =>
+          mutateIndicator((draft) => {
+            const current = draft[sessionID] ?? { permission: "rwx", active: [] }
+            draft[sessionID] = { ...current, ...patch }
+          })
+
+        try {
+          cleanups.push(
+            rpc.events.on("permission", (event) => {
+              if (!sameWorkspace(event)) return
+              const data = event.data as { sessionID: string; permission: string }
+              writeIndicator(data.sessionID, { permission: data.permission })
+            }),
+          )
+        } catch (error) {
+          console.error("[opencode-v2-security] permission indicator setup failed", error)
+        }
+
+        // Late attach / session switch: pull the full state so the indicator
+        // can never be stale. Older hosts without RPC methods degrade to
+        // event-only updates.
+        const pullStatus = async (sessionID: string) => {
+          try {
+            const data = await rpc.status?.({ sessionID })
+            if (data) {
+              writeIndicator(data.sessionID, {
+                permission: data.permission,
+                active: [...data.active],
+              })
+            }
+          } catch {
+            /* event-only fallback */
+          }
+        }
+
+        cleanups.push(
+          context.ui.slot({
+            append: "session.composer.top",
+            render: (input: { sessionID: string }) => {
+              // input is reactive (host merges getters): reading it here
+              // re-pulls on every session switch.
+              createEffect(() => void pullStatus(input.sessionID))
+              return (
+                <Show when={indicator[input.sessionID]}>
+                  {(state) => (
+                    <box flexDirection="row" paddingX={1}>
+                      <For each={segmentsFor(state(), context.theme as unknown as IndicatorTheme)}>
+                        {(segment) => <text fg={segment.fg}>{segment.text}</text>}
+                      </For>
+                    </box>
+                  )}
+                </Show>
+              )
+            },
+          }),
+        )
+      } catch (error) {
+        console.error("[opencode-v2-security] indicator slot failed", error)
+      }
+    }
+
+    return runCleanups
+  },
+}
+
+export default plugin

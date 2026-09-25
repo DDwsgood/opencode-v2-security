@@ -1,0 +1,59 @@
+{
+  "name": "opencode-v2-security",
+  "version": "1.0.0",
+  "description": "Execution-boundary security plugin for OpenCode (v2 plugin API): static + dynamic shell-command classification, bypass leases, and a session read/write permission ceiling.",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DDwsgood/opencode-v2-security.git"
+  },
+  "main": "./src/index.ts",
+  "exports": {
+    ".": {
+      "import": "./src/index.ts",
+      "types": "./src/index.ts"
+    },
+    "./tui": {
+      "import": "./src/tui.tsx",
+      "types": "./src/tui.tsx"
+    }
+  },
+  "files": [
+    "index.ts",
+    "tui.ts",
+    "src",
+    "!src/**/__pycache__",
+    "!src/**/*.pyc",
+    "bin",
+    "native/linux-sandbox",
+    "native/windows-bash-supervisor/README.md",
+    "native/windows-bash-supervisor/Cargo.toml",
+    "native/windows-bash-supervisor/Cargo.lock",
+    "native/windows-bash-supervisor/src/main.rs",
+    "native/windows-bash-supervisor/target/release/bash.exe",
+    "native/windows-bash-supervisor/target/release/opencode-bash-supervisor.exe"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "opencode-v2",
+    "opencode-v2-security",
+    "security",
+    "permissions",
+    "sandbox",
+    "landlock",
+    "bash",
+    "shell",
+    "command-classifier",
+    "llm-reviewer",
+    "openai-compatible"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "next",
+    "effect": ">=4.0.0-beta.83 <4.0.0"
+  }
+}

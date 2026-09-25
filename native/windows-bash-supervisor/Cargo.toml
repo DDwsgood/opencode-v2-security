@@ -1,0 +1,11 @@
+[package]
+name = "opencode-bash-supervisor"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+
+[[bin]]
+name = "bash"
+path = "src/main.rs"

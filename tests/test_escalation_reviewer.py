@@ -1,0 +1,185 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+
+SCRIPT = Path(__file__).parents[1] / "src" / "security" / "escalation-reviewer.py"
+SPEC = importlib.util.spec_from_file_location("escalation_reviewer_under_test", SCRIPT)
+assert SPEC is not None and SPEC.loader is not None
+reviewer = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(reviewer)
+
+
+def sample_request() -> dict:
+    return {
+        "command": "sudo apt-get install curl",
+        "categories": ["privilege", "host", "sandbox"],
+        "justification": "install the missing dependency",
+        "currentUserInput": "Test the service at https://example.test",
+        "recentContext": [
+            {"role": "user", "text": "Please test the service."},
+            {"role": "assistant", "text": "curl is missing."},
+        ],
+        "permScope": {"r": True, "w": True, "x": True},
+        "previousFailedEscalations": [
+            {
+                "command": "sudo apt-get install curl",
+                "categories": ["privilege", "host"],
+                "justification": "first attempt",
+                "decision": "deny",
+            }
+        ],
+    }
+
+
+class PayloadHandler(BaseHTTPRequestHandler):
+    payload: dict | None = None
+    auth: str | None = None
+    user_agent: str | None = None
+
+    def do_POST(self) -> None:  # noqa: N802
+        self.__class__.payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.__class__.auth = self.headers.get("Authorization")
+        self.__class__.user_agent = self.headers.get("User-Agent")
+        response = json.dumps(
+            {"choices": [{"message": {"content": "<think>internal</think>allow_once"}}]}
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+class EscalationReviewerTests(unittest.TestCase):
+    def test_schema_rejects_duplicate_extra_wildcard_and_large_context(self) -> None:
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            reviewer.parse_json_strict('{"command":"x","command":"y"}')
+
+        extra = sample_request()
+        extra["unexpected"] = True
+        with self.assertRaisesRegex(ValueError, "unexpected"):
+            reviewer.validate_request(extra)
+
+        for category in ("all", "ALL", "*", "All"):
+            bad = sample_request()
+            bad["categories"] = [category]
+            with self.assertRaisesRegex(ValueError, "forbidden"):
+                reviewer.validate_request(bad)
+
+        unknown = sample_request()
+        unknown["categories"] = ["os"]
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            reviewer.validate_request(unknown)
+
+        # Every whitelisted category validates, including the new `privilege`.
+        for category in reviewer.ALLOWED_CATEGORIES:
+            ok = sample_request()
+            ok["categories"] = [category]
+            reviewer.validate_request(ok)
+        self.assertIn("privilege", reviewer.ALLOWED_CATEGORIES)
+
+        too_many = sample_request()
+        too_many["recentContext"] = [
+            {"role": "user", "text": "x"} for _ in range(reviewer.MAX_CONTEXT_MESSAGES + 1)
+        ]
+        with self.assertRaisesRegex(ValueError, "too many"):
+            reviewer.validate_request(too_many)
+
+    def test_prompt_contains_goal_and_marks_all_text_as_untrusted(self) -> None:
+        system, prompt = reviewer.build_prompt(sample_request())
+        self.assertIn("untrusted", system.lower())
+        self.assertIn("safety floors", system)
+        self.assertIn("Test the service", prompt)
+        self.assertIn("sudo apt-get install curl", prompt)
+        self.assertIn("[untrusted data]", prompt)
+        self.assertIn("[untrusted data: command issued by the agent]", prompt)
+        self.assertNotIn("[untrusted user data]", prompt)
+        self.assertIn("Explicit current user input", prompt)
+        # The reviewed command is agent-issued, not user-typed.
+        self.assertIn(
+            "Requested command:\n\n<data>\n[untrusted data: command issued by the agent]\nsudo apt-get install curl\n</data>",
+            prompt,
+        )
+        # System prompt: aligned floor, allow_once ceiling, failed-decision scope.
+        self.assertIn("never raises the session's read/write/execute permission ceiling", system)
+        self.assertIn("permScope.w is false, return ask_user", system)
+        self.assertIn("previousFailedEscalations lists only ask_user and deny outcomes", system)
+        self.assertIn("legitimate user request, including the reasonable steps that request implies", system)
+        self.assertNotIn("literal shell escape", system)
+        self.assertNotIn("explicit user request", system)
+        self.assertIn("first attempt", prompt)
+        self.assertIn("role=user", prompt)
+
+    def test_payload_is_thinking_enabled_without_temperature_or_json_mode(self) -> None:
+        payload = reviewer.build_payload(sample_request(), "test-model")
+        # Thinking/reasoning models commonly reject these two knobs, so the
+        # escalation payload must not send either of them.
+        self.assertNotIn("temperature", payload)
+        self.assertNotIn("response_format", payload)
+        self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": True})
+        self.assertEqual(payload["max_tokens"], 4096)
+        self.assertEqual(payload["stream"], False)
+        self.assertEqual(payload["model"], "test-model")
+        self.assertEqual([message["role"] for message in payload["messages"]], ["system", "user"])
+        # Keep the wire payload minimal: no accidental provider-specific extras.
+        self.assertEqual(
+            set(payload),
+            {"model", "messages", "max_tokens", "stream", "chat_template_kwargs"},
+        )
+        # The system prompt must demand exactly one plain decision word, never JSON.
+        self.assertIn("Return exactly one final assistant content word", payload["messages"][0]["content"])
+
+    def test_decision_parser_is_strict(self) -> None:
+        self.assertEqual(reviewer.parse_decision("allow_once"), "allow_once")
+        self.assertEqual(reviewer.parse_decision(" <think>reason</think>\n deny "), "deny")
+        for content in (
+            "allow_once because",
+            "```deny```",
+            "allow_once deny",
+            "<think>one</think><think>two</think>deny",
+            "<thinking>reason</thinking>deny",
+            "unknown",
+        ):
+            with self.assertRaises(ValueError):
+                reviewer.parse_decision(content)
+
+    def test_openai_payload_headers_and_chat_path(self) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), PayloadHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            review = reviewer.validate_request(sample_request())
+            payload = reviewer.build_payload(review, "test-model")
+            content = reviewer.post_chat(
+                payload,
+                f"http://127.0.0.1:{server.server_port}/v1",
+                "secret-test-key",
+            )
+            self.assertEqual(content, "<think>internal</think>allow_once")
+            self.assertEqual(PayloadHandler.auth, "Bearer secret-test-key")
+            self.assertEqual(PayloadHandler.user_agent, reviewer.USER_AGENT)
+            self.assertIsNotNone(PayloadHandler.payload)
+            assert PayloadHandler.payload is not None
+            self.assertNotIn("response_format", PayloadHandler.payload)
+            self.assertNotIn("temperature", PayloadHandler.payload)
+            self.assertEqual(
+                PayloadHandler.payload["chat_template_kwargs"], {"enable_thinking": True}
+            )
+            self.assertEqual(PayloadHandler.payload["max_tokens"], 4096)
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+
+
+if __name__ == "__main__":
+    unittest.main()

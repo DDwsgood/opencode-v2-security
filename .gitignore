@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build output
+**/target/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Secrets — never commit API keys
+.env
+.env.local
+.env.*.local
+
+# Local reviewer fallback config (contains personal endpoint)
+config.json
+
+# opencode local state
+.opencode/
+
+# Local backups
+.backup/
+
+# IDEs / OS
+.idea
+.vscode
+.DS_Store
+Thumbs.db
+DESIGN-PHILOSOPHY.md
