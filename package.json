@@ -1,6 +1,6 @@
 {
   "name": "opencode-v2-security",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Execution-boundary security plugin for OpenCode (v2 plugin API): static + dynamic shell-command classification, bypass leases, and a session read/write permission ceiling.",
   "type": "module",
   "repository": {
@@ -54,6 +54,8 @@
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "next",
+    "@opentui/solid": ">=0.5.8 <0.6.0",
+    "solid-js": ">=1.9.12 <2.0.0",
     "effect": ">=4.0.0-beta.83 <4.0.0"
   }
 }

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.1 (2026-09-25)
+
+- Fix published CLI/TUI loading by declaring the Solid and OpenTUI JSX runtime
+  peer dependencies required by `src/tui.tsx`.
+
 ## 1.0.0 (2026-09-25)
 
 - Security (round 3): shell comments are now part of the lexical split — an

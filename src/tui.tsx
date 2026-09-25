@@ -8,8 +8,8 @@
 // persistent permission/bypass indicator right above the composer.
 //
 // Still build-free: the TUI host compiles this .tsx at load time (runtime
-// solid transform) and injects its own solid-js/@opentui modules — the same
-// mechanism opencode-tokenwatch's published artifact relies on in production.
+// solid transform). The published package declares the Solid/OpenTUI runtime
+// as peers so the npm loader installs them alongside this plugin.
 //
 // The RPC events are ephemeral (live-only), so the companion also pulls the
 // full state via the `status` method whenever the visible session changes: a
