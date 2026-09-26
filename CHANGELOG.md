@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.2 (2026-09-26)
+
+- Fix TUI bypass and permission indicators: fetch status from the session's
+  location and ignore replies older than a later event or status request.
+- Include the one-per-context-cycle escalation format guide in both OS-privilege
+  policy refusals. Slow-command and terminal refusals remain unchanged.
+
 ## 1.0.1 (2026-09-25)
 
 - Fix published CLI/TUI loading by declaring the Solid and OpenTUI JSX runtime

@@ -2232,7 +2232,8 @@ const plugin: Plugin = {
               `bypassed for this call, so the OS sandbox's no_new_privs floor would make the privilege step ` +
               `fail silently at runtime — the command was not run. Ask the user to arm the privilege bypass ` +
               `category (/bypass privilege)${escalationRoute} ` +
-              `(a rw profile host-direct route also requires sandbox.allowSudo).`,
+              `(a rw profile host-direct route also requires sandbox.allowSudo).` +
+              `${claimEscalationGuidance(sessionID)}`,
           )
         }
         if (callSandboxProfile === "ro") {
@@ -2244,7 +2245,8 @@ const plugin: Plugin = {
               `for this call, but this call's OS sandbox profile is read-only and cannot run it host-direct — the ` +
               `sandbox's no_new_privs floor would make the privilege step fail silently at runtime, so the command ` +
               `was not run. Ask the user to arm the sandbox bypass category (/bypass sandbox), ${escalationRoute}` +
-              `or to enable sandbox.allowSudo in the plugin config for read-write sessions.`,
+              `or to enable sandbox.allowSudo in the plugin config for read-write sessions.` +
+              `${claimEscalationGuidance(sessionID)}`,
           )
         }
       }

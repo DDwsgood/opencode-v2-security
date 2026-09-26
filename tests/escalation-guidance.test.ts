@@ -282,6 +282,57 @@ describe("full escalation guidance: once per session per context cycle", () => {
   })
 })
 
+describe("OS-privilege policy blocks carry escalation guidance", () => {
+  // A privilege-needing command under a non-full, non-allowSudo profile is
+  // blocked by the policy classifier before the reviewer is ever reached.
+  // Both refusal shapes name escalation inline, so they must also carry the
+  // one-per-cycle format guide like every other classifier block.
+  const PRIVILEGED = "sudo systemctl restart nginx"
+
+  test("missing privilege category: first block carries the full guide, later blocks stay short", async () => {
+    const h = await startPlugin({ sandbox: { enabled: true } })
+    const first = await runBefore(h, "s1", PRIVILEGED)
+    expect(first).toContain("Blocked by policy classifier")
+    expect(first).toContain("privilege category is not")
+    expect(first).toContain("/bypass privilege")
+    expect(first).toContain("escalating this command")
+    expect(hasFullGuide(first)).toBe(true)
+    expect(first).toContain("privilege (crossing permission or isolation boundaries")
+
+    // The slot was consumed: a later classifier block in the same cycle keeps
+    // only the short suffix.
+    expect(isShortBlock(await runBefore(h, "s1", DENY_A))).toBe(true)
+  })
+
+  test("ro profile with privilege armed: the first block carries the full guide", async () => {
+    const h = await startPlugin({ sandbox: { enabled: true, mode: "ro" } })
+    await invoke(h, "bypass", "s1", "host privilege")
+    const blocked = await runBefore(h, "s1", PRIVILEGED)
+    expect(blocked).toContain("Blocked by policy classifier")
+    expect(blocked).toContain("cannot run it host-direct")
+    expect(blocked).toContain("/bypass sandbox")
+    expect(blocked).toContain("include the sandbox category when escalating privileged commands")
+    expect(hasFullGuide(blocked)).toBe(true)
+
+    expect(isShortBlock(await runBefore(h, "s1", DENY_A))).toBe(true)
+  })
+
+  test("escalationEnabled: false keeps both blocks free of the escalation format guide", async () => {
+    const h = await startPlugin({ sandbox: { enabled: true }, escalationEnabled: false })
+    const missing = await runBefore(h, "s1", PRIVILEGED)
+    expect(missing).toContain("privilege category is not")
+    expect(missing).not.toContain(ESCALATION_MARKER)
+    expect(missing).not.toContain("escalating")
+
+    const ro = await startPlugin({ sandbox: { enabled: true, mode: "ro" }, escalationEnabled: false })
+    await invoke(ro, "bypass", "s1", "host privilege")
+    const blocked = await runBefore(ro, "s1", PRIVILEGED)
+    expect(blocked).toContain("cannot run it host-direct")
+    expect(blocked).not.toContain(ESCALATION_MARKER)
+    expect(blocked).not.toContain("escalating")
+  })
+})
+
 describe("permission.write hard refuse", () => {
   // `bash -c` under an RO session is an unconditional permission.write static
   // deny (see tests/static-regressions.test.ts execution-channel matrix).
