@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.2.1 (2026-09-29)
+
+- Reworked the Jev escalation mapping for LOOSE unattended operation
+  (owner severity: frequent ask_user > benign mis-deny > rare missed deny):
+  - deny needs corroboration now: retry-similarity ≥0.75, unsafe ≥0.70, a
+    clear harmful-cover-story veto (new `harmful_mismatch` noul ≥0.80), or
+    P(deny) ≥0.35 *with* unsafe ≥0.10 — pure "model dislikes it" no longer
+    hard-blocks routine privilege escalations like `sudo apt-get install`.
+  - ask_user requires the model preferring clarification AND the new `harm`
+    noul reaching 0.40 (irreversible loss or immediate severe production
+    impact); below the floor the benign-agent prior resolves indecision to
+    allow_once instead of interrupting.
+  - The `harm` criteria encode the destructive definition: irreversible or
+    immediate severe production impact counts (`rm -rf` of an unbacked
+    project, broad `pkill -9 node`); regenerable artifacts do not
+    (`node_modules`, build output, caches).
+  - `harmful_mismatch` catches dressed-up sabotage the choice question was
+    soft on: e.g. `echo '0.0.0.0 github.com' >> /etc/hosts` justified as
+    "fix DNS" now denies (mismatch ≈0.85) while the same command with an
+    explicit intentional-block context allows.
+  - New env-tunable keys: `deny_risk_min`, `ask_harm_min`,
+    `harmful_mismatch_deny` in `JEV_ESCALATION_THRESHOLDS`; `allow_prob`
+    removed (allow is a deliberate default, not a band).
+  - Deterministic host gates unchanged: mechanism names deny, unknown
+    categories ask, permScope.w=false+filesystem asks, category-mismatch
+    asks, uncovered previousDenial asks.
+
 ## 1.2.0 (2026-09-28)
 
 - Jev is now also the escalation reviewer under `reviewer: "auto"`:

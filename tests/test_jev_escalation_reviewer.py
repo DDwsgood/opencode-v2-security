@@ -32,20 +32,25 @@ def sample_request() -> dict:
 
 def answers(decision: str = "allow_once", p_deny: float = 0.05,
             unsafe: float = 0.05, necessity: float = 0.9,
-            retry: float | None = None, p_allow: float | None = None) -> dict:
-    allow = p_allow if p_allow is not None else 1.0 - p_deny - 0.02
+            retry: float | None = None, p_allow: float | None = None,
+            p_ask: float | None = None, harm: float = 0.1,
+            mismatch: float = 0.0) -> dict:
+    allow = p_allow if p_allow is not None else 1.0 - p_deny - (p_ask if p_ask is not None else 0.02)
+    ask = p_ask if p_ask is not None else max(0.0, 1.0 - p_deny - allow)
     result = {
         "decision": {
             "type": "choice",
             "choice": decision,
             "probabilities": {
                 "allow_once": allow,
-                "ask_user": max(0.0, 1.0 - p_deny - allow),
+                "ask_user": ask,
                 "deny": p_deny,
             },
         },
         "necessity": {"type": "noul", "noul": necessity},
         "unsafe": {"type": "noul", "noul": unsafe},
+        "harm": {"type": "noul", "noul": harm},
+        "harmful_mismatch": {"type": "noul", "noul": mismatch},
     }
     if retry is not None:
         result["retry_similarity"] = {"type": "noul", "noul": retry}
@@ -147,24 +152,40 @@ class DecideMappingTests(unittest.TestCase):
             reviewer.decide(sample_request(), answers()), "allow_once"
         )
 
-    def test_deny_on_choice_or_deny_probability(self) -> None:
+    def test_deny_on_corroborated_deny_band(self) -> None:
         self.assertEqual(
-            reviewer.decide(sample_request(), answers(decision="deny", p_deny=0.9)),
+            reviewer.decide(sample_request(), answers(decision="deny", p_deny=0.9, unsafe=0.3)),
             "deny",
         )
-        # p_deny above the 0.15 floor denies even when argmax picked allow_once.
+        # P(deny) >= 0.35 denies only with a minimum unsafe corroboration —
+        # pure policy/necessity disagreement under zero risk stays allowed.
         self.assertEqual(
-            reviewer.decide(sample_request(), answers(decision="allow_once", p_deny=0.25)),
+            reviewer.decide(sample_request(), answers(decision="allow_once", p_deny=0.4, unsafe=0.2)),
             "deny",
         )
         self.assertEqual(
-            reviewer.decide(sample_request(), answers(decision="allow_once", p_deny=0.15)),
-            "deny",
+            reviewer.decide(sample_request(), answers(decision="deny", p_deny=0.4, unsafe=0.05)),
+            "allow_once",
+        )
+        # Below the floor, deny never fires even with corroboration.
+        self.assertEqual(
+            reviewer.decide(sample_request(), answers(decision="allow_once", p_deny=0.3, unsafe=0.5)),
+            "allow_once",
         )
 
     def test_unsafe_veto(self) -> None:
         self.assertEqual(
             reviewer.decide(sample_request(), answers(unsafe=0.9)), "deny"
+        )
+
+    def test_harmful_mismatch_veto(self) -> None:
+        # A clear harmful cover story denies even with deny probability low.
+        self.assertEqual(
+            reviewer.decide(sample_request(), answers(mismatch=0.85)), "deny"
+        )
+        # Concerning-but-ambiguous discrepancy does not veto on its own.
+        self.assertEqual(
+            reviewer.decide(sample_request(), answers(mismatch=0.5)), "allow_once"
         )
 
     def test_retry_similarity_veto(self) -> None:
@@ -176,25 +197,36 @@ class DecideMappingTests(unittest.TestCase):
         )
 
     def test_ask_user_paths(self) -> None:
-        # decision=ask_user with deny mass under the floor and weak allow
-        # mass lands in the middle band -> ask_user.
-        self.assertEqual(
-            reviewer.decide(sample_request(), answers(decision="ask_user", p_allow=0.2)),
-            "ask_user",
-        )
-        # allow_once argmax but allow mass below the 0.30 band -> ask_user.
+        # ask_user fires only when the model prefers clarification AND the
+        # harm floor is met.
         self.assertEqual(
             reviewer.decide(
-                sample_request(), answers(decision="allow_once", p_deny=0.10, p_allow=0.25)
+                sample_request(), answers(decision="ask_user", p_deny=0.2, p_allow=0.2, harm=0.5)
             ),
             "ask_user",
         )
-        # allow mass at/above the band -> allow_once.
+        # Model prefers ask but harm is low: benign prior resolves to allow.
         self.assertEqual(
             reviewer.decide(
-                sample_request(), answers(decision="allow_once", p_deny=0.10, p_allow=0.6)
+                sample_request(), answers(decision="ask_user", p_deny=0.2, p_allow=0.2, harm=0.3)
             ),
             "allow_once",
+        )
+        # High harm but allow is the model's top pick: still allow.
+        self.assertEqual(
+            reviewer.decide(
+                sample_request(), answers(decision="allow_once", p_deny=0.2, p_ask=0.3, harm=0.6)
+            ),
+            "allow_once",
+        )
+        # Deny-vs-ask tie at the deny floor denies (deny checked first).
+        self.assertEqual(
+            reviewer.decide(
+                sample_request(),
+                answers(decision="deny", p_deny=0.48, p_ask=0.48, p_allow=0.04,
+                        unsafe=0.5, harm=0.5),
+            ),
+            "deny",
         )
 
 
@@ -238,6 +270,17 @@ class ProtocolTests(unittest.TestCase):
                                       "probabilities": {"deny": 0.0}},
                          "necessity": {"type": "noul", "noul": 7.5},
                          "unsafe": {"type": "noul", "noul": 0.5}}},
+            # Harm/mismatch scores are mandatory — a response from an older
+            # question set fails closed rather than silently allowing.
+            {"answers": {"decision": {"type": "choice", "choice": "allow_once",
+                                      "probabilities": {"allow_once": 0.9, "ask_user": 0.1, "deny": 0.0}},
+                         "necessity": {"type": "noul", "noul": 0.9},
+                         "unsafe": {"type": "noul", "noul": 0.1}}},
+            {"answers": {"decision": {"type": "choice", "choice": "allow_once",
+                                      "probabilities": {"allow_once": 0.9, "ask_user": 0.1, "deny": 0.0}},
+                         "necessity": {"type": "noul", "noul": 0.9},
+                         "unsafe": {"type": "noul", "noul": 0.1},
+                         "harm": {"type": "noul", "noul": 0.1}}},
         ):
             code, out = self._run_main(sample_request(), bad)
             self.assertEqual(code, 6, f"{bad!r} -> stdout {out!r}")
