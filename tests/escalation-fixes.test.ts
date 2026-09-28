@@ -489,9 +489,9 @@ describe("E4: the reviewer prompt carries category semantics", () => {
     expect(mock.requests).toHaveLength(1)
     const messages = mock.requests[0].body.messages as Array<{ role?: string; content?: unknown }>
     const system = String(messages.find((m) => m.role === "system")?.content ?? "")
-    expect(system).toContain("filesystem = local file changes")
-    expect(system).toContain("privilege = crossing permission or isolation boundaries")
-    expect(system).toContain("sandbox = remove the OS sandbox")
+    expect(system).toContain("filesystem: creating, modifying, deleting")
+    expect(system).toContain("privilege: crossing permission or isolation boundaries")
+    expect(system).toContain("sandbox: remove the OS sandbox")
     // dynamic/slow are no longer grantable — the prompt must not offer them.
     expect(system).not.toContain("the dynamic reviewer, the OS sandbox, slow-command checks")
   })

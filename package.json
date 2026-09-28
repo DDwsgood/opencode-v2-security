@@ -1,6 +1,6 @@
 {
   "name": "opencode-v2-security",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Execution-boundary security plugin for OpenCode (v2 plugin API): static + dynamic shell-command classification, bypass leases, and a session read/write permission ceiling.",
   "type": "module",
   "repository": {

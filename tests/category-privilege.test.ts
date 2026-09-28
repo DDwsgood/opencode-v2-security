@@ -403,7 +403,7 @@ describe("privilege in the effective bypass set routes the call host-direct", ()
       sandbox: { enabled: true },
       logReviewerTrace: false,
       reviewCommand: async (request: { command?: string; userBypass?: string[] }) => {
-        return { decision: "ALLOW" as const, reason: "test harness allow" }
+        return { decision: "ALLOW" as const, categories: [] }
       },
     }
     const h = await startPlugin(options)
@@ -450,7 +450,7 @@ describe("privilege in the effective bypass set routes the call host-direct", ()
     const options = {
       sandbox: { enabled: true },
       logReviewerTrace: false,
-      reviewCommand: async () => ({ decision: "ALLOW" as const, reason: "test harness allow" }),
+      reviewCommand: async () => ({ decision: "ALLOW" as const, categories: [] }),
     }
     const h = await startPlugin(options)
     await invoke(h, "bypass", "s1", "privilege")
@@ -483,7 +483,7 @@ describe("privilege in the effective bypass set routes the call host-direct", ()
       },
       reviewCommand: async (request: { command?: string; userBypass?: string[] }) => {
         h.dynamicCalls.push({ command: request.command ?? "", userBypass: request.userBypass })
-        return { decision: "ALLOW" as const, reason: "test harness allow" }
+        return { decision: "ALLOW" as const, categories: [] }
       },
     })
 
@@ -521,7 +521,7 @@ describe("privilege routing fails loudly when the call cannot leave the sandbox"
     const options = {
       sandbox: { enabled: true, mode: "ro" },
       logReviewerTrace: false,
-      reviewCommand: async () => ({ decision: "ALLOW" as const, reason: "test harness allow" }),
+      reviewCommand: async () => ({ decision: "ALLOW" as const, categories: [] }),
     }
     const h = await startPlugin(options)
     await invoke(h, "bypass", "s1", "host privilege")
@@ -568,7 +568,7 @@ describe("a privilege-needing command is refused when privilege is not armed", (
         logReviewerTrace: false,
         reviewCommand: async (request: { command?: string; userBypass?: string[] }) => {
           h.dynamicCalls.push({ command: request.command ?? "", userBypass: request.userBypass })
-          return { decision: "ALLOW" as const, reason: "test harness allow" }
+          return { decision: "ALLOW" as const, categories: [] }
         },
       })
       const sessionID = `r1-arm-${index}`
@@ -600,7 +600,7 @@ describe("a privilege-needing command is refused when privilege is not armed", (
       },
       reviewCommand: async (request: { command?: string; userBypass?: string[] }) => {
         h.dynamicCalls.push({ command: request.command ?? "", userBypass: request.userBypass })
-        return { decision: "ALLOW" as const, reason: "test harness allow" }
+        return { decision: "ALLOW" as const, categories: [] }
       },
     })
     const input: Record<string, unknown> = {
@@ -623,7 +623,7 @@ describe("a privilege-needing command is refused when privilege is not armed", (
       logReviewerTrace: false,
       reviewCommand: async (request: { command?: string; userBypass?: string[] }) => {
         h.dynamicCalls.push({ command: request.command ?? "", userBypass: request.userBypass })
-        return { decision: "ALLOW" as const, reason: "test harness allow" }
+        return { decision: "ALLOW" as const, categories: [] }
       },
     })
 
@@ -648,7 +648,7 @@ describe("a privilege-needing command is refused when privilege is not armed", (
     const h = await startPlugin({
       sandbox: { enabled: true },
       logReviewerTrace: false,
-      reviewCommand: async () => ({ decision: "ALLOW" as const, reason: "test harness allow" }),
+      reviewCommand: async () => ({ decision: "ALLOW" as const, categories: [] }),
     })
     for (const script of [
       "echo 'sudo id'",
@@ -680,7 +680,7 @@ describe("escalation floor pre-check", () => {
       },
       reviewCommand: async (request: { command?: string; userBypass?: string[] }) => {
         h.dynamicCalls.push({ command: request.command ?? "", userBypass: request.userBypass })
-        return { decision: "ALLOW" as const, reason: "test harness allow" }
+        return { decision: "ALLOW" as const, categories: [] }
       },
     })
 
@@ -723,7 +723,7 @@ describe("escalation floor pre-check", () => {
         timeoutMs: 15000,
         maxRounds: 1,
       },
-      reviewCommand: async () => ({ decision: "ALLOW" as const, reason: "test harness allow" }),
+      reviewCommand: async () => ({ decision: "ALLOW" as const, categories: [] }),
     })
 
     const input: Record<string, unknown> = {
@@ -751,7 +751,7 @@ describe("escalation floor pre-check", () => {
       },
       reviewCommand: async (request: { command?: string }) => {
         h.dynamicCalls.push({ command: request.command ?? "" })
-        return { decision: "ALLOW" as const, reason: "test harness allow" }
+        return { decision: "ALLOW" as const, categories: [] }
       },
     })
 
@@ -785,7 +785,7 @@ describe("escalation floor pre-check", () => {
         timeoutMs: 15000,
         maxRounds: 1,
       },
-      reviewCommand: async () => ({ decision: "ALLOW" as const, reason: "test harness allow" }),
+      reviewCommand: async () => ({ decision: "ALLOW" as const, categories: [] }),
     })
 
     // The escalation parser requires a non-empty command, but a zero-width
@@ -867,8 +867,8 @@ describe("host-direct reminder and audit line are written only when the call is 
       logReviewerTrace: true,
       reviewCommand: async () =>
         reviewerDecision === "DENY"
-          ? { decision: "DENY" as const, reason: "test harness deny: unsafe ownership change" }
-          : { decision: "ALLOW" as const, reason: "test harness allow" },
+          ? { decision: "DENY" as const, categories: ["privilege"] }
+          : { decision: "ALLOW" as const, categories: [] },
     })
     await invoke(h, "bypass", "s1", "host privilege")
 
@@ -876,7 +876,7 @@ describe("host-direct reminder and audit line are written only when the call is 
     // dynamic reviewer denies the call: the command never runs, so the
     // agent reminder and the audit line must not claim it did.
     const denied = await runBefore(h, "s1", { command: "sudo chown www-data:www-data /srv/app/config.yml" })
-    expect(denied).toContain("test harness deny")
+    expect(denied).toContain("Blocked by dynamic classifier")
     // Distinctive per-call reminder text — the session-level bypass
     // ACTIVE notice legitimately mentions "a call that needs OS
     // privilege", so the assertion targets the per-call phrasing.
@@ -955,7 +955,7 @@ describe("host-direct reminder and audit line are written only when the call is 
         if (command.includes("privilege-fingerprint-mutated")) {
           await writeFile(mutatedScript, "#!/bin/bash\necho changed after review\n")
         }
-        return { decision: "ALLOW" as const, reason: "test harness allow" }
+        return { decision: "ALLOW" as const, categories: [] }
       },
     })
 

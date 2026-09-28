@@ -7,11 +7,30 @@ import { STATIC_BYPASS_CATEGORIES } from "../categories"
 
 export type CloudReviewDecision = "ALLOW" | "DENY"
 
+/** Review engines understood by this module. "openai" is the OpenAI-compatible
+ * tool-calling auditor (auditor.py); "jev" is the structured systemone
+ * reviewer (jev-reviewer.py). */
+export type ReviewEngine = "jev" | "openai"
+
 export type CloudReviewResult = {
   decision: CloudReviewDecision
-  reason: string
+  /** Risk families the denial judged (canonical bypass-category names). A
+   * DENY carries at least one entry — parsers fall back to ["indirection"]
+   * when the reviewer reports none. */
+  categories: string[]
+  /** Lower-confidence risk families reported alongside `categories`. */
+  secondary_categories?: string[]
+  /** Free-text denial reason. Removed from the reviewer output contract in
+   * 1.1.0; tolerated when a legacy auditor still sends it. */
+  reason?: string
   /** Present only for the strict policy, which performs bypass detection. */
   bypassing?: boolean
+  /** Internal: which engine produced this verdict. Diagnostics only — never
+   * part of the wire contract or agent-facing text. */
+  engine?: ReviewEngine
+  /** Internal: why an engine fallback happened (e.g. jev infra failure under
+   * reviewer:"auto"). Diagnostics only — never part of the wire contract. */
+  fallback_reason?: string
 }
 
 export type PreviousRejectedCommand = {
@@ -60,6 +79,12 @@ export type CloudReviewRequest = {
   permScope?: { r: boolean; w: boolean; x: boolean }
 }
 
+export type JevReviewConfig = {
+  endpoint: string
+  model: string
+  apiKey: string
+}
+
 export type ReviewCommandOptions = {
   endpoint: string
   model: string
@@ -69,6 +94,16 @@ export type ReviewCommandOptions = {
   allowFullReadAccess?: boolean
   python?: string
   auditorPath?: string
+  /** Which reviewer engine to consult. "auto" (the resolved default) tries
+   * Jev when `jev` is configured and falls back to the OpenAI-compatible
+   * auditor on infrastructure failures (network, 5xx, timeout); protocol
+   * failures never retry — they fail close. */
+  reviewer?: "jev" | "openai" | "auto"
+  /** Resolved Jev reviewer settings; required for reviewer:"jev" and used
+   * opportunistically by "auto". */
+  jev?: JevReviewConfig
+  /** Path to jev-reviewer.py; defaults to the bundled script. */
+  jevPath?: string
   timeout?: number
   signal?: AbortSignal
 }
@@ -151,6 +186,16 @@ function bundledAuditorPath() {
   return candidates.find((candidate) => isRegularFile(candidate))
 }
 
+function bundledJevPath() {
+  const moduleDirectory = path.dirname(fileURLToPath(import.meta.url))
+  const candidates = [
+    path.join(moduleDirectory, "jev-reviewer.py"),
+    path.join(moduleDirectory, "security", "jev-reviewer.py"),
+    path.join(moduleDirectory, "..", "src", "security", "jev-reviewer.py"),
+  ]
+  return candidates.find((candidate) => isRegularFile(candidate))
+}
+
 function pythonCandidates(configured?: string): PythonCandidate[] {
   if (configured) return [{ executable: configured, prefixArgs: [...ISOLATED_FLAGS] }]
   if (process.platform === "win32") {
@@ -173,6 +218,9 @@ function reviewerEnvironment(options: {
   maxRounds: number
   policy: "LOOSE" | "HARD"
   allowFullReadAccess?: boolean
+  /** Resolved Jev reviewer settings; only forwarded for engine "jev". */
+  jev?: JevReviewConfig
+  engine?: ReviewEngine
   /** Resolved child-process budget; forwarded as the review deadline. */
   timeoutMs?: number
 }): NodeJS.ProcessEnv {
@@ -199,12 +247,18 @@ function reviewerEnvironment(options: {
   }
   result.PYTHONIOENCODING = "utf-8"
   result.PYTHONUTF8 = "1"
-  result.OPENCODE_V2_SECURITY_REVIEW_ENDPOINT = options.endpoint
-  result.OPENCODE_V2_SECURITY_REVIEW_MODEL = options.model
-  result.OPENCODE_V2_SECURITY_REVIEW_API_KEY = options.apiKey
-  result.OPENCODE_V2_SECURITY_REVIEW_MAX_ROUNDS = String(options.maxRounds)
+  if (options.engine === "jev" && options.jev) {
+    result.JEV_ENDPOINT = options.jev.endpoint
+    result.JEV_MODEL = options.jev.model
+    result.JEV_API_KEY = options.jev.apiKey
+  } else {
+    result.OPENCODE_V2_SECURITY_REVIEW_ENDPOINT = options.endpoint
+    result.OPENCODE_V2_SECURITY_REVIEW_MODEL = options.model
+    result.OPENCODE_V2_SECURITY_REVIEW_API_KEY = options.apiKey
+    result.OPENCODE_V2_SECURITY_REVIEW_MAX_ROUNDS = String(options.maxRounds)
+    result.OPENCODE_V2_SECURITY_REVIEW_FULL_READ = options.allowFullReadAccess === true ? "1" : "0"
+  }
   result.OPENCODE_V2_SECURITY_REVIEW_POLICY = options.policy
-  result.OPENCODE_V2_SECURITY_REVIEW_FULL_READ = options.allowFullReadAccess === true ? "1" : "0"
   if (typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0) {
     result.OPENCODE_V2_SECURITY_REVIEW_DEADLINE_S = String(
       pythonDeadlineSeconds(options.timeoutMs),
@@ -327,10 +381,38 @@ function collectTopLevelJsonKeys(text: string): string[] | null {
   return keys
 }
 
+// The 1.1.0 reviewer output contract: {decision, categories,
+// secondary_categories?} (+bypassing under HARD). A legacy `reason` string is
+// tolerated but no longer required — a DENY's categories drive the hint.
+const ALLOWED_RESULT_KEYS = new Set([
+  "decision",
+  "categories",
+  "secondary_categories",
+  "bypassing",
+  "reason",
+])
+
+// Categories a reviewer may report: the seven static names plus the sandbox
+// layer category (escalation-grantable; `dynamic`/`slow` are never reported —
+// a reviewer cannot ask to disable the layer judging it).
+const VALID_RESULT_CATEGORIES = new Set<string>([...STATIC_BYPASS_CATEGORIES, "sandbox"])
+
+function parseCategoryList(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value)) return undefined
+  const out: string[] = []
+  for (const item of value) {
+    if (typeof item === "string" && VALID_RESULT_CATEGORIES.has(item) && !out.includes(item)) {
+      out.push(item)
+    }
+  }
+  return out
+}
+
 function parseReviewResult(stdout: string, policy: "LOOSE" | "HARD"): CloudReviewResult {
   if (policy !== "LOOSE" && policy !== "HARD") throw new Error("Invalid review policy")
   const trimmed = stdout.trim()
-  const parsed = JSON.parse(trimmed) as Partial<CloudReviewResult>
+  const parsed = JSON.parse(trimmed) as Record<string, unknown>
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("The auditor returned a non-object result")
   }
@@ -338,35 +420,45 @@ function parseReviewResult(stdout: string, policy: "LOOSE" | "HARD"): CloudRevie
   if (rawKeys !== null && rawKeys.length !== Object.keys(parsed).length) {
     throw new Error("The auditor returned duplicate JSON keys")
   }
-  const keys = Object.keys(parsed).sort()
-  const expectedKeys = policy === "HARD" ? ["bypassing", "decision", "reason"] : ["decision", "reason"]
-  if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index])) {
-    throw new Error("The auditor returned unexpected fields")
+  for (const key of Object.keys(parsed)) {
+    if (!ALLOWED_RESULT_KEYS.has(key)) {
+      throw new Error("The auditor returned unexpected fields")
+    }
   }
-  if (!["ALLOW", "DENY"].includes(parsed.decision ?? "")) {
+  if (parsed.decision !== "ALLOW" && parsed.decision !== "DENY") {
     throw new Error("The auditor returned an invalid decision")
   }
-  if (typeof parsed.reason !== "string") {
+  if (parsed.categories !== undefined && !Array.isArray(parsed.categories)) {
+    throw new Error("The auditor returned a non-array categories")
+  }
+  if (parsed.secondary_categories !== undefined && !Array.isArray(parsed.secondary_categories)) {
+    throw new Error("The auditor returned a non-array secondary_categories")
+  }
+  if (parsed.reason !== undefined && typeof parsed.reason !== "string") {
     throw new Error("The auditor returned a non-string reason")
   }
   if (policy === "HARD" && typeof parsed.bypassing !== "boolean") {
     throw new Error("The auditor returned a non-boolean bypassing")
   }
   const decision = parsed.decision as CloudReviewDecision
-  // ALLOW must carry an empty reason. The strict policy additionally carries
-  // bypassing; the caller decides whether to interrupt. DENY needs a reason.
-  if (decision === "ALLOW" && parsed.reason !== "") {
-    throw new Error("The auditor returned a reason for ALLOW")
+  // Invalid/unknown category names are stripped rather than failing the
+  // review: the reviewer is an external model and a bad hint must degrade
+  // to "no hint", not to a fail-closed protocol error.
+  let categories = parseCategoryList(parsed.categories) ?? []
+  const secondary = (parseCategoryList(parsed.secondary_categories) ?? []).filter(
+    (category) => !categories.includes(category),
+  )
+  // A DENY with no category signal still needs a hint family — indirection
+  // is the conservative fallback (the reviewer did not trust what it saw).
+  if (decision === "DENY" && categories.length === 0) categories = ["indirection"]
+  if (decision === "ALLOW") categories = []
+  const result: CloudReviewResult = { decision, categories }
+  if (secondary.length > 0) result.secondary_categories = secondary
+  if (typeof parsed.reason === "string" && decision === "DENY") {
+    const reason = parsed.reason.trim().replace(/\s+/g, " ").slice(0, 80)
+    if (reason) result.reason = reason
   }
-  if (decision === "DENY" && !parsed.reason.trim()) {
-    throw new Error("The auditor returned an empty reason for DENY")
-  }
-  const result: CloudReviewResult = {
-    decision,
-    reason:
-      decision === "ALLOW" ? "" : parsed.reason.trim().replace(/\s+/g, " ").slice(0, 80),
-  }
-  if (policy === "HARD") result.bypassing = parsed.bypassing
+  if (policy === "HARD") result.bypassing = parsed.bypassing as boolean
   return result
 }
 
@@ -457,6 +549,8 @@ async function runCandidate(
     apiKey: string
     maxRounds: number
     policy: "LOOSE" | "HARD"
+    jev?: JevReviewConfig
+    engine?: ReviewEngine
     signal?: AbortSignal
   },
 ) {
@@ -640,30 +734,73 @@ export async function reviewCommandWithAuditor(
     throw new Error(`reviewCommandWithAuditor maxRounds must be between 1 and ${maxRoundsLimit}`)
   }
   const routedOptions = { ...options, policy: options.policy }
-
-  const auditorPath = options.auditorPath ?? bundledAuditorPath()
-  if (!auditorPath) {
-    throw new Error("The bundled auditor script could not be found or is not a regular file")
-  }
+  const normalized = requestForPolicy(normalizeReviewRequest(request), routedOptions.policy)
   const timeoutMs = options.timeout ?? DEFAULT_TIMEOUT_MS
-  const reviewInput = JSON.stringify(requestForPolicy(normalizeReviewRequest(request), routedOptions.policy))
-  if (Buffer.byteLength(reviewInput, "utf8") > MAX_REVIEW_INPUT_BYTES) {
-    throw new ReviewError("The review input exceeded the safety limit", "protocol")
-  }
 
-  const failures: Error[] = []
-  for (const candidate of pythonCandidates(options.python)) {
-    try {
-      return await runCandidate(candidate, auditorPath, reviewInput, timeoutMs, routedOptions)
-    } catch (error) {
-      const failure = error instanceof Error ? error : new Error(String(error))
-      failures.push(failure)
-      const code = (failure as NodeJS.ErrnoException).code
-      if (options.python || code !== "ENOENT") throw failure
+  const runEngine = async (engine: ReviewEngine): Promise<CloudReviewResult> => {
+    const scriptPath =
+      engine === "jev" ? (options.jevPath ?? bundledJevPath()) : (options.auditorPath ?? bundledAuditorPath())
+    if (!scriptPath) {
+      throw new ReviewError(
+        `The bundled ${engine === "jev" ? "jev-reviewer" : "auditor"} script could not be found or is not a regular file`,
+        "infra",
+      )
     }
+    // Jev also receives the armed categories under their own key (the same
+    // values userBypass already carries, duplicated per the adapter contract).
+    const payload =
+      engine === "jev" ? { ...normalized, armed_categories: normalized.userBypass ?? [] } : normalized
+    const reviewInput = JSON.stringify(payload)
+    if (Buffer.byteLength(reviewInput, "utf8") > MAX_REVIEW_INPUT_BYTES) {
+      throw new ReviewError("The review input exceeded the safety limit", "protocol")
+    }
+
+    const failures: Error[] = []
+    for (const candidate of pythonCandidates(options.python)) {
+      try {
+        const result = await runCandidate(candidate, scriptPath, reviewInput, timeoutMs, {
+          ...routedOptions,
+          engine,
+        })
+        result.engine = engine
+        return result
+      } catch (error) {
+        const failure = error instanceof Error ? error : new Error(String(error))
+        failures.push(failure)
+        const code = (failure as NodeJS.ErrnoException).code
+        if (options.python || code !== "ENOENT") throw failure
+      }
+    }
+    throw failures.at(-1) ?? new ReviewError("No Python 3 interpreter was found for the reviewer", "infra")
   }
 
-  throw failures.at(-1) ?? new ReviewError("No Python 3 interpreter was found for the auditor", "infra")
+  const jevReady = Boolean(options.jev?.apiKey && options.jev.endpoint && options.jev.model)
+  const preference = options.reviewer ?? "openai"
+  if (preference === "openai" || (preference === "auto" && !jevReady)) {
+    return runEngine("openai")
+  }
+  if (!jevReady) {
+    // reviewer:"jev" explicitly requested without a usable configuration.
+    throw new ReviewError("The Jev reviewer is not configured", "infra")
+  }
+  try {
+    return await runEngine("jev")
+  } catch (error) {
+    // auto only: Jev infrastructure failures (network, 5xx, timeout, missing
+    // interpreter) fall back to the OpenAI-compatible auditor. An explicit
+    // reviewer:"jev" never falls back — the caller asked for that engine.
+    // Protocol errors and aborts never retry — they fail close.
+    const infra = error instanceof ReviewError && error.kind === "infra"
+    if (preference !== "auto" || !infra || options.signal?.aborted) throw error
+    const reason = error instanceof Error ? error.message : String(error)
+    // Visibility: a silent engine switch can mask a dead jev endpoint (or a
+    // broken request shape) for an entire session — log it and stamp the
+    // reason on the internal result fields.
+    console.error(`[opencode-v2-security] jev review failed (${reason.slice(0, 200)}); falling back to the OpenAI auditor`)
+    const result = await runEngine("openai")
+    result.fallback_reason = reason.slice(0, 200)
+    return result
+  }
 }
 
 /**
@@ -672,4 +809,11 @@ export async function reviewCommandWithAuditor(
  */
 export const reviewCommandWithDeepSeek = reviewCommandWithAuditor
 
-export { bundledAuditorPath, normalizeReviewRequest, parseReviewResult, requestForPolicy, reviewerEnvironment }
+export {
+  bundledAuditorPath,
+  bundledJevPath,
+  normalizeReviewRequest,
+  parseReviewResult,
+  requestForPolicy,
+  reviewerEnvironment,
+}

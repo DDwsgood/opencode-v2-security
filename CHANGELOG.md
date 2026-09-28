@@ -1,11 +1,35 @@
 # Changelog
 
-## 1.0.2 (2026-09-26)
+## 1.1.0 (2026-09-28)
 
-- Fix TUI bypass and permission indicators: fetch status from the session's
-  location and ignore replies older than a later event or status request.
-- Include the one-per-context-cycle escalation format guide in both OS-privilege
-  policy refusals. Slow-command and terminal refusals remain unchanged.
+- Dynamic review engines: Jev (TypeSafe System One) is now an optional
+  reviewer — `dynamicReview.jev` (`enabled`, `model`, `endpoint`,
+  `apiKeyEnv`); `dynamicReview.reviewer: "auto"` (default) prefers Jev and
+  falls back to the OpenAI-compatible auditor on infrastructure failures
+  with a visible `fallback_reason`. Explicit `reviewer: "jev"` never falls
+  back.
+- Dynamic reviewers now return structured risk **categories** instead of a
+  free-text reason: `{decision, categories[<=3], secondary_categories}`.
+  Block messages carry `Risk categories: …` hints (static rules ∪ reviewer
+  categories), and the denial's categories are stored so escalation
+  requests are checked deterministically for coverage (uncovered → ask_user;
+  `dynamic`/`slow` requests → deny). Escalation retry matching compares
+  command tokens only, so adding the missing category is not mistaken for a
+  replay.
+- Reviewer prompts: armed categories move to the tail with a head-line
+  reminder; an armed category cannot be selected as a risk category (only
+  armed categories → ALLOW); write-vs-execute and category disambiguation
+  wording added.
+- Static classifier: interpreter heredoc bodies (`python3 <<EOF`, `node`,
+  ...) are scanned for dangerous calls only at execution sinks — comments
+  and inert string literals inside them no longer trigger destructive
+  floors.
+- TUI badges: `[Read Only]` / `[Read + Write]` / `[Write Only]` /
+  `[…, Bypassing Category(ies): …]` / `[YOLO ON, Bypassing all permissions]`;
+  `/bypass yolo`/`YOLO` is a case-insensitive kill-switch alias.
+- Fixes: Jev redirect following disabled (no Authorization leak), malformed
+  Jev answers fail closed, cached DENY refreshes escalation coverage state,
+  `..`-preserving rm-target normalization, appeal/answer range validation.
 
 ## 1.0.1 (2026-09-25)
 

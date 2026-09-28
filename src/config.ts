@@ -45,6 +45,24 @@ const DEFAULT_BYPASS_LEASE_TTL_MS = 20 * 60 * 1000
 const MIN_BYPASS_LEASE_TTL_MS = 60_000
 const MAX_BYPASS_LEASE_TTL_MS = 24 * 60 * 60 * 1000
 
+/** Which dynamic reviewer engine to consult (default "auto"). "auto" tries
+ * the Jev reviewer when `dynamicReview.jev` is configured and falls back to
+ * the OpenAI-compatible auditor on infrastructure failures. */
+export type DynamicReviewerEngine = "jev" | "openai" | "auto"
+
+export type JevReviewOptions = {
+  /** Master switch; default true when the jev object is present. */
+  enabled?: boolean
+  /** Default "jev-1.13". */
+  model?: string
+  /** Default "https://opencode.ai/zen/v1/systemone". */
+  endpoint?: string
+  /** Environment variable holding the Jev key (default "JEV_API_KEY"; the
+   * "OC_API_KEY" env var is accepted as a fallback). */
+  apiKeyEnv?: string
+  [key: string]: unknown
+}
+
 export type DynamicReviewOptions = {
   baseURL?: string
   model?: string
@@ -61,6 +79,10 @@ export type DynamicReviewOptions = {
   /** Path to the auditor script. Relative paths resolve against the package root
    * and must point to an existing regular file (directories are rejected). */
   auditorPath?: string
+  /** Reviewer engine selection: "jev", "openai", or "auto" (default). */
+  reviewer?: DynamicReviewerEngine
+  /** Jev (systemone) reviewer configuration. */
+  jev?: JevReviewOptions
   [key: string]: unknown
 }
 
@@ -119,6 +141,16 @@ export type BashClassifierOptions = {
   [key: string]: unknown
 }
 
+export type ResolvedJevReview = {
+  /** Configured and a key resolved — usable by reviewer:"jev"/"auto". */
+  available: boolean
+  endpoint: string
+  model: string
+  apiKey?: string
+  /** Human-readable unavailability reason; never contains secrets. */
+  reason?: string
+}
+
 export type ResolvedDynamicReview = {
   available: boolean
   endpoint?: string
@@ -129,6 +161,9 @@ export type ResolvedDynamicReview = {
   pythonPath?: string
   auditorPath?: string
   allowFullReadAccess: boolean
+  reviewer: DynamicReviewerEngine
+  /** Jev reviewer settings; absent when dynamicReview.jev is not configured. */
+  jev?: ResolvedJevReview
   /** Human-readable unavailability reason; never contains secrets. */
   reason?: string
 }
@@ -327,7 +362,16 @@ const ALLOWED_DYNAMIC_FIELDS = new Set([
   "allowFullReadAccess",
   "pythonPath",
   "auditorPath",
+  "reviewer",
+  "jev",
 ])
+
+const ALLOWED_JEV_FIELDS = new Set(["enabled", "model", "endpoint", "apiKeyEnv"])
+
+const DEFAULT_JEV_ENDPOINT = "https://opencode.ai/zen/v1/systemone"
+const DEFAULT_JEV_MODEL = "jev-1.13"
+const DEFAULT_JEV_KEY_ENV = "JEV_API_KEY"
+const FALLBACK_JEV_KEY_ENV = "OC_API_KEY"
 
 const DEFAULT_TIMEOUT_MS = 30_000
 const MIN_TIMEOUT_MS = 1
@@ -421,6 +465,96 @@ function resolveEndpoint(raw: unknown): { endpoint?: string; reason?: string } {
   if (!pathname.endsWith("/chat/completions")) pathname += "/chat/completions"
   const endpoint = `${parsed.protocol}//${parsed.host}${pathname}${query}`
   return { endpoint }
+}
+
+/** Jev endpoint validation: used verbatim (no /chat/completions suffix) —
+ * http is allowed only on loopback so tests can point at a local stub. */
+function resolveJevEndpoint(raw: unknown): { endpoint?: string; reason?: string } {
+  const value = typeof raw === "string" && raw.trim() ? raw.trim() : DEFAULT_JEV_ENDPOINT
+  if (URL_CONTROL_CHARS.test(value)) {
+    return { reason: "dynamicReview.jev.endpoint must not contain control characters" }
+  }
+  let parsed: URL
+  try {
+    parsed = new URL(value)
+  } catch {
+    return { reason: "dynamicReview.jev.endpoint is not a valid URL" }
+  }
+  const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "")
+  const ipVersion = isIP(hostname)
+  const loopback =
+    hostname === "localhost" ||
+    (ipVersion === 4 && hostname.startsWith("127.")) ||
+    (ipVersion === 6 && hostname === "::1")
+  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) {
+    return { reason: "dynamicReview.jev.endpoint must use https (http only for a loopback host)" }
+  }
+  if (parsed.username || parsed.password) {
+    return { reason: "dynamicReview.jev.endpoint must not contain userinfo" }
+  }
+  if (parsed.hash) {
+    return { reason: "dynamicReview.jev.endpoint must not contain a fragment" }
+  }
+  return { endpoint: `${parsed.protocol}//${parsed.host}${parsed.pathname}${parsed.search}` }
+}
+
+function resolveJev(raw: unknown): { jev?: ResolvedJevReview; reason?: string } {
+  if (raw === undefined) return {}
+  if (!isPlainObject(raw)) return { reason: "dynamicReview.jev must be an object" }
+  for (const key of Object.keys(raw)) {
+    if (!ALLOWED_JEV_FIELDS.has(key)) {
+      return { reason: `dynamicReview.jev contains an unknown field: ${key}` }
+    }
+  }
+  const source = raw as Record<string, unknown>
+  if (source.enabled !== undefined && typeof source.enabled !== "boolean") {
+    return { reason: "dynamicReview.jev.enabled must be a boolean" }
+  }
+  if (source.enabled === false) {
+    return { jev: { available: false, endpoint: "", model: "", reason: "jev reviewer is disabled" } }
+  }
+  const endpointResult = resolveJevEndpoint(source.endpoint)
+  if (endpointResult.reason) return { reason: endpointResult.reason }
+  const modelResult =
+    source.model === undefined
+      ? { model: DEFAULT_JEV_MODEL }
+      : resolveModel(source.model)
+  if (modelResult.reason || !modelResult.model) {
+    return { reason: modelResult.reason ?? "dynamicReview.jev.model is invalid" }
+  }
+  const envName = source.apiKeyEnv === undefined ? DEFAULT_JEV_KEY_ENV : source.apiKeyEnv
+  if (typeof envName !== "string" || !envName.trim()) {
+    return { reason: "dynamicReview.jev.apiKeyEnv must be a non-empty string" }
+  }
+  if (!API_KEY_ENV_PATTERN.test(envName)) {
+    return { reason: "dynamicReview.jev.apiKeyEnv is not a valid environment variable name" }
+  }
+  const apiKey = (
+    process.env[envName] ??
+    process.env[FALLBACK_JEV_KEY_ENV] ??
+    ""
+  ).trim()
+  if (!apiKey) {
+    return {
+      jev: {
+        available: false,
+        endpoint: endpointResult.endpoint!,
+        model: modelResult.model,
+        reason: `jev api key is not configured (${envName}${envName === FALLBACK_JEV_KEY_ENV ? "" : ` or ${FALLBACK_JEV_KEY_ENV}`})`,
+      },
+    }
+  }
+  if (FORBIDDEN_KEY_CHARS.test(apiKey)) {
+    return { reason: "dynamicReview.jev api key contains disallowed control characters" }
+  }
+  return {
+    jev: {
+      available: true,
+      endpoint: endpointResult.endpoint!,
+      model: modelResult.model,
+      apiKey,
+    },
+  }
 }
 
 function resolveModel(raw: unknown): { model?: string; reason?: string } {
@@ -522,6 +656,7 @@ function resolveDynamicReview(raw: unknown, strictness: Strictness): ResolvedDyn
       timeoutMs: DEFAULT_TIMEOUT_MS,
       maxRounds: defaultRounds,
       allowFullReadAccess: false,
+      reviewer: "auto",
       reason: "dynamic review is not configured",
     }
   }
@@ -531,6 +666,7 @@ function resolveDynamicReview(raw: unknown, strictness: Strictness): ResolvedDyn
       timeoutMs: DEFAULT_TIMEOUT_MS,
       maxRounds: defaultRounds,
       allowFullReadAccess: false,
+      reviewer: "auto",
       reason: "dynamicReview must be an object",
     }
   }
@@ -541,6 +677,7 @@ function resolveDynamicReview(raw: unknown, strictness: Strictness): ResolvedDyn
         timeoutMs: DEFAULT_TIMEOUT_MS,
         maxRounds: defaultRounds,
         allowFullReadAccess: false,
+        reviewer: "auto",
         reason: `dynamicReview contains an unknown field: ${key}`,
       }
     }
@@ -555,6 +692,36 @@ function resolveDynamicReview(raw: unknown, strictness: Strictness): ResolvedDyn
   const keyResult = resolveApiKey(dynamic)
   const auditorResult = resolveAuditorPath(dynamic.auditorPath)
   const pythonResult = resolvePythonPath(dynamic.pythonPath)
+  const jevResult = resolveJev(dynamic.jev)
+
+  let reviewer: DynamicReviewerEngine = "auto"
+  const reviewerReason =
+    dynamic.reviewer === undefined ||
+    dynamic.reviewer === "jev" ||
+    dynamic.reviewer === "openai" ||
+    dynamic.reviewer === "auto"
+      ? undefined
+      : 'dynamicReview.reviewer must be "jev", "openai", or "auto"'
+  if (dynamic.reviewer === "jev" || dynamic.reviewer === "openai") {
+    reviewer = dynamic.reviewer
+  }
+  if (reviewer === "jev" && !jevResult.jev?.available) {
+    // An explicit engine choice without a working Jev config is a hard
+    // config error — "auto" would simply never select it, but "jev" has no
+    // fallback of its own.
+    return {
+      available: false,
+      timeoutMs: timeout.value,
+      maxRounds: rounds.value,
+      allowFullReadAccess: false,
+      reviewer,
+      jev: jevResult.jev,
+      reason:
+        jevResult.jev?.reason ??
+        jevResult.reason ??
+        "dynamicReview.jev is not configured",
+    }
+  }
 
   const reason =
     endpointResult.reason ??
@@ -563,7 +730,9 @@ function resolveDynamicReview(raw: unknown, strictness: Strictness): ResolvedDyn
     timeout.reason ??
     rounds.reason ??
     auditorResult.reason ??
-    pythonResult.reason
+    pythonResult.reason ??
+    jevResult.reason ??
+    reviewerReason
   const accessReason =
     allowFullReadAccess === undefined || typeof allowFullReadAccess === "boolean"
       ? undefined
@@ -575,6 +744,8 @@ function resolveDynamicReview(raw: unknown, strictness: Strictness): ResolvedDyn
       timeoutMs: timeout.value,
       maxRounds: rounds.value,
       allowFullReadAccess: false,
+      reviewer,
+      jev: jevResult.jev,
       reason: unavailableReason,
     }
   }
@@ -589,6 +760,8 @@ function resolveDynamicReview(raw: unknown, strictness: Strictness): ResolvedDyn
     pythonPath: pythonResult.pythonPath,
     auditorPath: auditorResult.auditorPath,
     allowFullReadAccess: allowFullReadAccess === true,
+    reviewer,
+    jev: jevResult.jev,
   }
 }
 

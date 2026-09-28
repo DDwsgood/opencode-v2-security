@@ -90,7 +90,7 @@ async function startPlugin(options: Record<string, unknown>): Promise<Harness> {
       sandbox: { enabled: false },
       // The dynamic (auditor) reviewer is stubbed in-process so the HTTP mock
       // only ever sees dedicated escalation-reviewer traffic.
-      reviewCommand: async () => ({ decision: "ALLOW" as const, reason: "test harness allow" }),
+      reviewCommand: async () => ({ decision: "ALLOW" as const, categories: [] }),
       ...options,
     },
     tool: {
@@ -173,7 +173,7 @@ describe("escalationEnabled: false removes the escalation channel entirely", () 
       failPolicy: "fail_close",
       dynamicReview: { baseURL: mock.endpoint, model: "m", apiKey: "k", timeoutMs: 5000, maxRounds: 1 },
       // The dynamic reviewer denies, exercising the fail-closed policy block.
-      reviewCommand: async () => ({ decision: "DENY" as const, reason: "not safe in this context" }),
+      reviewCommand: async () => ({ decision: "DENY" as const, categories: ["secret"] }),
     })
     // A statically denied command: the block must not mention escalation.
     const denied = await runBefore(h, "s1", { command: "rm -rf /" })

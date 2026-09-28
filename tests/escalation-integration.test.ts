@@ -116,7 +116,7 @@ const decision = (word: "allow_once" | "ask_user" | "deny"): Responder => () => 
 
 type CommandExec = (input: { sessionID: string; prompt: { text: string } }) => Effect.Effect<void, unknown>
 type HookCb = (ev: never) => Effect.Effect<void, unknown>
-type DynamicReviewResult = { decision: "ALLOW" | "DENY"; reason: string }
+type DynamicReviewResult = { decision: "ALLOW" | "DENY"; categories: string[] }
 type DynamicCall = { command: string; userBypass?: string[] }
 type ContextShape = "array" | "envelope"
 
@@ -192,7 +192,7 @@ async function startPluginWithReview(
   let h!: Harness
   const reviewCommand = async (request: { command?: string; userBypass?: string[] }) => {
     h.dynamicCalls.push({ command: request.command ?? "", userBypass: request.userBypass })
-    return { decision: "ALLOW", reason: "test harness allow" } satisfies DynamicReviewResult
+    return { decision: "ALLOW", categories: [] } satisfies DynamicReviewResult
   }
   h = await startPlugin({ reviewCommand, ...options }, mock, SESSION_MESSAGES, contextShape)
   return h

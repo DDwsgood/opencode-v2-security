@@ -170,6 +170,19 @@ export function ruleBypassCategory(rule: string): BypassCategory | undefined {
   return categories?.length === 1 ? categories[0] : undefined
 }
 
+/** Union of the bypass categories the given rules require. Floor rules and
+ * rules with no bypass mapping contribute nothing — arming categories cannot
+ * clear them, so they should never appear in an escalation hint. Conjunctive
+ * rules contribute every required category (the union is still correct: the
+ * escalation reviewer sees the full risk family). */
+export function rulesHintCategories(rules: readonly string[]): BypassCategory[] {
+  const out = new Set<BypassCategory>()
+  for (const rule of rules) {
+    for (const category of ruleRequiredCategories(rule) ?? []) out.add(category)
+  }
+  return [...out]
+}
+
 /** True when the rule is disabled by one of the armed bypass categories. */
 export function ruleBypassed(rule: string, bypassed: ReadonlySet<BypassCategory> | undefined): boolean {
   if (!bypassed || bypassed.size === 0) return false

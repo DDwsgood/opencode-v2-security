@@ -88,7 +88,7 @@ import {
 } from "./security/reviewer"
 import { analyzeSlowCommand } from "./security/slow-command"
 import { detectInjection } from "./security/injection-detector"
-import { isFloorRule } from "./security/bypass"
+import { isFloorRule, rulesHintCategories } from "./security/bypass"
 import {
   CATEGORY_HEADER_PREFIX,
   ESCALATION_MARKER,
@@ -207,6 +207,15 @@ type SessionState = {
   touchedAt: number
   lastRejected?: { value: PreviousRejectedCommand; generation: number }
   lastFailed?: { value: PreviousFailedCommand; generation: number; consumedBy?: string }
+  /** The most recent dynamic DENY (or HARD bypassing interrupt) in this
+   * session. The risk categories the denial judged are replayed to the
+   * escalation reviewer as `previousDenial` so it can verify the requested
+   * categories actually cover what was denied. */
+  lastDynamicDenial?: {
+    command: string
+    riskCategories: string[]
+    at: number
+  }
 }
 
 // --- v2 hook event shapes ---------------------------------------------------
@@ -288,6 +297,29 @@ function conciseReason(reason: string, limit = 160) {
   return (value || "Blocked by policy").slice(0, limit)
 }
 
+// The risk-family line appended to classifier blocks so the agent knows which
+// categories to request instead of guessing (category-fix design §2).
+function riskCategoryHint(categories: readonly string[]): string {
+  if (categories.length === 0) return ""
+  return ` Risk categories: ${categories.join(", ")} — request escalation with these categories.`
+}
+
+// Static rules name the categories that would clear the static layer; the
+// reviewer's own categories name the families IT judged. The union is the
+// conservative hint — arming an extra category is harmless, arming too few
+// guarantees a second denial.
+function denialHintCategories(
+  rules: readonly string[],
+  review?: { categories?: string[]; secondary_categories?: string[] },
+): string[] {
+  const out = new Set<string>(rulesHintCategories(rules))
+  if (review) {
+    for (const category of review.categories ?? []) out.add(category)
+    for (const category of review.secondary_categories ?? []) out.add(category)
+  }
+  return [...out]
+}
+
 // `guidance` is the escalation-usage text appended after BLOCK_SUFFIX. The
 // plugin passes a per-session, per-context-cycle claim so the full format is
 // shown only on the first classifier block of a cycle (see
@@ -301,6 +333,7 @@ function blockMessage(
   command = "",
   guidance: string = ESCALATION_GUIDANCE,
   escalationEnabled = true,
+  riskHint = "",
 ) {
   // A static permission.write deny comes from the permission ceiling, not a
   // bypassable classifier rule: it must not point at escalation nor consume
@@ -310,8 +343,12 @@ function blockMessage(
     return rejectionError(`Blocked by static classifier: ${conciseReason(reason, 120)}. ${suffix}`)
   }
   const suffix = escalationEnabled ? BLOCK_SUFFIX : BLOCK_SUFFIX_NO_ESCALATION
+  // With the escalation channel configured off, the agent must never learn
+  // it exists — the risk-category hint points at escalation, so it is
+  // suppressed alongside the format guide (claimEscalationGuidance).
+  const hint = escalationEnabled ? riskHint : ""
   return rejectionError(
-    `Blocked by ${type} classifier: ${conciseReason(reason, type === "dynamic" ? 80 : 120)}. ${suffix}${guidance}`,
+    `Blocked by ${type} classifier: ${conciseReason(reason, type === "dynamic" ? 80 : 120)}.${hint} ${suffix}${guidance}`,
   )
 }
 
@@ -504,19 +541,29 @@ function cacheDynamicAllow(cache: Map<string, number>, key: string, now: number)
 // Short-lived negative cache: a stubborn model retrying an identical denied
 // command re-burns a review call every attempt. Replaying the same DENY for
 // 90s throttles that without meaningfully delaying legitimate state changes.
-type DenyCacheEntry = { expiresAt: number; reason: string }
+type DenyCacheEntry = { expiresAt: number; reason: string; riskCategories: string[] }
 
-function cachedDynamicDenyReason(cache: Map<string, DenyCacheEntry>, key: string, now: number): string | undefined {
+function cachedDynamicDenyEntry(
+  cache: Map<string, DenyCacheEntry>,
+  key: string,
+  now: number,
+): DenyCacheEntry | undefined {
   const entry = cache.get(key)
   if (!entry) return undefined
   if (entry.expiresAt <= now) {
     cache.delete(key)
     return undefined
   }
-  return entry.reason
+  return entry
 }
 
-function cacheDynamicDeny(cache: Map<string, DenyCacheEntry>, key: string, reason: string, now: number) {
+function cacheDynamicDeny(
+  cache: Map<string, DenyCacheEntry>,
+  key: string,
+  reason: string,
+  riskCategories: string[],
+  now: number,
+) {
   for (const [cachedKey, entry] of cache) {
     if (entry.expiresAt <= now) cache.delete(cachedKey)
   }
@@ -525,18 +572,70 @@ function cacheDynamicDeny(cache: Map<string, DenyCacheEntry>, key: string, reaso
     if (typeof oldest !== "string") break
     cache.delete(oldest)
   }
-  cache.set(key, { expiresAt: now + DYNAMIC_DENY_CACHE_TTL_MS, reason })
+  cache.set(key, { expiresAt: now + DYNAMIC_DENY_CACHE_TTL_MS, reason, riskCategories })
 }
 
-function isValidReviewResult(value: unknown, strict: boolean): value is CloudReviewResult {
+// Categories a reviewer may report: the seven static names plus the sandbox
+// layer category (same set reviewer.ts accepts on the wire contract).
+const REVIEW_RESULT_CATEGORIES = new Set<string>([...STATIC_BYPASS_CATEGORIES, "sandbox"])
+const REVIEW_RESULT_KEYS = new Set([
+  "decision",
+  "categories",
+  "secondary_categories",
+  "bypassing",
+  "reason",
+])
+
+function isValidCategoryList(value: unknown): value is string[] {
+  return (
+    value === undefined ||
+    (Array.isArray(value) && value.every((item) => typeof item === "string"))
+  )
+}
+
+// The 1.1.0 reviewer output contract: {decision, categories?,
+// secondary_categories?, bypassing?(HARD), reason?(legacy)}. `reason` is
+// tolerated for older auditors but is no longer required; a DENY without a
+// usable category falls back to ["indirection"] (mutated onto the record).
+export function isValidReviewResult(value: unknown, strict: boolean): value is CloudReviewResult {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
   const record = value as Record<string, unknown>
-  const expected = strict ? ["bypassing", "decision", "reason"] : ["decision", "reason"]
-  const keys = Object.keys(record).sort()
-  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) return false
+  for (const key of Object.keys(record)) {
+    if (!REVIEW_RESULT_KEYS.has(key)) return false
+  }
   if (record.decision !== "ALLOW" && record.decision !== "DENY") return false
-  if (typeof record.reason !== "string") return false
-  return !strict || typeof record.bypassing === "boolean"
+  if (!isValidCategoryList(record.categories) || !isValidCategoryList(record.secondary_categories)) {
+    return false
+  }
+  if (record.reason !== undefined && typeof record.reason !== "string") return false
+  if (strict && typeof record.bypassing !== "boolean") return false
+
+  // Normalize: strip unknown/duplicate category names (a bad hint degrades
+  // to "no hint" rather than invalidating the verdict).
+  const sanitize = (list: unknown): string[] => {
+    const out: string[] = []
+    if (Array.isArray(list)) {
+      for (const item of list) {
+        if (typeof item === "string" && REVIEW_RESULT_CATEGORIES.has(item) && !out.includes(item)) {
+          out.push(item)
+        }
+      }
+    }
+    return out
+  }
+  let categories = sanitize(record.categories)
+  const secondary = sanitize(record.secondary_categories).filter((category) => !categories.includes(category))
+  if (record.decision === "DENY" && categories.length === 0) categories = ["indirection"]
+  if (record.decision === "ALLOW") categories = []
+  record.categories = categories
+  if (secondary.length > 0) record.secondary_categories = secondary
+  else delete record.secondary_categories
+  if (typeof record.reason === "string") {
+    const trimmed = record.reason.trim().replace(/\s+/g, " ").slice(0, 80)
+    if (trimmed && record.decision === "DENY") record.reason = trimmed
+    else delete record.reason
+  }
+  return true
 }
 
 // --- effect plugin context (local structural mirror) -----------------------
@@ -1305,8 +1404,9 @@ const plugin: Plugin = {
           sign = body[0] as "+" | "-"
           body = body.slice(1)
         }
-        // Kill switch: case-sensitive literal ALL.
-        if (body === "ALL") {
+        // Kill switch: case-sensitive literal ALL; `yolo`/`YOLO` is the
+        // case-insensitive alias for the same kill switch.
+        if (body === "ALL" || /^yolo$/i.test(body)) {
           ops.push({ kind: "killSwitch", action: sign === "+" ? "arm" : sign === "-" ? "disarm" : "toggle" })
           continue
         }
@@ -1335,7 +1435,7 @@ const plugin: Plugin = {
         `Unknown bypass categor${invalid.length > 1 ? "ies" : "y"}: ${invalid.join(", ")}.\n` +
         `Usage: /bypass <${[...BYPASS_CATEGORIES].join("|")}|fs|*|all|ALL|off> — ` +
         `categories space or comma separated; legacy aliases: fs=filesystem, os=host+privilege+indirection, web=network+remote; ` +
-        `* or all = all ${BYPASS_CATEGORIES.length} categories; uppercase ALL = the kill switch (all plugin enforcement off) — prefer specific categories when possible; ` +
+        `* or all = all ${BYPASS_CATEGORIES.length} categories; uppercase ALL or yolo/YOLO = the kill switch (all plugin enforcement off) — prefer specific categories when possible; ` +
         `off/0 clears everything. +token arms, -token disarms, a bare token toggles.\n` +
         `host = running-system state (processes, services, power, persistence); privilege = crossing permission or ` +
         `isolation boundaries (sudo/doas/su/pkexec/sudoedit, chown, capabilities, kernel parameters, namespaces) — when privilege is ` +
@@ -1577,6 +1677,7 @@ const plugin: Plugin = {
       throw blockMessage(
         "static", reason, strictPolicy, rules, command,
         claimEscalationGuidance(sessionID, rules), resolved.escalationEnabled,
+        riskCategoryHint(rulesHintCategories(rules)),
       )
     }
 
@@ -1592,6 +1693,14 @@ const plugin: Plugin = {
         allowFullReadAccess: resolved.dynamicReview.allowFullReadAccess,
         python: resolved.dynamicReview.pythonPath,
         auditorPath: resolved.dynamicReview.auditorPath,
+        reviewer: resolved.dynamicReview.reviewer,
+        jev: resolved.dynamicReview.jev?.available
+          ? {
+              endpoint: resolved.dynamicReview.jev.endpoint,
+              model: resolved.dynamicReview.jev.model,
+              apiKey: resolved.dynamicReview.jev.apiKey ?? "",
+            }
+          : undefined,
         timeout: resolved.dynamicReview.timeoutMs,
       }
       return reviewFn(request, options)
@@ -1865,7 +1974,11 @@ const plugin: Plugin = {
         const ancestorFailures = escalationFailures.get(ancestor)
         if (ancestorFailures) inherited.push(...ancestorFailures)
       }
-      const similar = findSimilarFailedEscalation(request.command, [...failures, ...inherited])
+      const similar = findSimilarFailedEscalation(
+        request.command,
+        [...failures, ...inherited],
+        request.categories,
+      )
       if (similar) {
         const earlier =
           similar.decision === "ask_user"
@@ -1940,6 +2053,17 @@ const plugin: Plugin = {
           recentContext,
           permScope: { r: perm.r, w: perm.w, x: perm.x },
           previousFailedEscalations: failures,
+        }
+        // When this command was denied by the dynamic reviewer earlier in the
+        // session, the recorded risk categories let the escalation reviewer
+        // verify the requested grant actually covers what was denied (a retry
+        // that only renamed the categories cannot slip the same gap through).
+        const priorDenial = getSessionState(sessionID).lastDynamicDenial
+        if (priorDenial && priorDenial.command === request.command) {
+          reviewRequest.previousDenial = {
+            command: priorDenial.command,
+            riskCategories: priorDenial.riskCategories,
+          }
         }
       } catch {
         throw rejectionError(
@@ -2232,8 +2356,7 @@ const plugin: Plugin = {
               `bypassed for this call, so the OS sandbox's no_new_privs floor would make the privilege step ` +
               `fail silently at runtime — the command was not run. Ask the user to arm the privilege bypass ` +
               `category (/bypass privilege)${escalationRoute} ` +
-              `(a rw profile host-direct route also requires sandbox.allowSudo).` +
-              `${claimEscalationGuidance(sessionID)}`,
+              `(a rw profile host-direct route also requires sandbox.allowSudo).`,
           )
         }
         if (callSandboxProfile === "ro") {
@@ -2245,8 +2368,7 @@ const plugin: Plugin = {
               `for this call, but this call's OS sandbox profile is read-only and cannot run it host-direct — the ` +
               `sandbox's no_new_privs floor would make the privilege step fail silently at runtime, so the command ` +
               `was not run. Ask the user to arm the sandbox bypass category (/bypass sandbox), ${escalationRoute}` +
-              `or to enable sandbox.allowSudo in the plugin config for read-write sessions.` +
-              `${claimEscalationGuidance(sessionID)}`,
+              `or to enable sandbox.allowSudo in the plugin config for read-write sessions.`,
           )
         }
       }
@@ -2327,17 +2449,33 @@ const plugin: Plugin = {
           return
         }
         if (cacheKey) {
-          const denyReason = cachedDynamicDenyReason(dynamicDenyCache, cacheKey, Date.now())
-          if (denyReason !== undefined) {
-            writeReviewerTrace({ kind: "cache_deny", sessionID, command: script, cacheKey, reason: denyReason })
+          const denyEntry = cachedDynamicDenyEntry(dynamicDenyCache, cacheKey, Date.now())
+          if (denyEntry !== undefined) {
+            writeReviewerTrace({
+              kind: "cache_deny",
+              sessionID,
+              command: script,
+              cacheKey,
+              reason: denyEntry.reason,
+            })
+            // Refresh the coverage-gate record: a cached DENY replays the
+            // same risk categories a live verdict would, and without this
+            // the escalation reviewer loses previousDenial evidence whenever
+            // the denial came from cache.
+            sessionState.lastDynamicDenial = {
+              command: script,
+              riskCategories: [...denyEntry.riskCategories],
+              at: Date.now(),
+            }
             throw blockMessage(
               "dynamic",
-              denyReason,
+              denyEntry.reason,
               strictPolicy,
               staticDecision.rules,
               script,
               claimEscalationGuidance(sessionID),
               resolved.escalationEnabled,
+              riskCategoryHint(denyEntry.riskCategories),
             )
           }
         }
@@ -2409,9 +2547,31 @@ const plugin: Plugin = {
             }
           }
           const result: unknown = await pending
-          if (!isValidReviewResult(result, strictPolicy)) {
-            throw new Error("Dynamic review returned an invalid result")
+          // `engine`/`fallback_reason` are internal provenance stamped by
+          // reviewer.ts after the verdict parses — they are not part of the
+          // wire contract. Remove them before the strict schema check (which
+          // rejects unknown keys) and re-attach afterwards so trace logging
+          // keeps the fields.
+          let engine: CloudReviewResult["engine"] | undefined
+          let fallbackReason: string | undefined
+          if (result !== null && typeof result === "object" && !Array.isArray(result)) {
+            const record = result as Record<string, unknown>
+            if (record.engine === "jev" || record.engine === "openai") {
+              engine = record.engine
+            }
+            if (typeof record.fallback_reason === "string") {
+              fallbackReason = record.fallback_reason
+            }
+            delete record.engine
+            delete record.fallback_reason
           }
+          if (!isValidReviewResult(result, strictPolicy)) {
+            // A malformed verdict is a protocol failure (fail-close under
+            // HARD), never a verdict and never routed through fail_open.
+            throw new ReviewError("Dynamic review returned an invalid result", "protocol")
+          }
+          if (engine) result.engine = engine
+          if (fallbackReason) result.fallback_reason = fallbackReason
           cloudReview = result
         } catch (error) {
           reviewError = error instanceof Error ? error : new Error(String(error))
@@ -2441,37 +2601,56 @@ const plugin: Plugin = {
           endpoint: resolved.dynamicReview.endpoint,
           model: resolved.dynamicReview.model,
           decision: cloudReview.decision,
-          reason: cloudReview.reason,
+          reason: cloudReview.reason ?? "Denied by policy",
+          categories: cloudReview.categories,
+          secondary_categories: cloudReview.secondary_categories,
           bypassing: cloudReview.bypassing,
+          engine: cloudReview.engine,
+          fallback_reason: cloudReview.fallback_reason,
         })
         if (strictPolicy && cloudReview.bypassing === true) {
           const reason =
             cloudReview.decision === "DENY"
-              ? cloudReview.reason
+              ? (cloudReview.reason ?? "Denied by policy")
               : "The command appears to bypass a previous rejection"
+          const riskCategories = denialHintCategories(staticDecision.rules, cloudReview)
+          sessionState.lastDynamicDenial = {
+            command: script,
+            riskCategories,
+            at: Date.now(),
+          }
           recordRejection(sessionState, { command: script, reason, classifier: "DYNAMIC" })
           scheduleAbort(sessionID)
           throw blockMessage(
             "dynamic", reason, true, staticDecision.rules, script,
             claimEscalationGuidance(sessionID), resolved.escalationEnabled,
+            riskCategoryHint(riskCategories),
           )
         }
 
         if (cloudReview.decision === "DENY") {
+          const reason = cloudReview.reason ?? "Denied by policy"
+          const riskCategories = denialHintCategories(staticDecision.rules, cloudReview)
+          sessionState.lastDynamicDenial = {
+            command: script,
+            riskCategories,
+            at: Date.now(),
+          }
           recordRejection(sessionState, {
             command: script,
-            reason: cloudReview.reason,
+            reason,
             classifier: "DYNAMIC",
           })
-          if (cacheKey) cacheDynamicDeny(dynamicDenyCache, cacheKey, cloudReview.reason, Date.now())
+          if (cacheKey) cacheDynamicDeny(dynamicDenyCache, cacheKey, reason, riskCategories, Date.now())
           throw blockMessage(
             "dynamic",
-            cloudReview.reason,
+            reason,
             strictPolicy,
             staticDecision.rules,
             script,
             claimEscalationGuidance(sessionID),
             resolved.escalationEnabled,
+            riskCategoryHint(riskCategories),
           )
         }
 
@@ -3184,6 +3363,7 @@ const plugin: Plugin = {
 
 export default plugin
 export { classifyShellCommand, verifyScriptFingerprints } from "./security/classifier"
+export { isFloorRule, ruleRequiredCategories, rulesHintCategories } from "./security/bypass"
 export { reviewCommandWithAuditor, reviewCommandWithAuditor as reviewCommandWithDeepSeek } from "./security/reviewer"
 export { resolvePluginConfig, resolveSandbox } from "./config"
 export {

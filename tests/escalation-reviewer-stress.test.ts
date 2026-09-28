@@ -214,7 +214,7 @@ describe("escalation limiter is not shared with the ordinary reviewer", () => {
           'os.write(_fd, ("%.6f\\n" % time.time()).encode("ascii"))',
           "os.close(_fd)",
           "sys.stdin.buffer.read()",
-          'sys.stdout.write(\'{"decision":"ALLOW","reason":""}\\n\')',
+          'sys.stdout.write(\'{"decision":"ALLOW","categories":[]}\\n\')',
           "",
         ].join("\n"),
       )

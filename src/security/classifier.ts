@@ -6076,6 +6076,149 @@ async function recycleTargetsFinding(
   return undefined
 }
 
+/** Heredoc language leaves whose bodies use `#` comments: the shell lexer's
+ * quote-aware comment blanking (commentNeutralizedView) fits them directly.
+ * `php` also accepts `//` comments — those simply stay visible, since comment
+ * stripping may only ever narrow the rule surface. */
+const HASH_COMMENT_LANGS = new Set([
+  "python", "python3", "py", "perl", "ruby", "php", "lua", "rscript",
+  "pwsh", "powershell",
+])
+
+/**
+ * Comment-stripped view of a script-language body. `hash` reuses the shell
+ * lexer (# comments, quote-aware, position-preserving); an unlexable body
+ * returns the original text (fail closed). `slash` blanks `//` line comments
+ * and slash-star block comments outside quotes; a confused lex (unterminated
+ * quote or block comment) likewise leaves the text unmodified.
+ */
+function stripScriptComments(text: string, style: "hash" | "slash"): string {
+  if (style === "hash") return commentNeutralizedView(text, "/bin/bash") ?? text
+  let out = ""
+  let quote: "'" | '"' | "`" | undefined
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index]
+    if (quote) {
+      out += character
+      if (character === "\\") {
+        out += text[index + 1] ?? ""
+        index += 1
+      } else if (character === quote) {
+        quote = undefined
+      }
+      continue
+    }
+    if (character === "/" && text[index + 1] === "/") {
+      while (index < text.length && text[index] !== "\n") {
+        out += " "
+        index += 1
+      }
+      if (index < text.length) out += "\n"
+      continue
+    }
+    if (character === "/" && text[index + 1] === "*") {
+      let closed = false
+      out += "  "
+      index += 2
+      while (index < text.length) {
+        if (text[index] === "*" && text[index + 1] === "/") {
+          out += "  "
+          index += 2
+          closed = true
+          break
+        }
+        out += text[index] === "\n" ? "\n" : " "
+        index += 1
+      }
+      if (!closed) return text
+      continue
+    }
+    if (character === "'" || character === '"' || character === "`") {
+      quote = character
+      out += character
+      continue
+    }
+    out += character
+  }
+  if (quote !== undefined) return text
+  return out
+}
+
+/** Execution/file-mutation sinks whose ARGUMENTS the DEFINITE-destructive
+ * shell-syntax rule scan may judge inside a language body; matched text
+ * outside these calls (comments, plain string literals) is not executed. */
+const LANG_SINK_PATTERN =
+  /\b(?:os\.(?:system|popen|exec\w*|spawn\w*)|subprocess\.(?:Popen|call|run|check_output|check_call|getoutput|getstatusoutput)|child_process|(?:exec(?:Sync|File(?:Sync)?)?|spawn(?:Sync)?)\s*\(|system\s*\(|popen\s*\(|exec\s*\(|Process\.(?:start|builder)|shutil\.rmtree|os\.(?:remove|unlink|rmdir|removedirs)|fs(?:\.promises)?\.(?:rm|unlink|rmdir)(?:Sync)?|unlink\s*\(|File\.(?:delete|unlink)\s*\()/g
+
+/** The sink call's argument block: text from `start` through the balanced
+ * closing paren of its first `(`, parens counted quote-aware and capped. A
+ * window that runs off the cap still open keeps its visible text (fail
+ * closed); a match with no paren yields nothing. */
+function sinkParenBlock(text: string, start: number): string | undefined {
+  const limit = Math.min(text.length, start + 2000)
+  let depth = 0
+  let quote: string | undefined
+  for (let index = start; index < limit; index += 1) {
+    const character = text[index]
+    if (quote) {
+      if (character === "\\") index += 1
+      else if (character === quote) quote = undefined
+      continue
+    }
+    if (character === "'" || character === '"' || character === "`") {
+      quote = character
+      continue
+    }
+    if (character === "(") {
+      depth += 1
+      continue
+    }
+    if (character === ")" && depth > 0) {
+      depth -= 1
+      if (depth === 0) return text.slice(start, index + 1)
+    }
+  }
+  return depth > 0 ? text.slice(start, limit) : undefined
+}
+
+/** A backtick execution block (perl/ruby/php): text through the matching
+ * closing backtick, capped the same way. */
+function sinkBacktickBlock(text: string, start: number): string {
+  const limit = Math.min(text.length, start + 2000)
+  for (let index = start + 1; index < limit; index += 1) {
+    const character = text[index]
+    if (character === "\\") index += 1
+    else if (character === "`") return text.slice(start, index + 1)
+  }
+  return text.slice(start, limit)
+}
+
+/**
+ * The only text from a language-heredoc body the DEFINITE-destructive rule
+ * scan may judge: the comment-stripped body reduced to the argument blocks of
+ * execution/file-mutation sink calls. SECURITY_SIGNAL_RULES are shell-syntax
+ * regexes; applied to raw Python/JS they false-positively deny on `#`/`//`
+ * comments and plain string literals that are never executed. Empty means "no
+ * static hit": every lang body still pushes the unconditional
+ * execution.local-script ASK, so nothing escapes review.
+ */
+function langDestructiveRuleView(body: string, leaf: string): string {
+  const commentFree = stripScriptComments(body, HASH_COMMENT_LANGS.has(leaf) ? "hash" : "slash")
+  const blocks: string[] = []
+  for (const match of commentFree.matchAll(LANG_SINK_PATTERN)) {
+    const block = sinkParenBlock(commentFree, match.index ?? 0)
+    if (block) blocks.push(block)
+  }
+  // Backticks execute their content in perl/ruby/php; in node they only build
+  // strings, so a JS template literal must stay out of the rule scan.
+  if (leaf === "perl" || leaf === "ruby" || leaf === "php") {
+    for (const match of commentFree.matchAll(/`/g)) {
+      blocks.push(sinkBacktickBlock(commentFree, match.index ?? 0))
+    }
+  }
+  return blocks.join("\n")
+}
+
 /** Any DEFINITE-destructive signal inside text: used to hard-deny code bodies
  * carried by heredocs (shell/remote/lang consumers) the same way the combined
  * scan denies them inline. */
@@ -6221,7 +6364,11 @@ async function classifyHeredocSegment(
       continue
     }
     if (consumer === "lang") {
-      const hit = definiteDestructiveHit(body, bypassed)
+      // Rule scan on the sink-argument view only (FP fix): SECURITY_SIGNAL_RULES
+      // are shell-syntax regexes; a raw Python/JS body denies on comments and
+      // plain string literals that are never executed.
+      const leaf = commandLeaf(heredocConsumerTokens(h)[0] ?? "") ?? ""
+      const hit = definiteDestructiveHit(langDestructiveRuleView(body, leaf), bypassed)
       if (hit) decisions.push({ verdict: "DENY", rules: [hit.id], reason: hit.reason })
       else if (
         hasLocalScriptReviewSignal(body) &&

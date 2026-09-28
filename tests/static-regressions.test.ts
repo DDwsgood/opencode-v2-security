@@ -394,6 +394,48 @@ test("shell heredoc body with definite-destructive command is denied", async () 
   expect(await verdict("bash <<'EOF'\nrm -rf /x\nEOF", "LOOSE")).toBe("DENY")
 })
 
+// --- FP fix: lang-heredoc rule scans see sink argument blocks only -------------
+// SECURITY_SIGNAL_RULES are shell-syntax regexes: applied to a raw Python/JS
+// body they denied on comments and plain string literals that are never
+// executed. The lang consumer scans the comment-stripped sink-argument view
+// instead, while the unconditional execution.local-script ASK still routes
+// every body to dynamic review.
+describe("lang heredoc rule scan sees only sink argument blocks", () => {
+  test("python comments and string literals do not deny", async () => {
+    const d = await classify(
+      "python3 - <<'EOF'\n# rm -rf /  dangerous comment\npatterns=['rm -rf /tmp/x','sudo id']\nEOF",
+      "LOOSE",
+    )
+    expect(d.verdict).toBe("ASK")
+    expect(d.rules).toContain("execution.local-script")
+  })
+  test("subprocess.run shell sink with rm -rf denies", async () => {
+    const d = await classify(
+      "python3 - <<'EOF'\nimport subprocess\nsubprocess.run('rm -rf /tmp/foo', shell=True)\nEOF",
+      "LOOSE",
+    )
+    expect(d.verdict).toBe("DENY")
+  })
+  test("os.system rm -rf / denies", async () => {
+    const d = await classify("python3 - <<'EOF'\nimport os\nos.system('rm -rf /')\nEOF", "LOOSE")
+    expect(d.verdict).toBe("DENY")
+    // forced-recursive-delete precedes root-delete in SECURITY_SIGNAL_RULES
+    // order, so a root deletion reports the forced-recursive rule id.
+    expect(d.rules).toContain("filesystem.forced-recursive-delete")
+  })
+  test("node comments and string literals do not deny", async () => {
+    const d = await classify("node <<'EOF'\n// rm -rf /\nconst x = \"rm -rf /tmp/y\";\nEOF", "LOOSE")
+    expect(d.verdict).not.toBe("DENY")
+  })
+  test("node execSync sink with rm -rf denies", async () => {
+    const d = await classify("node <<'EOF'\nrequire('child_process').execSync('rm -rf /tmp/x')\nEOF", "LOOSE")
+    expect(d.verdict).toBe("DENY")
+  })
+  test("shell body path is unchanged and still denies", async () => {
+    expect(await verdict("bash <<'EOF'\nrm -rf /\nEOF", "LOOSE")).toBe("DENY")
+  })
+})
+
 // --- RO permission ceiling: execution-channel hardening ---------------------
 // Spec: security-overhaul-research/12-escape-gap.md. Under permScope lacking
 // `w`, execution channels that could smuggle a write (local scripts, encoded

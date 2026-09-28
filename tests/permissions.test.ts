@@ -40,6 +40,10 @@ describe("parsePerm (r/w MVP)", () => {
   test("is case/whitespace insensitive", () => {
     expect(parsePerm("  RO ")).toEqual(perm(true, false))
   })
+  test("rejects yolo — it is the /bypass kill-switch alias, not a permission", () => {
+    expect(parsePerm("yolo")).toBeUndefined()
+    expect(parsePerm("YOLO")).toBeUndefined()
+  })
   const xBearing = ["x", "rx", "wx", "rwx", "--x", "r-x", "-wx", "1", "3", "5", "7"]
   for (const raw of xBearing) {
     test(`rejects x-bearing ${JSON.stringify(raw)} (never silently stripped)`, () => {

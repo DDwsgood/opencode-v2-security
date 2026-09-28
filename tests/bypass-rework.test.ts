@@ -225,6 +225,23 @@ describe("/bypass command parse + kill switch", () => {
     expect(h.synthetic.some((s) => s.sessionID === "s1" && s.text.includes("Enforcement restored"))).toBe(true)
   })
 
+  test("yolo/YOLO is a case-insensitive alias for the ALL kill switch", async () => {
+    const h = await startPlugin()
+    for (const spelling of ["yolo", "YOLO", "Yolo"]) {
+      expect(await invoke(h, "bypass", "s1", "off")).toBeUndefined()
+      expect(await invoke(h, "bypass", "s1", spelling)).toBeUndefined()
+      const status = await h.status("s1")
+      expect(status.active).toContain("ALL")
+      expect(status.temporary).toContain("ALL")
+    }
+    // +/-yolo behaves like +/-ALL.
+    expect(await invoke(h, "bypass", "s1", "-yolo")).toBeUndefined()
+    expect((await h.status("s1")).active).not.toContain("ALL")
+    expect(await invoke(h, "bypass", "s1", "+YOLO")).toBeUndefined()
+    expect((await h.status("s1")).active).toContain("ALL")
+    expect(await invoke(h, "bypass", "s1", "off")).toBeUndefined()
+  })
+
   test("+ALL/-ALL are explicit arm/disarm; bare ALL toggles", async () => {
     const h = await startPlugin()
     expect(await invoke(h, "bypass", "s1", "+ALL")).toBeUndefined()

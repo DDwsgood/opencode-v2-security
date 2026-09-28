@@ -271,6 +271,17 @@ describe("set_permission is direct-child-only and tighten-only", () => {
     expect((await h.status("ses_grandchild")).permission).toBe("r-x")
   })
 
+  test("rejects yolo in the mode setter — it is the /bypass kill-switch alias", async () => {
+    const h = await startPlugin()
+    await flushEventsAfterPush(
+      h,
+      "probe",
+      { type: "session.created", data: { sessionID: "ses_child1", parentID: "parent1" } },
+    )
+    const { message } = await runTool(h, "parent1", { permission: "yolo", sessionID: "ses_child1" })
+    expect(message).toMatch(/permission/i)
+  })
+
   test("a child created before plugin load is verified via the live session lookup", async () => {
     // No session.created event for late-child: only ctx.session.get knows
     // its parentID.

@@ -24,6 +24,15 @@ export type PreviousFailedEscalation = {
   decision: "ask_user" | "deny"
 }
 
+/** The denial an earlier classifier pass recorded for this same command.
+ * The risk categories are host-computed state: the reviewer's coverage rule
+ * (`requested categories ⊇ riskCategories`) is a pure set check. The auditor
+ * validates this field strictly: exactly `command` and `riskCategories`. */
+export type PreviousDenial = {
+  command: string
+  riskCategories: string[]
+}
+
 export type EscalationReviewRequest = {
   command: string
   categories: readonly string[]
@@ -32,6 +41,7 @@ export type EscalationReviewRequest = {
   recentContext: readonly EscalationReviewContextMessage[]
   permScope: EscalationReviewPermissionScope
   previousFailedEscalations?: readonly PreviousFailedEscalation[]
+  previousDenial?: PreviousDenial
 }
 
 export interface EscalationReviewLimiter {

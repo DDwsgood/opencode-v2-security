@@ -27,7 +27,7 @@ OpenCode v2 执行边界安全插件：在原生 `shell` 工具执行命令前�
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "opencode-v2-security@1.0.2",
+      "package": "opencode-v2-security@1.0.1",
       "options": {
         "strictness": "HARD",
         "failPolicy": "fail_open",

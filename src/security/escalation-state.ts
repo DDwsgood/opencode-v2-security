@@ -134,9 +134,27 @@ export function escalationCommandsAreSimilar(a: string, b: string): boolean {
   return left[0] === right[0] && score >= 0.55
 }
 
+/** Conservative retry-family check over COMMAND TOKENS ONLY — categories are
+ * deliberately not part of command similarity. The `categories` argument
+ * adds one exemption on top: a retry that strictly widens the failed
+ * request's declared set (every earlier category kept, plus at least one
+ * new one) is a different ask, not a disguised retry — e.g. the coverage
+ * retry a "Risk categories: …" hint points at. Such a retry must reach the
+ * reviewer; an identical or narrowed category set is still a similar
+ * request and stays denied. */
 export function findSimilarFailedEscalation(
   command: string,
   failures: readonly FailedEscalationRecord[],
+  categories?: readonly string[],
 ): FailedEscalationRecord | undefined {
-  return failures.find((failure) => escalationCommandsAreSimilar(command, failure.command))
+  return failures.find((failure) => {
+    if (!escalationCommandsAreSimilar(command, failure.command)) return false
+    if (categories !== undefined) {
+      const widened =
+        failure.categories.every((category) => categories.includes(category)) &&
+        categories.some((category) => !failure.categories.includes(category))
+      if (widened) return false
+    }
+    return true
+  })
 }

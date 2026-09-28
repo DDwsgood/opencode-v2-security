@@ -19,76 +19,14 @@
 import { createEffect, For, Show } from "solid-js"
 import type { Plugin } from "@opencode-ai/plugin/tui"
 import { BypassRpc, type BypassChangedData, type BypassStatusData } from "./bypass-rpc"
+import {
+  allIsOff,
+  segmentsFor,
+  type IndicatorState,
+  type IndicatorTheme,
+} from "./indicator"
 
 type Context = Plugin.Context
-
-/** Per-session state backing the persistent indicator. */
-type IndicatorState = {
-  /** Effective triple rendered unix-style ("rwx", "r-x", "--x"). */
-  permission: string
-  /** Bypass categories currently in effect (temporary + permanent). */
-  active: string[]
-}
-
-/** Structural slice of the reactive theme the indicator reads (kept loose so
- * the entrypoint stays free of runtime imports beyond solid-js). */
-type IndicatorTheme = {
-  readonly text: {
-    readonly subdued: string
-    readonly feedback: {
-      readonly success: { readonly subdued: string }
-      readonly warning: { readonly default: string }
-      /** Optional danger/error tokens — the ALL-OFF badge prefers the first
-       * present, falling back to warning.default. */
-      readonly danger?: { readonly default?: string; readonly subdued?: string }
-      readonly error?: { readonly default?: string; readonly subdued?: string }
-    }
-  }
-}
-
-type Segment = { readonly text: string; readonly fg: string }
-
-/** The `all` kill switch rides the same `active` list as a literal "all"
- * entry (RPC schema is closed, so no separate flag field). */
-function allIsOff(active: readonly string[]): boolean {
-  return active.includes("ALL")
-}
-
-function dangerColor(theme: IndicatorTheme): string {
-  return (
-    theme.text.feedback.danger?.default ??
-    theme.text.feedback.danger?.subdued ??
-    theme.text.feedback.error?.default ??
-    theme.text.feedback.error?.subdued ??
-    theme.text.feedback.warning.default
-  )
-}
-
-/** [RO] light green (success.subdued) · [RW, Bypassing:...] orange
- * (warning.default) · [ALL OFF] danger/error · plain [RW] subdued.
- * `permission` keeps the raw triple for anything outside the two named modes.
- * With the kill switch armed the danger badge REPLACES the bypass label —
- * individual categories are moot while all enforcement is off. */
-function segmentsFor(state: IndicatorState, theme: IndicatorTheme): Segment[] {
-  const writable = state.permission.includes("w")
-  if (allIsOff(state.active)) {
-    // While the kill switch is armed the badge is just [ALL OFF] — category
-    // and permission detail is moot while every enforcement layer is off.
-    return [{ text: "[ALL OFF]", fg: dangerColor(theme) }]
-  }
-  if (state.active.length > 0) {
-    return [
-      {
-        text: `[${writable ? "RW" : "RO"}, Bypassing:${state.active.join(",")}]`,
-        fg: theme.text.feedback.warning.default,
-      },
-    ]
-  }
-  if (!writable) {
-    return [{ text: state.permission.includes("r") ? "[RO]" : `[${state.permission}]`, fg: theme.text.feedback.success.subdued }]
-  }
-  return [{ text: "[RW]", fg: theme.text.subdued }]
-}
 
 type Toast = { title: string; message: string; variant: "info" | "success" | "warning" | "error"; duration: number }
 
@@ -158,20 +96,10 @@ const plugin: Plugin.Definition = {
         events: {
           on: (name: string, handler: (event: { data: unknown; location?: unknown }) => void) => () => void
         }
-        status?: (
-          input: { sessionID: string },
-          options: { location: { directory: string; workspaceID?: string } },
-        ) => Promise<BypassStatusData>
+        status?: (input: { sessionID: string }) => Promise<BypassStatusData>
       }
     }
     if (!client?.rpc) return () => {}
-
-    // Ignore status responses started before a more recent bypass/permission
-    // event. A late reply must not replace the state the TUI just displayed.
-    const eventRevision = new Map<string, number>()
-    const statusRevision = new Map<string, number>()
-    const markEvent = (sessionID: string) =>
-      eventRevision.set(sessionID, (eventRevision.get(sessionID) ?? 0) + 1)
 
     // The server RPC event is not location-scoped, so a host with several
     // locations would deliver all of them. Only filter when the reliable
@@ -197,9 +125,9 @@ const plugin: Plugin.Definition = {
           try {
             if (!sameWorkspace(event)) return
             const data = event.data as BypassChangedData
-            markEvent(data.sessionID)
+            context.ui.toast.show(toastFor(data))
             if (context.storage?.memory) {
-              const [, mutateIndicator] = context.storage.memory("opencode-v2-security.indicator", {
+              const [indicator, mutateIndicator] = context.storage.memory("opencode-v2-security.indicator", {
                 initial: {} as Record<string, IndicatorState>,
               })
               mutateIndicator((draft) => {
@@ -207,7 +135,6 @@ const plugin: Plugin.Definition = {
                 draft[data.sessionID] = { ...current, active: [...data.active] }
               })
             }
-            context.ui.toast.show(toastFor(data))
           } catch (error) {
             console.error("[opencode-v2-security] bypass toast failed", error)
           }
@@ -235,7 +162,6 @@ const plugin: Plugin.Definition = {
             rpc.events.on("permission", (event) => {
               if (!sameWorkspace(event)) return
               const data = event.data as { sessionID: string; permission: string }
-              markEvent(data.sessionID)
               writeIndicator(data.sessionID, { permission: data.permission })
             }),
           )
@@ -246,20 +172,10 @@ const plugin: Plugin.Definition = {
         // Late attach / session switch: pull the full state so the indicator
         // can never be stale. Older hosts without RPC methods degrade to
         // event-only updates.
-        const pullStatus = async (sessionID: string, location: { directory: string; workspaceID?: string }) => {
-          const startedAtRevision = eventRevision.get(sessionID) ?? 0
-          const requestRevision = (statusRevision.get(sessionID) ?? 0) + 1
-          statusRevision.set(sessionID, requestRevision)
+        const pullStatus = async (sessionID: string) => {
           try {
-            // RPCs without an explicit location go to the service's cwd, not
-            // necessarily the instance that owns this session's bypass lease.
-            const data = await rpc.status?.({ sessionID }, { location })
-            if (
-              data &&
-              data.sessionID === sessionID &&
-              statusRevision.get(sessionID) === requestRevision &&
-              (eventRevision.get(sessionID) ?? 0) === startedAtRevision
-            ) {
+            const data = await rpc.status?.({ sessionID })
+            if (data) {
               writeIndicator(data.sessionID, {
                 permission: data.permission,
                 active: [...data.active],
@@ -274,14 +190,9 @@ const plugin: Plugin.Definition = {
           context.ui.slot({
             append: "session.composer.top",
             render: (input: { sessionID: string }) => {
-              // The host keeps session info and the slot input reactive. Wait
-              // for the authoritative session location before pulling; the
-              // currently selected TUI location may be a different instance.
-              createEffect(() => {
-                const sessionID = input.sessionID
-                const location = context.data.session.get(sessionID)?.location
-                if (location) void pullStatus(sessionID, location)
-              })
+              // input is reactive (host merges getters): reading it here
+              // re-pulls on every session switch.
+              createEffect(() => void pullStatus(input.sessionID))
               return (
                 <Show when={indicator[input.sessionID]}>
                   {(state) => (

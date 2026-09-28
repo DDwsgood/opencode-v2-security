@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import threading
 import unittest
+from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).parents[1] / "src" / "security" / "escalation-reviewer.py"
@@ -77,8 +80,9 @@ class EscalationReviewerTests(unittest.TestCase):
 
         unknown = sample_request()
         unknown["categories"] = ["os"]
-        with self.assertRaisesRegex(ValueError, "unknown"):
-            reviewer.validate_request(unknown)
+        # Unknown category names no longer fail schema validation; the
+        # deterministic gate routes them to the user before the model runs.
+        reviewer.validate_request(unknown)
 
         # Every whitelisted category validates, including the new `privilege`.
         for category in reviewer.ALLOWED_CATEGORIES:
@@ -179,6 +183,146 @@ class EscalationReviewerTests(unittest.TestCase):
             server.shutdown()
             thread.join(timeout=2)
             server.server_close()
+
+
+class PreviousDenialSchemaTests(unittest.TestCase):
+    def test_previous_denial_validates_and_attaches(self) -> None:
+        req = sample_request()
+        req["previousDenial"] = {"command": req["command"], "riskCategories": ["secret", "filesystem"]}
+        review = reviewer.validate_request(req)
+        self.assertEqual(
+            review["previousDenial"],
+            {"command": req["command"], "riskCategories": ["secret", "filesystem"]},
+        )
+
+    def test_previous_denial_rejects_bad_shapes_and_names(self) -> None:
+        for bad in (
+            {"command": "x"},
+            {"command": "x", "riskCategories": ["secret"], "extra": 1},
+            {"command": "x", "riskCategories": "secret"},
+            {"command": "x", "riskCategories": ["os"]},
+            {"command": "x", "riskCategories": ["dynamic"]},
+            {"command": "x", "riskCategories": ["secret", "secret"]},
+        ):
+            req = sample_request()
+            req["previousDenial"] = bad
+            with self.assertRaisesRegex(ValueError, "previousDenial"):
+                reviewer.validate_request(req)
+
+    def test_previous_denial_empty_risk_categories_never_trip_the_gate(self) -> None:
+        req = sample_request()
+        req["previousDenial"] = {"command": req["command"], "riskCategories": []}
+        review = reviewer.validate_request(req)
+        self.assertFalse(reviewer.coverage_missing(review))
+
+
+class DeterministicGateTests(unittest.TestCase):
+    def test_dynamic_and_slow_are_mechanism_tampering(self) -> None:
+        for name in ("dynamic", "slow"):
+            req = sample_request()
+            req["categories"] = [name]
+            review = reviewer.validate_request(req)
+            self.assertEqual(reviewer.deterministic_decision(review), "deny")
+
+    def test_unknown_names_route_to_ask_user(self) -> None:
+        req = sample_request()
+        req["categories"] = ["os", "secret"]
+        review = reviewer.validate_request(req)
+        self.assertEqual(reviewer.deterministic_decision(review), "ask_user")
+
+    def test_canonical_and_sandbox_names_still_reach_the_model(self) -> None:
+        # sandbox stays a grantable layer category; its justification is judged
+        # by the model, not by the deterministic name gate.
+        for categories in (["filesystem"], ["sandbox"], ["privilege", "host", "sandbox"]):
+            req = sample_request()
+            req["categories"] = categories
+            review = reviewer.validate_request(req)
+            self.assertIsNone(reviewer.deterministic_decision(review))
+
+    def test_coverage_gate_requires_recorded_risk_covered(self) -> None:
+        req = sample_request()
+        req["previousDenial"] = {"command": req["command"], "riskCategories": ["secret", "filesystem"]}
+        review = reviewer.validate_request(req)
+        self.assertTrue(reviewer.coverage_missing(review))
+        self.assertEqual(reviewer.deterministic_decision(review), "ask_user")
+        covered = sample_request()
+        covered["categories"] = ["privilege", "host", "sandbox", "secret", "filesystem"]
+        covered["previousDenial"] = {"command": covered["command"], "riskCategories": ["secret", "filesystem"]}
+        review = reviewer.validate_request(covered)
+        self.assertFalse(reviewer.coverage_missing(review))
+        self.assertIsNone(reviewer.deterministic_decision(review))
+
+    def test_coverage_gate_only_applies_to_the_same_command(self) -> None:
+        req = sample_request()
+        req["previousDenial"] = {"command": "different command", "riskCategories": ["secret"]}
+        review = reviewer.validate_request(req)
+        self.assertFalse(reviewer.coverage_missing(review))
+
+    def test_final_decision_downgrades_uncovered_allow_once(self) -> None:
+        req = sample_request()
+        req["previousDenial"] = {"command": req["command"], "riskCategories": ["secret"]}
+        review = reviewer.validate_request(req)
+        self.assertEqual(reviewer.finalize_decision(review, "allow_once"), "ask_user")
+        self.assertEqual(reviewer.finalize_decision(review, "deny"), "deny")
+        self.assertEqual(reviewer.finalize_decision(review, "ask_user"), "ask_user")
+
+    def test_main_skips_the_model_when_coverage_missing(self) -> None:
+        req = sample_request()
+        req["previousDenial"] = {"command": req["command"], "riskCategories": ["secret"]}
+        with (
+            patch.object(reviewer, "_load_config", return_value=("http://127.0.0.1:1", "m", "k")),
+            patch.object(
+                reviewer,
+                "_read_review_input",
+                return_value=reviewer.read_review_input(json.dumps(req)),
+            ),
+            patch.object(reviewer, "post_chat", side_effect=AssertionError("the model must not be consulted")),
+            redirect_stdout(io.StringIO()) as out,
+        ):
+            self.assertEqual(reviewer.main(), 0)
+        self.assertEqual(out.getvalue().strip(), "ask_user")
+
+    def test_main_skips_the_model_for_mechanism_tampering(self) -> None:
+        req = sample_request()
+        req["categories"] = ["dynamic"]
+        with (
+            patch.object(reviewer, "_load_config", return_value=("http://127.0.0.1:1", "m", "k")),
+            patch.object(
+                reviewer,
+                "_read_review_input",
+                return_value=reviewer.read_review_input(json.dumps(req)),
+            ),
+            patch.object(reviewer, "post_chat", side_effect=AssertionError("the model must not be consulted")),
+            redirect_stdout(io.StringIO()) as out,
+        ):
+            self.assertEqual(reviewer.main(), 0)
+        self.assertEqual(out.getvalue().strip(), "deny")
+
+
+class PromptContentTests(unittest.TestCase):
+    def test_prompt_renders_previous_denial(self) -> None:
+        req = sample_request()
+        req["previousDenial"] = {"command": req["command"], "riskCategories": ["secret", "filesystem"]}
+        _system, prompt = reviewer.build_prompt(req)
+        self.assertIn("Previous denial recorded for this same command", prompt)
+        self.assertIn('["secret","filesystem"]', prompt)
+
+    def test_system_prompt_carries_coverage_write_vs_execute_and_disambiguation(self) -> None:
+        system = reviewer.SYSTEM_PROMPT
+        # Coverage rule.
+        self.assertIn("requested categories to cover every riskCategory", system)
+        self.assertIn("prefer ask_user over allow_once", system)
+        # Write-vs-execute clause.
+        self.assertIn("is inert unless this same command also executes it", system)
+        self.assertIn("executing a script later is a different command", system)
+        # Disambiguation list: compact, defines exactly the canonical set, and
+        # never teaches layer toggles as grantable families.
+        lines = [line for line in system.splitlines() if line.startswith("- ")]
+        self.assertLessEqual(len(lines), 12)
+        defined = {line.split(":")[0].strip("- ").strip() for line in lines}
+        self.assertEqual(defined, set(reviewer.ALLOWED_CATEGORIES))
+        self.assertIn("never what is written", system)
+        self.assertIn("dynamic, slow", system)
 
 
 if __name__ == "__main__":
