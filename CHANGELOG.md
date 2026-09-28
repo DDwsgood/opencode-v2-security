@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.1 (2026-09-28)
+
+- Fix TUI indicator not updating after `/perm` or `/bypass`: restores the
+  1.0.2 fix that was dropped in the 1.1.0 refactor — the status pull now
+  addresses the session's own location (RPCs without a location land on the
+  service's cwd instance) and stale in-flight status replies are discarded
+  via per-session revision counters.
+
 ## 1.1.0 (2026-09-28)
 
 - Dynamic review engines: Jev (TypeSafe System One) is now an optional
