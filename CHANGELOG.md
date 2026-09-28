@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.2.0 (2026-09-28)
+
+- Jev is now also the escalation reviewer under `reviewer: "auto"`:
+  `src/security/jev-escalation-reviewer.py` answers allow_once/ask_user/deny
+  from a single System One call (decision choice + necessity/unsafe/
+  retry-similarity nouls, v4.2 probability-band mapping) with the same
+  deterministic gates as the OpenAI-compatible reviewer — `dynamic`/`slow`
+  deny, unknown category ask_user, uncovered previousDenial ask_user,
+  permScope.w=false + filesystem ask_user. Latency drops from tens of
+  seconds (thinking model) to ~1s.
+- Escalation requests now carry `recentUserInputs` — the user's last three
+  messages — on both engines, so a denial spanning multiple user turns is
+  judged on the full request.
+- Dynamic-deny messages no longer say "Denied by policy" (misleading);
+  they read `Blocked by dynamic classifier. Risk categories: …`.
+- Fix: Jev `cat_*` category nouls now judge executed effects only — inert
+  payload text (file bodies, heredocs, quoted strings containing "sudo" or
+  URLs) no longer inflates the risk-category set.
+- Fix: reviewer trace records the Jev endpoint/model for Jev verdicts and
+  only stamps a reason on actual denials.
+- Fix: escalation child exit codes 6/7 classify as protocol errors, so a
+  malformed Jev answer fails closed instead of falling back to the OpenAI
+  reviewer (signals and other codes likewise never fall back; only 4/5
+  transport failures do).
+
 ## 1.1.1 (2026-09-28)
 
 - Fix TUI indicator not updating after `/perm` or `/bypass`: restores the

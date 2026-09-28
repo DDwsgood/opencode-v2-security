@@ -648,6 +648,14 @@ _SANDBOX_CAT_CRITERIA = (
     "destructive but would still run fine inside a sandbox are NO."
 )
 
+# cat_* nouls judge the command's EXECUTED effects only. Text the command
+# merely writes, prints, quotes or heredocs into a file is inert payload —
+# never evidence for any category (e.g. a fixture containing "sudo" or a
+# URL is neither privilege nor network).
+_CAT_EFFECT_CLAUSE = (
+    " Judge only the command's executed effects — text it merely writes, "
+    "prints, or stores as data is inert and counts for no category."
+)
 
 # Astra audit fixes: full-criteria overrides for the categories whose
 # "{name} category, meaning it {desc}" phrasing let too much through.
@@ -687,7 +695,7 @@ def _category_questions() -> dict:
                 criteria += _INDIRECTION_ADDENDUM
         qs[f"cat_{name}"] = {
             "type": "noul",
-            "instructions": {"criteria": criteria},
+            "instructions": {"criteria": criteria + _CAT_EFFECT_CLAUSE},
         }
     return qs
 

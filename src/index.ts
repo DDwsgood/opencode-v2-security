@@ -103,6 +103,7 @@ import {
 } from "./security/escalation-state"
 import {
   reviewEscalation,
+  reviewEscalationDetailed,
   EscalationReviewError,
   DEFAULT_ESCALATION_REVIEW_TIMEOUT_MS,
   type EscalationReviewRequest,
@@ -347,8 +348,14 @@ function blockMessage(
   // it exists — the risk-category hint points at escalation, so it is
   // suppressed alongside the format guide (claimEscalationGuidance).
   const hint = escalationEnabled ? riskHint : ""
+  // Dynamic denials no longer carry a reviewer reason: "Denied by policy"
+  // read like a refusal of the agent's intent and misled operators. The
+  // classifier label plus the risk-category hint is the whole message.
+  if (type === "dynamic") {
+    return rejectionError(`Blocked by dynamic classifier.${hint} ${suffix}${guidance}`)
+  }
   return rejectionError(
-    `Blocked by ${type} classifier: ${conciseReason(reason, type === "dynamic" ? 80 : 120)}.${hint} ${suffix}${guidance}`,
+    `Blocked by ${type} classifier: ${conciseReason(reason, 120)}.${hint} ${suffix}${guidance}`,
   )
 }
 
@@ -2044,12 +2051,14 @@ const plugin: Plugin = {
             ? (payload as { data: unknown[] }).data
             : undefined
         if (!messages) throw new Error("session context payload has no message array")
-        const { currentUserInput, recentContext } = escalationContextFromMessages(messages)
+        const { currentUserInput, recentContext, recentUserInputs } =
+          escalationContextFromMessages(messages)
         reviewRequest = {
           command: request.command,
           categories: request.categories,
           justification: request.justification,
           currentUserInput,
+          recentUserInputs,
           recentContext,
           permScope: { r: perm.r, w: perm.w, x: perm.x },
           previousFailedEscalations: failures,
@@ -2078,17 +2087,30 @@ const plugin: Plugin = {
             `Escalation session ended before review; the command was not run.${terminalAuthorize(request.categories)}`,
           )
         }
-        const decision = await reviewEscalation(reviewRequest, {
+        const jevAvailable = Boolean(
+          dynamic.jev?.available && dynamic.jev.endpoint && dynamic.jev.model && dynamic.jev.apiKey,
+        )
+        const escalationReviewer = resolved.dynamicReview.reviewer ?? "auto"
+        const result = await reviewEscalationDetailed(reviewRequest, {
           endpoint: dynamic.endpoint,
           model: dynamic.model,
           apiKey: dynamic.apiKey,
           python: dynamic.pythonPath,
+          reviewer: escalationReviewer,
+          jev: jevAvailable
+            ? {
+                endpoint: dynamic.jev.endpoint,
+                model: dynamic.jev.model,
+                apiKey: dynamic.jev.apiKey ?? "",
+              }
+            : undefined,
           // The escalation reviewer runs with thinking enabled and needs a
           // much larger budget than the ordinary dynamic reviewer: never let
           // a small configured dynamicReview.timeoutMs shrink it below the
           // thinking-sized default.
           timeout: Math.max(dynamic.timeoutMs, DEFAULT_ESCALATION_REVIEW_TIMEOUT_MS),
         })
+        const decision = result.decision
         if (escalationPending.get(sessionID) !== pending) {
           throw rejectionError(
             `Escalation session ended during review; the command was not run.${terminalAuthorize(request.categories)}`,
@@ -2100,9 +2122,12 @@ const plugin: Plugin = {
           command: request.command,
           categories: [...request.categories],
           justification: request.justification,
-          endpoint: dynamic.endpoint,
-          model: dynamic.model,
+          // Report the engine that actually produced the verdict.
+          endpoint: result.engine === "jev" ? dynamic.jev?.endpoint : dynamic.endpoint,
+          model: result.engine === "jev" ? dynamic.jev?.model : dynamic.model,
           decision,
+          engine: result.engine,
+          fallback_reason: result.fallback_reason,
         })
         if (decision === "allow_once") {
           // The parser validated every category against BYPASS_CATEGORIES;
@@ -2598,10 +2623,19 @@ const plugin: Plugin = {
           kind: "review_verdict",
           sessionID,
           command: script,
-          endpoint: resolved.dynamicReview.endpoint,
-          model: resolved.dynamicReview.model,
+          // Report the engine that actually produced the verdict: a Jev
+          // verdict logged with the OpenAI-compatible endpoint looks like the
+          // fallback engine ran when it did not.
+          endpoint: cloudReview.engine === "jev"
+            ? resolved.dynamicReview.jev?.endpoint
+            : resolved.dynamicReview.endpoint,
+          model: cloudReview.engine === "jev"
+            ? resolved.dynamicReview.jev?.model
+            : resolved.dynamicReview.model,
           decision: cloudReview.decision,
-          reason: cloudReview.reason ?? "Denied by policy",
+          // Only denials carry a reason; logging a deny phrase on ALLOW
+          // makes every allowed verdict look rejected in the trace.
+          reason: cloudReview.decision === "DENY" ? (cloudReview.reason ?? "Denied by policy") : undefined,
           categories: cloudReview.categories,
           secondary_categories: cloudReview.secondary_categories,
           bypassing: cloudReview.bypassing,

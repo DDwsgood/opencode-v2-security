@@ -6,6 +6,7 @@ import {
   RollingEscalationReviewLimiter,
   parseEscalationReviewOutput,
   reviewEscalation,
+  reviewEscalationDetailed,
   type EscalationReviewRequest,
 } from "../src/security/escalation-reviewer"
 
@@ -119,6 +120,90 @@ describe("direct Python review and fail-closed behavior", () => {
         limiter: new RollingEscalationReviewLimiter({ windowMs: 20, maxRequests: 2 }),
       }),
     ).rejects.toThrow(/timed out after 30ms/)
+  })
+})
+
+describe("engine routing (jev/openai)", () => {
+  const jevEnvProbe =
+    'import os, sys\nsys.stdin.buffer.read()\nif not os.environ.get("JEV_API_KEY"):\n    sys.exit(4)\nsys.stdout.write("allow_once\\n")\n'
+  const openaiScript =
+    'import os, sys\nsys.stdin.buffer.read()\nif not os.environ.get("OPENCODE_V2_SECURITY_ESCALATION_API_KEY"):\n    sys.exit(4)\nsys.stdout.write("deny\\n")\n'
+  const jev = { endpoint: "http://127.0.0.1:9/jev", model: "jev-test", apiKey: "k" }
+  const base = {
+    endpoint: "http://127.0.0.1:9",
+    model: "test-model",
+    apiKey: "test-key",
+    python: "python3",
+    timeout: 2_000,
+    limiter: new RollingEscalationReviewLimiter({ windowMs: 20, maxRequests: 8 }),
+  }
+
+  test("auto prefers jev and feeds it JEV_* env", async () => {
+    const jevPath = await fakeReviewer(jevEnvProbe)
+    const openaiPath = await fakeReviewer(openaiScript)
+    const result = await reviewEscalationDetailed(request, {
+      ...base,
+      reviewer: "auto",
+      jev,
+      jevPath,
+      auditorPath: openaiPath,
+    })
+    expect(result.engine).toBe("jev")
+    expect(result.decision).toBe("allow_once")
+    expect(result.fallback_reason).toBeUndefined()
+  })
+
+  test("auto falls back to openai on jev infra failure only", async () => {
+    const jevInfra = await fakeReviewer('import sys\nsys.stderr.write("network down")\nsys.exit(5)\n')
+    const openaiPath = await fakeReviewer(openaiScript)
+    const result = await reviewEscalationDetailed(request, {
+      ...base,
+      reviewer: "auto",
+      jev,
+      jevPath: jevInfra,
+      auditorPath: openaiPath,
+    })
+    expect(result.engine).toBe("openai")
+    expect(result.decision).toBe("deny")
+    expect(result.fallback_reason).toMatch(/network down|code 5/)
+  })
+
+  test("auto does not fall back on jev protocol errors", async () => {
+    const jevProtocol = await fakeReviewer('import sys\nsys.stderr.write("bad answers")\nsys.exit(6)\n')
+    const openaiPath = await fakeReviewer(openaiScript)
+    await expect(
+      reviewEscalationDetailed(request, {
+        ...base,
+        reviewer: "auto",
+        jev,
+        jevPath: jevProtocol,
+        auditorPath: openaiPath,
+      }),
+    ).rejects.toThrow(/bad answers|code 6/)
+  })
+
+  test("explicit jev never falls back", async () => {
+    const jevInfra = await fakeReviewer('import sys\nsys.exit(5)\n')
+    const openaiPath = await fakeReviewer(openaiScript)
+    await expect(
+      reviewEscalationDetailed(request, {
+        ...base,
+        reviewer: "jev",
+        jev,
+        jevPath: jevInfra,
+        auditorPath: openaiPath,
+      }),
+    ).rejects.toThrow(/code 5/)
+  })
+
+  test("openai reviewer stays the default engine", async () => {
+    const openaiPath = await fakeReviewer(openaiScript)
+    const result = await reviewEscalationDetailed(request, {
+      ...base,
+      auditorPath: openaiPath,
+    })
+    expect(result.engine).toBe("openai")
+    expect(result.decision).toBe("deny")
   })
 })
 

@@ -24,6 +24,7 @@ function clippedText(value: unknown): string | undefined {
 export function escalationContextFromMessages(messages: readonly unknown[]): {
   currentUserInput: string
   recentContext: EscalationContextMessage[]
+  recentUserInputs: string[]
 } {
   const candidates: EscalationContextMessage[] = []
   for (const value of messages) {
@@ -57,8 +58,13 @@ export function escalationContextFromMessages(messages: readonly unknown[]): {
     used += text.length
   }
   recent.reverse()
-  const currentUserInput = [...candidates].reverse().find((item) => item.role === "user")?.text ?? ""
-  return { currentUserInput, recentContext: recent }
+  const userInputs = candidates.filter((item) => item.role === "user").map((item) => item.text)
+  const currentUserInput = userInputs.at(-1) ?? ""
+  // The escalation reviewer sees the user's last three messages verbatim:
+  // one denial may span multiple user turns, and the immediately-preceding
+  // message is not always the request being executed.
+  const recentUserInputs = userInputs.slice(-3)
+  return { currentUserInput, recentContext: recent, recentUserInputs }
 }
 
 const TOKEN_ALIASES: Readonly<Record<string, string>> = {

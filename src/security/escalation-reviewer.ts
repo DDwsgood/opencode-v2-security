@@ -38,6 +38,9 @@ export type EscalationReviewRequest = {
   categories: readonly string[]
   justification: string
   currentUserInput: string
+  /** The user's last three messages, oldest first — one escalation may span
+   * several user turns, so the reviewer sees more than the latest input. */
+  recentUserInputs?: readonly string[]
   recentContext: readonly EscalationReviewContextMessage[]
   permScope: EscalationReviewPermissionScope
   previousFailedEscalations?: readonly PreviousFailedEscalation[]
@@ -48,6 +51,11 @@ export interface EscalationReviewLimiter {
   acquire(signal?: AbortSignal): Promise<void>
 }
 
+/** Review engines understood by this module. "openai" is the
+ * OpenAI-compatible escalation-reviewer.py; "jev" is the one-shot
+ * systemone adapter jev-escalation-reviewer.py. */
+export type EscalationReviewEngine = "jev" | "openai"
+
 export type EscalationReviewOptions = {
   endpoint: string
   model: string
@@ -56,6 +64,15 @@ export type EscalationReviewOptions = {
   auditorPath?: string
   timeout?: number
   signal?: AbortSignal
+  /** Which engine to consult. "auto" tries Jev when `jev` is configured and
+   * falls back to the OpenAI-compatible reviewer on infrastructure failures
+   * only; an explicit "jev" never falls back. Default: "openai". */
+  reviewer?: "jev" | "openai" | "auto"
+  /** Resolved Jev reviewer settings; required for reviewer:"jev" and used
+   * by "auto". */
+  jev?: { endpoint: string; model: string; apiKey: string }
+  /** Path to jev-escalation-reviewer.py; defaults to the bundled script. */
+  jevPath?: string
   /** Test/local injection point. The default is the process-wide limiter. */
   limiter?: EscalationReviewLimiter
 }
@@ -111,6 +128,15 @@ const ESCALATION_DECISIONS: readonly EscalationReviewDecision[] = [
 
 function abortError(): EscalationReviewError {
   return new EscalationReviewError("The escalation review was aborted", "aborted")
+}
+
+/** Map child exit codes to error kinds. 4/5 are transport failures (HTTP
+ * status or network — eligible for engine fallback under auto); 6/7 are the
+ * scripts' own protocol/fail-closed exits and must never be retried on
+ * another engine. A signal or any other code is a protocol violation. */
+function classifyEscalationExitCode(code: number | null): EscalationReviewErrorKind {
+  if (code === 4 || code === 5) return "infra"
+  return "protocol"
 }
 
 function waitForPreviousTurn(previous: Promise<void>, signal: AbortSignal): Promise<void> {
@@ -296,6 +322,17 @@ export function bundledEscalationReviewerPath(): string | undefined {
   return candidates.find((candidate) => isRegularFile(candidate))
 }
 
+/** Find the bundled Jev escalation adapter, same layout search. */
+export function bundledJevEscalationPath(): string | undefined {
+  const moduleDirectory = path.dirname(fileURLToPath(import.meta.url))
+  const candidates = [
+    path.join(moduleDirectory, "jev-escalation-reviewer.py"),
+    path.join(moduleDirectory, "security", "jev-escalation-reviewer.py"),
+    path.join(moduleDirectory, "..", "src", "security", "jev-escalation-reviewer.py"),
+  ]
+  return candidates.find((candidate) => isRegularFile(candidate))
+}
+
 export const findBundledEscalationReviewerPath = bundledEscalationReviewerPath
 
 type PythonCandidate = { executable: string; prefixArgs: string[] }
@@ -317,6 +354,10 @@ function pythonCandidates(configured?: string): PythonCandidate[] {
 type EscalationEnvironmentOptions = Pick<EscalationReviewOptions, "endpoint" | "model" | "apiKey"> & {
   /** Resolved child-process budget; forwarded as the HTTP read deadline. */
   timeoutMs?: number
+  /** Which engine this child runs; selects the env var names. */
+  engine?: EscalationReviewEngine
+  /** Resolved Jev settings; forwarded as JEV_* when engine is "jev". */
+  jev?: { endpoint: string; model: string; apiKey: string }
 }
 
 function reviewerEnvironment(options: EscalationEnvironmentOptions): NodeJS.ProcessEnv {
@@ -346,9 +387,15 @@ function reviewerEnvironment(options: EscalationEnvironmentOptions): NodeJS.Proc
   }
   environment.PYTHONIOENCODING = "utf-8"
   environment.PYTHONUTF8 = "1"
-  environment.OPENCODE_V2_SECURITY_ESCALATION_ENDPOINT = options.endpoint
-  environment.OPENCODE_V2_SECURITY_ESCALATION_MODEL = options.model
-  environment.OPENCODE_V2_SECURITY_ESCALATION_API_KEY = options.apiKey
+  if (options.engine === "jev" && options.jev) {
+    environment.JEV_ENDPOINT = options.jev.endpoint
+    environment.JEV_MODEL = options.jev.model
+    environment.JEV_API_KEY = options.jev.apiKey
+  } else {
+    environment.OPENCODE_V2_SECURITY_ESCALATION_ENDPOINT = options.endpoint
+    environment.OPENCODE_V2_SECURITY_ESCALATION_MODEL = options.model
+    environment.OPENCODE_V2_SECURITY_ESCALATION_API_KEY = options.apiKey
+  }
   if (typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0) {
     environment.OPENCODE_V2_SECURITY_ESCALATION_DEADLINE_S = String(
       pythonDeadlineSeconds(options.timeoutMs),
@@ -543,7 +590,7 @@ async function runPythonCandidate(config: SpawnOptions): Promise<EscalationRevie
                 (code === null
                   ? "The escalation reviewer was terminated by a signal"
                   : `The escalation reviewer exited with code ${code}`),
-              "infra",
+              classifyEscalationExitCode(code),
               { exitCode: code === null ? undefined : code },
             ),
           )
@@ -593,65 +640,122 @@ async function runPythonCandidate(config: SpawnOptions): Promise<EscalationRevie
   })
 }
 
+/** Verdict plus diagnostics for the caller's trace: which engine answered
+ * and, for auto fallbacks, why Jev was skipped. */
+export type EscalationReviewResult = {
+  decision: EscalationReviewDecision
+  engine: EscalationReviewEngine
+  fallback_reason?: string
+}
+
 /**
  * Run one isolated escalation review. This starts a direct Python child; it
  * never creates an OpenCode subagent or treats an infrastructure error as an
- * approval.
+ * approval. Engine dispatch mirrors reviewCommandWithAuditor: "auto" prefers
+ * Jev and falls back to the OpenAI-compatible reviewer on infrastructure
+ * failures only; explicit "jev" never falls back; protocol errors and aborts
+ * fail closed everywhere.
  */
-export async function reviewEscalation(
+export async function reviewEscalationDetailed(
   request: EscalationReviewRequest,
   options: EscalationReviewOptions,
-): Promise<EscalationReviewDecision> {
+): Promise<EscalationReviewResult> {
   validateOptions(options)
   if (options.signal?.aborted) throw abortError()
-
-  const auditorPath = options.auditorPath ?? bundledEscalationReviewerPath()
-  if (!auditorPath) {
-    throw new EscalationReviewError(
-      "The bundled escalation-reviewer.py could not be found or is not a regular file",
-      "protocol",
-    )
-  }
-  const resolvedAuditorPath = path.resolve(auditorPath)
-  if (!isRegularFile(resolvedAuditorPath)) {
-    throw new EscalationReviewError(
-      "The configured escalation reviewer is not a regular file",
-      "protocol",
-    )
-  }
 
   const input = serializeRequest(request)
   const timeoutMs = options.timeout ?? DEFAULT_ESCALATION_REVIEW_TIMEOUT_MS
   const limiter = options.limiter ?? processLimiter
-  // Acquire immediately before the child is spawned. Invalid input and a
-  // missing script therefore do not consume a start slot.
-  await limiter.acquire(options.signal)
 
-  const failures: EscalationReviewError[] = []
-  for (const candidate of pythonCandidates(options.python)) {
-    try {
-      return await runPythonCandidate({
-        executable: candidate.executable,
-        prefixArgs: candidate.prefixArgs,
-        auditorPath: resolvedAuditorPath,
-        input,
-        timeoutMs,
-        options,
-      })
-    } catch (error) {
-      const failure =
-        error instanceof EscalationReviewError
-          ? error
-          : new EscalationReviewError(String(error), "infra")
-      failures.push(failure)
-      if (options.python || failure.code !== "ENOENT") throw failure
+  const runEngine = async (engine: EscalationReviewEngine): Promise<EscalationReviewResult> => {
+    const scriptPath =
+      engine === "jev"
+        ? (options.jevPath ?? bundledJevEscalationPath())
+        : (options.auditorPath ?? bundledEscalationReviewerPath())
+    if (!scriptPath) {
+      throw new EscalationReviewError(
+        `The bundled ${engine === "jev" ? "jev-escalation-reviewer" : "escalation-reviewer"}.py could not be found or is not a regular file`,
+        engine === "jev" ? "infra" : "protocol",
+      )
     }
+    const resolvedAuditorPath = path.resolve(scriptPath)
+    if (!isRegularFile(resolvedAuditorPath)) {
+      throw new EscalationReviewError(
+        "The configured escalation reviewer is not a regular file",
+        engine === "jev" ? "infra" : "protocol",
+      )
+    }
+
+    // Acquire immediately before the child is spawned. Invalid input and a
+    // missing script therefore do not consume a start slot.
+    await limiter.acquire(options.signal)
+
+    const failures: EscalationReviewError[] = []
+    for (const candidate of pythonCandidates(options.python)) {
+      try {
+        const decision = await runPythonCandidate({
+          executable: candidate.executable,
+          prefixArgs: candidate.prefixArgs,
+          auditorPath: resolvedAuditorPath,
+          input,
+          timeoutMs,
+          options: { ...options, engine },
+        })
+        return { decision, engine }
+      } catch (error) {
+        const failure =
+          error instanceof EscalationReviewError
+            ? error
+            : new EscalationReviewError(String(error), "infra")
+        failures.push(failure)
+        if (options.python || failure.code !== "ENOENT") throw failure
+      }
+    }
+
+    throw (
+      failures.at(-1) ??
+      new EscalationReviewError("No python3 or python interpreter was found for escalation review", "infra")
+    )
   }
 
-  throw (
-    failures.at(-1) ??
-    new EscalationReviewError("No python3 or python interpreter was found for escalation review", "infra")
-  )
+  const jevReady = Boolean(options.jev?.apiKey && options.jev.endpoint && options.jev.model)
+  const preference = options.reviewer ?? "openai"
+  if (preference === "openai" || (preference === "auto" && !jevReady)) {
+    return runEngine("openai")
+  }
+  if (!jevReady) {
+    // reviewer:"jev" explicitly requested without a usable configuration.
+    throw new EscalationReviewError("The Jev escalation reviewer is not configured", "infra")
+  }
+  try {
+    return await runEngine("jev")
+  } catch (error) {
+    // auto only: Jev infrastructure failures (network, 5xx, timeout, missing
+    // interpreter) fall back to the OpenAI-compatible reviewer. An explicit
+    // reviewer:"jev" never falls back. Protocol errors and aborts never
+    // retry — they fail closed.
+    const infra =
+      error instanceof EscalationReviewError &&
+      (error.kind === "infra" || error.kind === "timeout")
+    if (preference !== "auto" || !infra || options.signal?.aborted) throw error
+    const reason = error instanceof Error ? error.message : String(error)
+    // Visibility: a silent engine switch can mask a dead jev endpoint for an
+    // entire escalation — log it and stamp the reason on the result.
+    console.error(
+      `[opencode-v2-security] jev escalation review failed (${reason.slice(0, 200)}); falling back to the OpenAI reviewer`,
+    )
+    const result = await runEngine("openai")
+    result.fallback_reason = reason.slice(0, 200)
+    return result
+  }
+}
+
+export async function reviewEscalation(
+  request: EscalationReviewRequest,
+  options: EscalationReviewOptions,
+): Promise<EscalationReviewDecision> {
+  const result = await reviewEscalationDetailed(request, options)
+  return result.decision
 }
 
 // Keep names parallel to the existing command reviewer and make the intended
