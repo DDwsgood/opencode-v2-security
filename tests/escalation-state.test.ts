@@ -56,10 +56,36 @@ describe("escalation context extraction", () => {
   })
 
   test("bounds message count and individual length", () => {
-    const messages = Array.from({ length: 10 }, (_, index) => ({ type: "user", text: `${index}:${"x".repeat(900)}` }))
+    const messages = Array.from({ length: 20 }, (_, index) => ({ type: "user", text: `${index}:${"x".repeat(9000)}` }))
     const result = escalationContextFromMessages(messages)
     expect(result.recentContext).toHaveLength(6)
-    expect(result.recentContext.every((item) => item.text.length <= 600)).toBe(true)
-    expect(result.currentUserInput.length).toBe(600)
+    expect(result.recentContext.every((item) => item.text.length <= 4000)).toBe(true)
+    expect(result.recentContext.reduce((sum, item) => sum + item.text.length, 0)).toBeLessThanOrEqual(24000)
+    expect(result.currentUserInput.length).toBe(8000)
+    expect(result.recentUserInputs).toHaveLength(5)
+  })
+
+  test("retains five user turns independently of assistant chatter", () => {
+    const messages: unknown[] = [{ type: "user", text: "old request" }]
+    for (let index = 0; index < 5; index++) {
+      messages.push({ type: "user", text: `task ${index}` })
+      for (let reply = 0; reply < 4; reply++) {
+        messages.push({ type: "assistant", content: [{ type: "text", text: `step ${index}.${reply}` }] })
+      }
+    }
+    const result = escalationContextFromMessages(messages)
+    expect(result.recentUserInputs).toEqual(["task 0", "task 1", "task 2", "task 3", "task 4"])
+    expect(result.recentContext).toHaveLength(16)
+    expect(result.currentUserInput).toBe("task 4")
+  })
+
+  test("preserves trailing user restrictions when a message must be clipped", () => {
+    const result = escalationContextFromMessages([
+      { type: "user", text: `Install the dependency. ${"x".repeat(10000)} Do not delete my database.` },
+    ])
+    expect(result.currentUserInput.startsWith("Install the dependency.")).toBe(true)
+    expect(result.currentUserInput.endsWith("Do not delete my database.")).toBe(true)
+    expect(result.recentContext[0].text.endsWith("Do not delete my database.")).toBe(true)
+    expect(result.currentUserInput).toContain("[context truncated]")
   })
 })

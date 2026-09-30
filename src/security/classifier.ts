@@ -2380,7 +2380,7 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
     id: "network.reverse-shell",
     reason: "Contains a reverse-shell or remote-control primitive",
     test: (text) =>
-      /\/dev\/tcp\/|\/dev\/udp\//i.test(text) ||
+      hasAttachedDevSocket(text) ||
       /\b(?:nc|ncat|netcat)\b[^\n]*(?:\s-e\s|\s--exec\s)/i.test(text) ||
       /\bsocat\b[^\n]*(?:\s(?:EXEC|SYSTEM|EXEC):)/i.test(text) ||
       /\bmkfifo\b[^\n]*(?:\|\s*(?:cat|sh|bash)[^\n]*\|\s*(?:nc|ncat|netcat))/i.test(text) ||
@@ -2393,6 +2393,12 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
     id: "credentials.sensitive-access",
     reason: "Attempts to access credentials, private keys, process secrets, or credential material",
     test: hasSensitiveCredentialReference,
+  },
+  {
+    id: "network.dev-socket",
+    reason:
+      "Opens a bash /dev/tcp or /dev/udp socket without attaching a shell; may be a benign connectivity probe and requires review",
+    test: (text) => /\/dev\/(?:tcp|udp)\//i.test(text),
   },
   {
     id: "network.destructive-api",
@@ -2540,6 +2546,35 @@ function hasSensitiveCredentialReference(text: string) {
     /(?:^|[\\/\s])\.ssh(?:[\\/\s]|$)|\bid_(?:rsa|dsa|ecdsa|ed25519)\b|\/proc\/(?:self|\d+)\/environ|\blsass\b|\.aws[\\/](?:credentials|config)|\.npmrc\b|\.vercel[\\/]token/i.test(
       text,
     )
+  )
+}
+
+/** True when a `/dev/tcp`/`/dev/udp` socket has a SHELL or stdio attached to
+ *  it — the shapes that make a bash socket a remote-control channel:
+ *  an interactive shell (`bash -i … /dev/tcp`), a shell reading its program
+ *  from a socket fd (`sh <&3`), stdio redirected to the socket
+ *  (`0</dev/tcp`, `exec <> /dev/tcp`, `>& /dev/tcp`, `&> /dev/tcp`), or
+ *  stdin copied from an already-connected fd (`0>&3`, `0<&3`).
+ *  A bare fd open used for probing (`exec 3<>/dev/tcp/127.0.0.1/9222`,
+ *  `head -c 100 <&3`, `echo x > /dev/tcp/h/p`) does NOT match — it is
+ *  ambiguous network I/O handled by the `network.dev-socket` review signal
+ *  instead of the unconditional floor. */
+function hasAttachedDevSocket(text: string): boolean {
+  if (!/\/dev\/(?:tcp|udp)\//i.test(text)) return false
+  const B = "(?:^|[\\s;&|(/'\"`>])"
+  return (
+    // Interactive shell anywhere a socket path is in play.
+    new RegExp(B + "(?:ba|z|da|k|a)?sh\\b[^|\\n;]*\\s-i(?:[\\s'\";&|)/]|$)", "i").test(text) ||
+    // Shell taking its input (program) from a socket fd: `sh <&3`, `bash 0<&3`.
+    new RegExp(B + "(?:ba|z|da|k|a)?sh\\s+(?:0\\s*)?<\\s*&\\s*\\d", "i").test(text) ||
+    // stdin redirected to the socket: `0</dev/tcp`, `exec < /dev/tcp`, `exec 0<>/dev/tcp`.
+    new RegExp(B + "(?:0\\s*<|0?<>|<)\\s*/dev/(?:tcp|udp)/", "i").test(text) ||
+    // stdout+stderr merged onto the socket: `>& /dev/tcp`, `&> /dev/tcp`,
+    // `3>&/dev/tcp` — the `&` may be re-joined as a connector (`3> & /dev/tcp`),
+    // so arbitrary whitespace around both operator chars is tolerated.
+    new RegExp(B + "(?:\\d*\\s*>\\s*&|\\s*&\\s*>)\\s*/dev/(?:tcp|udp)/", "i").test(text) ||
+    // stdin copied to/from a numbered fd while a socket is open: `0>&3`, `0<&3`.
+    new RegExp(B + "0\\s*[<>]\\s*&\\s*\\d", "i").test(text)
   )
 }
 
@@ -3804,14 +3839,23 @@ function decodePowerShellBase64(value: string) {
   }
 }
 
-function extractDecodedPayloads(script: string) {
+function extractDecodedPayloads(script: string, opts?: { executedOnly?: boolean }) {
   const decoded: string[] = []
-  const encodedPatterns = [
+  const patterns: RegExp[] = [
     /(?:-encodedcommand|-enc)\s+["']?([A-Za-z0-9+/]{12,}={0,2})["']?/gi,
-    /\b(?:echo|printf)\s+["']?([A-Za-z0-9+/]{16,}={0,2})["']?\s*\|\s*base64\s+(?:-d|--decode)/gi,
+    // `echo <b64> | base64 -d` decodes a payload. Whether that payload is
+    // EXECUTED depends on the downstream consumer: `… | base64 -d | sh`
+    // runs it, `… | base64 -d > fixture.bin` only stores it. With
+    // executedOnly the payload surface is collected only when the pipeline
+    // continues into a code interpreter — storing a decoded blob without a
+    // proven executor goes to the dynamic reviewer (execution.wrapper ASK),
+    // never to the floor scans.
+    opts?.executedOnly
+      ? /\b(?:echo|printf)\s+["']?([A-Za-z0-9+/]{16,}={0,2})["']?\s*\|\s*base64\s+(?:-d|--decode)\b[^\n]{0,300}?\|\s*(?:sh|bash|zsh|dash|ksh|python(?:3)?(?:\.exe)?|py(?:\.exe)?|node|ruby|perl|php|powershell|pwsh|eval|source|\.\s|xargs\b|busybox\s+sh)\b/gi
+      : /\b(?:echo|printf)\s+["']?([A-Za-z0-9+/]{16,}={0,2})["']?\s*\|\s*base64\s+(?:-d|--decode)/gi,
   ]
 
-  for (const pattern of encodedPatterns) {
+  for (const pattern of patterns) {
     for (const match of script.matchAll(pattern)) {
       for (const candidate of decodePowerShellBase64(match[1] ?? "")) {
         if (!decoded.includes(candidate)) decoded.push(candidate)
@@ -3823,20 +3867,47 @@ function extractDecodedPayloads(script: string) {
 }
 
 function extractQuotedWrappers(script: string) {
-  const payloads: string[] = []
-  const patterns = [
-    /\b(?:bash|sh|zsh|python(?:3)?(?:\.exe)?|py(?:\.exe)?|node)\b[^\n]{0,80}\s-(?:c|e)\s+(["'])([\s\S]{1,32000}?)\1/gi,
-    /\b(?:cmd(?:\.exe)?)\b[^\n]{0,80}\s\/c\s+(["'])([\s\S]{1,32000}?)\1/gi,
-    /\b(?:powershell|pwsh)\b[^\n]{0,120}\s-(?:command|c)\s+(["'])([\s\S]{1,32000}?)\1/gi,
+  return extractQuotedWrapperPayloads(script).map((payload) => payload.payload)
+}
+
+/** Like `extractQuotedWrappers` but keeps the interpreter leaf so rule scans
+ *  can judge a language payload by its execution sinks instead of raw text. */
+function extractQuotedWrapperPayloads(script: string): { payload: string; leaf: string }[] {
+  const payloads: { payload: string; leaf: string }[] = []
+  const patterns: Array<{ re: RegExp; leaf: RegExpExecArray | null } | RegExp> = [
+    /\b(bash|sh|zsh|python(?:3)?(?:\.exe)?|py(?:\.exe)?|node|ruby|perl|php|lua|deno|bun)\b[^\n]{0,80}\s-(?:c|e|r)\s+(["'])([\s\S]{1,32000}?)\2/gi,
+    /\b(cmd(?:\.exe)?)\b[^\n]{0,80}\s\/c\s+(["'])([\s\S]{1,32000}?)\2/gi,
+    /\b(powershell|pwsh)\b[^\n]{0,120}\s-(?:command|c)\s+(["'])([\s\S]{1,32000}?)\2/gi,
   ]
   for (const pattern of patterns) {
-    for (const match of script.matchAll(pattern)) {
-      const payload = match[2]?.trim()
-      if (payload && !payloads.includes(payload)) payloads.push(payload)
+    const re = pattern as RegExp
+    for (const match of script.matchAll(re)) {
+      const leaf = (match[1] ?? "").toLowerCase().replace(/\.exe$/, "")
+      const payload = match[3]?.trim()
+      if (payload && !payloads.some((p) => p.payload === payload)) {
+        payloads.push({ payload, leaf })
+      }
       if (payloads.length >= MAX_DECODED_PAYLOADS) return payloads
     }
   }
   return payloads
+}
+
+/** Rule-scan surfaces for executed wrapper payloads: shell-dialect payloads
+ *  (bash -c, cmd /c, pwsh -Command) scan raw since the floor rules ARE shell
+ *  rules; language payloads reduce to their sink-argument blocks so a literal
+ *  `rm -rf /` inside `python3 -c 'print("rm -rf /")'` stays data. */
+function ruleScanWrappers(script: string): string[] {
+  const out: string[] = []
+  for (const { payload, leaf } of extractQuotedWrapperPayloads(script)) {
+    if (LANG_INLINE_LEAVES.has(leaf)) {
+      const sinks = langDestructiveRuleView(payload, leaf).trim()
+      if (sinks) out.push(sinks)
+    } else {
+      out.push(payload)
+    }
+  }
+  return out
 }
 
 function stripLeadingDirectoryChanges(script: string) {
@@ -4529,6 +4600,41 @@ function heredocFlowsToCode(h: HeredocInfo): boolean {
   return false
 }
 
+/** Stricter than `heredocFlowsToCode`: true only when the downstream pipeline
+ *  contains a KNOWN executor that provably consumes stdin as code — a shell
+ *  or language interpreter reading its program from stdin, a DB shell, or a
+ *  remote exec forwarding stdin. Unknown downstream leaves do NOT qualify:
+ *  they are the ambiguous case routed to the dynamic reviewer (payload-text
+ *  fix a), whereas a proven executor keeps the body on the DENY path. */
+function heredocFlowsToKnownExecutor(h: HeredocInfo): boolean {
+  const { end } = heredocPipelinePart(h.headerText, h.opStart - h.headerStart)
+  const downstream = h.headerText.slice(end)
+  if (!/^\s*\|/.test(downstream)) return false
+  const rest = downstream.replace(/^\s*\|&?\s*/, "")
+  for (const part of rest.split(/[|&;]/)) {
+    const tokens = simpleInvocationTokens(part)
+    if (tokens.length === 0) continue
+    const leaf = commandLeaf(tokens[0] ?? "") ?? ""
+    if (HEREDOC_SHELL_COMMANDS.has(leaf)) {
+      if (shellProgramFromStdin(tokens)) return true
+      continue
+    }
+    if (HEREDOC_LANG_COMMANDS.has(leaf)) {
+      if (interpreterProgramFromStdin(tokens)) return true
+      continue
+    }
+    if (HEREDOC_DB_COMMANDS.has(leaf)) return true
+    if (leaf === "ssh" || leaf === "mosh") {
+      if (remoteProgramFromStdin(tokens)) return true
+      continue
+    }
+    if (["docker", "podman", "kubectl", "lxc", "incus"].includes(leaf) && containerExecReadsStdin(tokens)) {
+      return true
+    }
+  }
+  return false
+}
+
 /**
  * Masks heredoc bodies that cannot influence execution (E2): the body must
  * feed a KNOWN data consumer whose output is not piped into code, AND the
@@ -4538,24 +4644,66 @@ function heredocFlowsToCode(h: HeredocInfo): boolean {
  * of stdin. Write-to-file heredocs keep their correlation check on the
  * original segment text.
  */
-function maskHeredocDataBodies(text: string, shell: string): string {
+function maskHeredocBodies(
+  text: string,
+  shell: string,
+  maskableConsumer: (h: HeredocInfo) => boolean,
+): string {
   const heredocs = parseHeredocs(text)
   if (heredocs.length === 0) return text
   let out = ""
   let cursor = 0
   for (const h of heredocs) {
     const maskable =
-      heredocConsumer(h) === "data" &&
-      !heredocFlowsToCode(h) &&
+      maskableConsumer(h) &&
       (h.quoted || !hasUnquotedExpansion(text.slice(h.bodyRange.start, h.bodyRange.end), shell))
     if (maskable) {
-      out += text.slice(cursor, h.bodyRange.start) + "[heredoc-body]"
+      // The masked text must still LEX as a heredoc (a lexer that sees `<<EOF`
+      // consumes to the closing line), so the closing line is kept in place
+      // with its delimiter word blanked — a bare `rm`/`bash` delimiter name
+      // can never resurface as an executable token.
+      const closing =
+        h.closeEnd === undefined
+          ? ""
+          : (() => {
+              const line = text.slice(h.bodyRange.end, h.closeEnd)
+              const nl = line.endsWith("\n") ? "\n" : ""
+              const inner = nl ? line.slice(0, -1) : line
+              return inner.replace(/\S/g, " ") + nl
+            })()
+      out += text.slice(cursor, h.bodyRange.start) + "[heredoc-body]\n" + closing
     } else {
       out += text.slice(cursor, h.closeEnd ?? h.bodyRange.end)
     }
     cursor = h.closeEnd ?? h.bodyRange.end
   }
   return out + text.slice(cursor)
+}
+
+function maskHeredocDataBodies(text: string, shell: string): string {
+  return maskHeredocBodies(
+    text,
+    shell,
+    (h) => heredocConsumer(h) === "data" && !heredocFlowsToCode(h),
+  )
+}
+
+/**
+ * Floor-scan variant that additionally masks heredoc bodies whose consumer is
+ * UNKNOWN — when the static layer cannot prove the body is only stored/read as
+ * data, but also cannot prove it reaches an executor. Those ambiguous bodies
+ * are routed to the dynamic reviewer (execution.ambiguous-heredoc ASK in
+ * classifyHeredocSegment) instead of hitting the floor DENY rules as raw text.
+ * Bodies provably piped into an executor (`cat <<EOF | sh`) stay visible.
+ */
+function maskHeredocNonExecBodies(text: string, shell: string): string {
+  return maskHeredocBodies(
+    text,
+    shell,
+    (h) =>
+      (heredocConsumer(h) === "data" || heredocConsumer(h) === "unknown") &&
+      !heredocFlowsToCode(h),
+  )
 }
 
 /** The segment minus all heredoc bodies AND their `<<` operator tokens, so a
@@ -5894,11 +6042,23 @@ async function classifyHardDeletionPolicy(
   input: InternalClassifyInput,
 ): Promise<StaticSecurityDecision | undefined> {
   const ruleSurface = dataLiteralView(segment) ?? segment
-  const surfaces = [ruleSurface, ...extractDecodedPayloads(ruleSurface), ...extractQuotedWrappers(ruleSurface)]
+  const surfaces = [
+    ruleSurface,
+    ...extractDecodedPayloads(ruleSurface, { executedOnly: true }),
+    ...ruleScanWrappers(ruleSurface),
+  ]
   // Heredoc bodies are masked consumer-aware: proven-inert bodies never reach
   // the forced-delete scan, while unquoted bodies (which expand `$()`/`…`
-  // before the consumer reads them) stay visible.
-  const combined = surfaces.map((surface) => maskHeredocDataBodies(surface, input.shell)).join("\n\n")
+  // before the consumer reads them) stay visible. Language `-c`/`-e` payloads
+  // reduce to their execution-sink view (payloadRuleView) — string literals
+  // inside them are data, not commands.
+  const combined = surfaces
+    .flatMap((surface) => {
+      const view = payloadRuleView(surface, input.shell)
+      return [...view.segments, ...view.sinks]
+    })
+    .map((surface) => maskHeredocDataBodies(surface, input.shell))
+    .join("\n\n")
   const bypassed = input.bypassedCategories
 
   // HARD-mode exemption for clearing recognized disposable directories inside
@@ -6219,6 +6379,153 @@ function langDestructiveRuleView(body: string, leaf: string): string {
   return blocks.join("\n")
 }
 
+/** Interpreter leaves whose inline-code operand (`-c`, `-e`, `--eval`,
+ *  `-r`, `deno eval`) carries a LANGUAGE payload, not shell text: shell-shaped
+ *  words inside it (`rm -rf /` in a string literal, a comment) are program
+ *  data and must not hit the shell-syntax rule scan. Only the sink-argument
+ *  view (os.system/subprocess/fs.rm/…) may carry destructive signals, exactly
+ *  like lang-heredoc bodies. */
+const LANG_INLINE_LEAVES = new Set([
+  "python", "python2", "python3", "py", "node", "deno", "bun",
+  "ruby", "perl", "php", "lua", "luajit", "rscript",
+])
+
+/** Index in `argv` of the word carrying inline code for a language leaf,
+ *  plus how many leading chars of that word are the flag itself (attached
+ *  `-eCODE`/`--eval=CODE` forms). undefined when the invocation is not a
+ *  recognizable inline-eval form (script file, `-m`, bare REPL, `--`
+ *  operands, unknown flag layout) — the raw payload then stays scanned
+ *  (fail closed). */
+function langInlineCodeIndex(
+  leaf: string,
+  argv: string[],
+): { index: number; flagChars: number } | undefined {
+  for (let i = 1; i < argv.length; i += 1) {
+    const token = argv[i] ?? ""
+    if (token === "--") return undefined
+    if (leaf === "deno") {
+      if (token === "eval") return { index: i + 1, flagChars: 0 }
+      if (["run", "test", "repl", "eval-file"].includes(token)) return undefined
+    }
+    if (leaf === "python" || leaf === "python2" || leaf === "python3" || leaf === "py") {
+      if (token === "-c") return { index: i + 1, flagChars: 0 }
+      if (token === "-m") return undefined
+    } else if (leaf === "node" || leaf === "bun") {
+      if (token === "-e" || token === "-p" || token === "--eval" || token === "--print") {
+        return { index: i + 1, flagChars: 0 }
+      }
+      if (/^-(?:e|p)(?=\S)/.test(token)) return { index: i, flagChars: 2 }
+      if (/^--(?:eval|print)=(?=\S)/.test(token)) {
+        return { index: i, flagChars: token.indexOf("=") + 1 }
+      }
+    } else if (leaf === "ruby" || leaf === "perl") {
+      if (token === "-e" || token === "--eval") return { index: i + 1, flagChars: 0 }
+      if (/^--eval=/.test(token)) return { index: i, flagChars: token.indexOf("=") + 1 }
+      if (/^-e(?=\S)/.test(token)) return { index: i, flagChars: 2 }
+    } else if (leaf === "php") {
+      if (token === "-r") return { index: i + 1, flagChars: 0 }
+      if (/^-r(?=\S)/.test(token)) return { index: i, flagChars: 2 }
+    } else if (leaf === "lua" || leaf === "luajit" || leaf === "rscript") {
+      if (token === "-e") return { index: i + 1, flagChars: 0 }
+      if (/^-e(?=\S)/.test(token)) return { index: i, flagChars: 2 }
+    }
+    if (token === "-") return undefined // stdin program
+    if (token.startsWith("-") && token.length > 1) {
+      // Unknown single-dash option: assume it consumes the next token, so a
+      // flag value is never mistaken for the inline code (fail closed).
+      const next = argv[i + 1]
+      if (next !== undefined && !next.startsWith("-")) i += 1
+      continue
+    }
+    return undefined // positional operand = script path
+  }
+  return undefined
+}
+
+/**
+ * The DEFINITE-destructive rule-scan view of one surface: shell-shaped text
+ * unchanged, but language-interpreter inline payloads are reduced to their
+ * sink-argument blocks (`os.system(…)`, `fs.rmSync(…)`, `subprocess.run(…)`…)
+ * and the code word is blanked in the surface itself. String/comment content
+ * that merely LOOKS like a command (`python3 -c 'print("rm -rf /")'`,
+ * `node -e 'require("fs").writeFileSync("x","rm -rf /")'`) is program data —
+ * writing or storing a payload is judged by the write/path pipeline and the
+ * unconditional execution.wrapper ASK, never by the shell floors. The
+ * detected execution sinks inside the payload keep their full deny power.
+ */
+function payloadRuleView(text: string, shell: string): { segments: string[]; text: string; sinks: string[] } {
+  const parsed = splitCommandSegmentsDetailed(text, shell)
+  if (!parsed) return { segments: [text], text, sinks: [] }
+  const out: string[] = []
+  const connectors: string[] = [] // connector BETWEEN out[i-1] and out[i]
+  const sinks: string[] = []
+  for (const item of parsed.segments) {
+    const piece = item.text
+    connectors.push(
+      item.incoming === "&&" ? " && "
+      : item.incoming === "||" ? " || "
+      : item.incoming === "|" ? " | "
+      : item.incoming === "&" ? " & "
+      : item.incoming === ";" ? "; "
+      : "\n",
+    )
+    const trimmed = piece.trim()
+    // Proven-inert quoted data (grep/rg patterns, `git commit -m` messages)
+    // is message text, not a command — blank it exactly like the data-literal
+    // rule view so a `nc -e /bin/sh` inside a commit message cannot trip the
+    // floor scans. Anything not positively proven data stays raw.
+    const dataMasked = dataLiteralView(trimmed) ?? trimmed
+    // Output redirects are inert for the payload-code check but poison the
+    // literal lexer; strip them first so `python3 -c '…' > log` still gets
+    // its code word masked. Unparseable redirects keep the raw piece.
+    const lexTarget = stripOutputRedirects(dataMasked) ?? dataMasked
+    const argv = literalShellArgvDetailed(lexTarget)
+    if (!argv) {
+      out.push(dataMasked)
+      continue
+    }
+    const resolved = resolveLiteralInvocation(argv.words)
+    if (resolved === "unresolved" || argv.words.length === 0) {
+      out.push(dataMasked)
+      continue
+    }
+    const leaf = commandLeaf(argv.words[resolved.index] ?? "") ?? ""
+    if (!LANG_INLINE_LEAVES.has(leaf)) {
+      out.push(dataMasked)
+      continue
+    }
+    const codeInfo = langInlineCodeIndex(leaf, argv.words.slice(resolved.index))
+    const codeArgvIndex = codeInfo === undefined ? undefined : resolved.index + codeInfo.index
+    const codeWord = codeArgvIndex === undefined ? undefined : argv.words[codeArgvIndex]
+    if (codeWord === undefined) {
+      out.push(piece)
+      continue
+    }
+    const code = codeWord.slice(codeInfo!.flagChars)
+    // Blank the proven-literal quoted fragments of the code word — those carry
+    // the language payload text. Unquoted fragments stay (fail closed).
+    // Spans are offsets into the lexed text (trimmed, redirects stripped);
+    // mask that lexed form so the view stays consistent.
+    const spans = argv.spans[codeArgvIndex] ?? []
+    if (spans.length > 0) {
+      const chars = lexTarget.split("")
+      for (const span of spans) {
+        for (let k = span.start; k < span.end && k < chars.length; k += 1) chars[k] = " "
+      }
+      out.push(chars.join(""))
+    } else {
+      out.push(piece)
+    }
+    const sinkText = langDestructiveRuleView(code, leaf).trim()
+    if (sinkText && sinks.length < MAX_DECODED_PAYLOADS) sinks.push(sinkText)
+  }
+  // Re-join with the real connectors so pipe-spanned floors (literal-shell,
+  // remote-pipe) still see `|`; the sink surfaces append as extra lines.
+  let joined = ""
+  for (let i = 0; i < out.length; i += 1) joined += (i > 0 ? connectors[i] : "") + out[i]
+  return { segments: out, text: joined, sinks }
+}
+
 /** Any DEFINITE-destructive signal inside text: used to hard-deny code bodies
  * carried by heredocs (shell/remote/lang consumers) the same way the combined
  * scan denies them inline. */
@@ -6266,17 +6573,31 @@ async function classifyHeredocSegment(
   const residual = heredocResidualText(segment, heredocs)
   const consumers = heredocs.map(heredocConsumer)
   const hasCode = consumers.some((consumer) => consumer !== "data" && consumer !== "unknown")
+  const hasUnknown = consumers.some((consumer) => consumer === "unknown")
 
   // Under a read-only session a code-consumer heredoc executes its body —
   // deny the channel before the normal consumer review can defer to ASK.
   // Kernel-enforced LOOSE passes it through after the non-write gate: the
   // body's write syscalls are kernel-bound, while floors/credentials inside
   // the body still gate. HARD and kernel-absent RO keep the static deny.
-  if (hasCode && input.permScope && !input.permScope.w) {
+  // Unknown consumers are equally unprovable under RO (they may execute the
+  // body) — deny instead of letting an ASK reach the dynamic reviewer.
+  if ((hasCode || hasUnknown) && input.permScope && !input.permScope.w) {
     if (input.roKernelEnforced && strictness !== "HARD") {
       return (await roNonWriteGate(segment, base, input, strictness)) ?? kernelEnforcedAllow()
     }
     return readOnlyExecutionDeny()
+  }
+
+  // An unknown consumer whose own output provably pipes into a KNOWN executor
+  // (`sometool <<EOF | sh`) is a provable execution chain, not ambiguous
+  // payload text: keep the body visible to the raw fall-through scans so the
+  // DENY floor still applies.
+  if (
+    hasUnknown &&
+    heredocs.some((h, i) => consumers[i] === "unknown" && heredocFlowsToKnownExecutor(h))
+  ) {
+    return undefined
   }
 
   // All-data consumers: the heredoc is a write surface only. The residual
@@ -6284,10 +6605,23 @@ async function classifyHeredocSegment(
   // known-safe readers), unquoted bodies must carry no expansions, and the
   // write target still goes through the normal path checks.
   if (!hasCode && consumers.every((consumer) => consumer === "data")) {
-    if (input.cwdUnknown) return undefined
+    if (input.cwdUnknown) {
+      if (input.permScope && !input.permScope.w) return undefined
+      // Unknown base: the write target of a data-consumer heredoc cannot be
+      // proven safe or unsafe — ambiguous payload goes to dynamic review.
+      return {
+        verdict: "ASK",
+        rules: ["execution.ambiguous-heredoc"],
+        reason:
+          "The heredoc write target cannot be verified from the tracked working directory and requires review",
+      }
+    }
     const bodiesStatic = heredocs.every(
       (h) => h.quoted || !hasUnquotedExpansion(segment.slice(h.bodyRange.start, h.bodyRange.end), input.shell),
     )
+    // Bodies that may carry live expansions (`$(cmd)`, backticks, `$VAR`)
+    // are NOT mere payload text: an unquoted `$(rm -rf /)` provably runs at
+    // heredoc-read time, so the raw fall-through scan must keep seeing them.
     if (!bodiesStatic) return undefined
     // The residual may still chain commands (`cat <<EOF; rm -rf /`), so it is
     // re-split and every piece must be a provably inert reader/writer.
@@ -6299,7 +6633,25 @@ async function classifyHeredocSegment(
         const strippedPart = stripOutputRedirects(part) ?? part
         return isKnownSafeSegment(strippedPart) || isInertHeredocWriter(strippedPart)
       })
-    if (!inert) return undefined
+    if (!inert) {
+      if (input.permScope && !input.permScope.w) return undefined
+      // Distinguish provable execution from mere ambiguity: a `; rm -rf /`
+      // chained after the heredoc is a real command, and a body piped into a
+      // KNOWN executor (`| sh`) is provably consumed as code — both keep the
+      // raw fall-through scan (DENY path). Only a pipeline the static layer
+      // cannot prove writes/stores vs executes (`| sometool`) defers to the
+      // dynamic reviewer as ambiguous payload text.
+      const provablyExecuted =
+        definiteDestructiveHit(residual, bypassed) !== undefined ||
+        heredocs.some((h) => heredocFlowsToKnownExecutor(h))
+      if (provablyExecuted) return undefined
+      return {
+        verdict: "ASK",
+        rules: ["execution.ambiguous-heredoc"],
+        reason:
+          "The heredoc pipeline cannot be proven to only write/store its body and requires review",
+      }
+    }
     const finding = analyzeSegmentPaths(residual, m3ctx)
     if (finding.kind === "pass") {
       return {
@@ -6402,9 +6754,22 @@ async function classifyHeredocSegment(
       })
       continue
     }
-    // `data` consumers need no body scan here; `unknown` consumers fall
-    // through to the normal flow with the body unmasked (fail-closed).
-    if (consumer === "unknown") return undefined
+    // `data` consumers need no body scan here. An `unknown` consumer is the
+    // ambiguity case: static analysis cannot prove whether the body is stored
+    // as payload text or executed, so instead of letting the raw body hit the
+    // floor scans as a hard DENY it defers to the dynamic reviewer (ASK).
+    // Provably-executed forms keep their DENYs: shells/interpreters are
+    // classified recursively above, and `cat <<EOF | sh`-style pipelines keep
+    // the body visible to the full-script floor view (heredocFlowsToCode).
+    if (consumer === "unknown") {
+      decisions.push({
+        verdict: "ASK",
+        rules: ["execution.ambiguous-heredoc"],
+        reason:
+          "The heredoc consumer is unrecognized; the body may be stored data or executed code and requires review",
+      })
+      continue
+    }
   }
 
   // The residual command still classifies normally (pipeline tails, file
@@ -7529,8 +7894,10 @@ function hasPrivilegeBoundaryAtCommandPosition(text: string, shell: string, dept
 function privilegeExecutableSurfaces(segment: string): string[] {
   const surfaces = [
     segment,
-    ...extractQuotedWrappers(segment),
-    ...extractDecodedPayloads(segment),
+    // Language `-c`/`-e` payloads join as their sink-argument view: a `sudo`
+    // inside `os.system("sudo …")` counts, one inside a stored string does not.
+    ...ruleScanWrappers(segment),
+    ...extractDecodedPayloads(segment, { executedOnly: true }),
     ...commandSubstitutionBodies(segment),
   ]
   for (const h of parseHeredocs(segment)) {
@@ -8890,9 +9257,19 @@ async function roNonWriteGate(
   // Rule surfaces use the proven-data view (fix D); sensitive-path findings
   // below keep the raw surfaces so masking can never hide a credential path.
   const ruleSurface = dataLiteralView(segment) ?? segment
-  const ruleSurfaces = [ruleSurface, ...extractDecodedPayloads(ruleSurface), ...extractQuotedWrappers(ruleSurface)]
+  const ruleSurfaces = [
+    ruleSurface,
+    ...extractDecodedPayloads(ruleSurface, { executedOnly: true }),
+    ...ruleScanWrappers(ruleSurface),
+  ]
   const surfaces = [segment, ...extractDecodedPayloads(segment), ...extractQuotedWrappers(segment)]
-  const combined = ruleSurfaces.map((surface) => maskHeredocDataBodies(surface, input.shell)).join("\n\n")
+  const combined = ruleSurfaces
+    .flatMap((surface) => {
+      const view = payloadRuleView(surface, input.shell)
+      return [...view.segments, ...view.sinks]
+    })
+    .map((surface) => maskHeredocDataBodies(surface, input.shell))
+    .join("\n\n")
 
   for (const rule of SECURITY_SIGNAL_RULES) {
     if (ruleBypassed(rule.id, bypassed)) continue
@@ -9053,7 +9430,9 @@ function readOnlyExecutionChannel(segment: string, combined: string, shell: stri
   if (localScriptCandidates(segment, shell).length > 0) return true
   if (WRAPPER_PRIMITIVE.test(combined)) return true
   if (hasDynamicShellExpansion(combined, shell)) return true
-  if (extractDecodedPayloads(segment).length > 0) return true
+  // A decoded blob is an execution channel only when the pipeline provably
+  // feeds it to an interpreter; `| base64 -d > f` stores payload text.
+  if (extractDecodedPayloads(segment, { executedOnly: true }).length > 0) return true
   // A heredoc whose consumer is code (shell/lang/remote/db) executes its body.
   const heredocs = parseHeredocs(segment)
   if (heredocs.some((h) => heredocConsumer(h) !== "data")) return true
@@ -9442,14 +9821,26 @@ async function classifySegment(
   const executorHazard = executorCapabilityHazard(segment)
   const surfaces = [
     ruleSurface,
-    ...extractDecodedPayloads(ruleSurface),
-    ...extractQuotedWrappers(ruleSurface),
+    // Decoded payloads join the rule scan only when the pipeline provably
+    // executes them (`| base64 -d | sh`). A decoded blob that is merely
+    // stored (`| base64 -d > f`) is payload text — the dynamic reviewer
+    // sees it through the encoded-payload ASK, not a floor DENY.
+    ...extractDecodedPayloads(ruleSurface, { executedOnly: true }),
+    // Language `-c`/`-e` payloads scan as their execution-sink view, not raw
+    // program text: string literals inside them are data.
+    ...ruleScanWrappers(ruleSurface),
     ...ansiSurfaces,
     ...(varSurface ? [varSurface] : []),
     ...(quoteSurface ? [quoteSurface] : []),
     ...(executorHazard?.kind === "executor" ? executorHazard.payloads : []),
   ]
-  const combined = surfaces.map((surface) => maskHeredocDataBodies(surface, input.shell)).join("\n\n")
+  const combined = surfaces
+    .flatMap((surface) => {
+      const view = payloadRuleView(surface, input.shell)
+      return [...view.segments, ...view.sinks]
+    })
+    .map((surface) => maskHeredocDataBodies(surface, input.shell))
+    .join("\n\n")
   const reviewSignals = new Map<string, string>()
   // A quote-stripped variant of THIS same segment (`Remove-Item -LiteralPath
   // ".\dist" -Recurse -Force` unquotes to the identical delete invocation) is
@@ -10007,7 +10398,21 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
   // connectors, pipelines, substitutions, redirects, and executor bodies stay
   // visible. Unparseable or ineligible input keeps the raw scan text.
   const ruleView = dataLiteralScriptView(source, input.shell) ?? scanView
-  const executableSurfaces = [ruleView, ...extractDecodedPayloads(ruleView), ...extractQuotedWrappers(ruleView)]
+  // Floor-scan view: same position-preserving scan text, but with heredoc
+  // bodies that cannot be PROVEN to execute (data consumers, unknown
+  // consumers that don't pipe onward to code) removed. A payload stored in a
+  // file (`cat > x.sh <<'EOF' … EOF`) is payload text, not a command — the
+  // ambiguous remainder routes to ASK via execution.ambiguous-heredoc.
+  // Executed-code sinks inside language `-c` payloads join as extra surfaces.
+  const payloadView = payloadRuleView(scanView, input.shell)
+  const floorsView =
+    maskHeredocNonExecBodies(payloadView.text, input.shell) +
+    (payloadView.sinks.length > 0 ? "\n" + payloadView.sinks.join("\n") : "")
+  const executableSurfaces = [
+    ruleView,
+    ...extractDecodedPayloads(ruleView, { executedOnly: true }),
+    ...ruleScanWrappers(ruleView),
+  ]
   const bypassed = input.bypassedCategories
   // Pipe-separated segments are classified individually, so remote-pipe
   // (`curl ... | bash`) must be judged on the full script. HARD mode denies
@@ -10018,7 +10423,7 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
     (input.strictness ?? "LOOSE") === "HARD" &&
     remotePipeRule &&
     !ruleBypassed("execution.remote-pipe", bypassed) &&
-    remotePipeRule.test(ruleView)
+    remotePipeRule.test(floorsView)
   ) {
     return {
       verdict: "DENY",
@@ -10034,7 +10439,7 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
   const xargsRule = SECURITY_SIGNAL_RULES.find((rule) => rule.id === "execution.xargs-destructive")
   for (const rule of [reverseShellRule, xargsRule]) {
     if (!rule || ruleBypassed(rule.id, bypassed)) continue
-    if (rule.test(ruleView)) {
+    if (rule.test(floorsView)) {
       return { verdict: "DENY", rules: [rule.id], reason: rule.reason, fingerprints: [] }
     }
   }
@@ -10053,13 +10458,13 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
   const kernelCorePatternRule = SECURITY_SIGNAL_RULES.find((rule) => rule.id === "filesystem.kernel-core-pattern")
   for (const rule of [forkBombRule, kernelTriggerRule, kernelCorePatternRule]) {
     if (!rule || ruleBypassed(rule.id, bypassed)) continue
-    if (rule.test(ruleView)) {
+    if (rule.test(floorsView)) {
       return { verdict: "DENY", rules: [rule.id], reason: rule.reason, fingerprints: [] }
     }
   }
   // Literal piped into a shell interpreter: `printf 'rm -rf /' | sh`.
   const literalShell = /(?:echo|printf)\s+["'][^"']{0,200}?(?:\brm\b[^\n;|"'&]*-[rf]|\bshred\b|\brm\s+-rf\b)[^"']*["']\s*\|\s*(?:sh|bash|zsh|dash)\b/i.test(
-    ruleView,
+    floorsView,
   )
   if (literalShell) {
     return {

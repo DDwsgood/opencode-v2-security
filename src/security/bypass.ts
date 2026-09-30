@@ -68,6 +68,7 @@ const RULE_PREFIXES: ReadonlyArray<readonly [string, RequiredCategories]> = [
   ["execution.local-script", required("indirection")],
   ["execution.wrapper", required("indirection")],
   ["execution.encoded-shell", required("indirection")],
+  ["execution.ambiguous-heredoc", required("indirection")],
 ]
 
 /** Exact overrides for rules the prefix table cannot express precisely.

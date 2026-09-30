@@ -7,15 +7,21 @@ export type FailedEscalationRecord = {
   decision: "ask_user" | "deny"
 }
 
-const MAX_CONTEXT_MESSAGES = 6
-const MAX_CONTEXT_MESSAGE_CHARS = 600
-const MAX_CONTEXT_TOTAL_CHARS = 4000
+const MAX_CONTEXT_MESSAGES = 16
+const MAX_CONTEXT_MESSAGE_CHARS = 4000
+const MAX_CONTEXT_TOTAL_CHARS = 24000
+const MAX_USER_INPUT_CHARS = 8000
+const MAX_RECENT_USER_INPUTS = 5
 
-function clippedText(value: unknown): string | undefined {
+function clippedText(value: unknown, limit = MAX_CONTEXT_MESSAGE_CHARS): string | undefined {
   if (typeof value !== "string") return undefined
   const text = value.replace(/\0/g, "").trim()
   if (!text) return undefined
-  return text.slice(0, MAX_CONTEXT_MESSAGE_CHARS)
+  if (text.length <= limit) return text
+  // Preserve trailing restrictions as well as the task at the beginning.
+  const marker = "\n…[context truncated]…\n"
+  const headLength = Math.floor((limit - marker.length) / 2)
+  return text.slice(0, headLength) + marker + text.slice(-(limit - marker.length - headLength))
 }
 
 /** Extract only human/model prose from the durable session context. Tool
@@ -27,12 +33,15 @@ export function escalationContextFromMessages(messages: readonly unknown[]): {
   recentUserInputs: string[]
 } {
   const candidates: EscalationContextMessage[] = []
+  const userInputs: string[] = []
   for (const value of messages) {
     if (!value || typeof value !== "object" || Array.isArray(value)) continue
     const message = value as Record<string, unknown>
     if (message.type === "user") {
       const text = clippedText(message.text)
       if (text) candidates.push({ role: "user", text })
+      const userText = clippedText(message.text, MAX_USER_INPUT_CHARS)
+      if (userText) userInputs.push(userText)
       continue
     }
     if (message.type !== "assistant" || !Array.isArray(message.content)) continue
@@ -58,12 +67,11 @@ export function escalationContextFromMessages(messages: readonly unknown[]): {
     used += text.length
   }
   recent.reverse()
-  const userInputs = candidates.filter((item) => item.role === "user").map((item) => item.text)
   const currentUserInput = userInputs.at(-1) ?? ""
-  // The escalation reviewer sees the user's last three messages verbatim:
+  // Keep the last five user messages independently of the mixed-context window:
   // one denial may span multiple user turns, and the immediately-preceding
   // message is not always the request being executed.
-  const recentUserInputs = userInputs.slice(-3)
+  const recentUserInputs = userInputs.slice(-MAX_RECENT_USER_INPUTS)
   return { currentUserInput, recentContext: recent, recentUserInputs }
 }
 

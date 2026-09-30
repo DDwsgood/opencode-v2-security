@@ -45,7 +45,7 @@ import { access, appendFile, mkdir, readFile, realpath } from "node:fs/promises"
 import { homedir, release as osRelease } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { Effect, Schedule, Stream } from "effect"
+import { Effect, Latch, Stream } from "effect"
 import type { Plugin } from "@opencode-ai/plugin/effect/plugin"
 import type { Scope } from "effect"
 import { resolveClassifierShell } from "./shell-dialect"
@@ -887,12 +887,15 @@ const plugin: Plugin = {
     let consecutiveDynamicFailures = 0
     let lastDynamicFailureToastAt = 0
 
-    // --- temporary bypass state (activity-renewed lease) --------------------
-    // In-memory by design: a service restart clears every lease, and a lease
-    // expires when the session stays quiet for bypassLeaseTtlMs (TUI closed
-    // → no user activity → no renewal). Subagent children inherit the armed
-    // categories so a bypass armed on the root session covers its spawned
-    // subagents doing the actual shell work.
+    // --- temporary bypass state (fixed-expiry lease) ------------------------
+    // In-memory by design: a service restart clears every lease. `expiresAt`
+    // is an absolute deadline set at arm time — a user-supplied timeout of
+    // 120 means the bypass lapses 120 seconds later; activity never extends
+    // it. A timeout <= 0 arms a lease that never expires on its own (only
+    // `/bypass off`, session deletion, or a service restart ends it).
+    // Subagent children inherit the armed categories so a bypass armed on
+    // the root session covers its spawned subagents doing the actual shell
+    // work.
     type BypassLease = { categories: Set<BypassCategory>; expiresAt: number; all?: boolean }
     const bypassLeases = new Map<string, BypassLease>()
     // child → parent links (session lifetime, NOT lease lifetime): written on
@@ -1181,7 +1184,7 @@ const plugin: Plugin = {
       [
         "The user temporarily removed all opencode-v2-security enforcement for this session (/bypass ALL).",
         "You may retry the previously blocked command and continue within the user's authorization; be careful with your authorized scope and the changes you make.",
-        "The user can restore enforcement with /bypass off; it also expires on its own.",
+        "The user can restore enforcement with /bypass off. Positive timeouts expire at their deadline; zero or negative timeouts have no natural expiry.",
       ].join("\n")
     const BYPASS_ALL_RESTORED_REMINDER = () =>
       [
@@ -1208,17 +1211,54 @@ const plugin: Plugin = {
       return chain
     }
 
-    /** Renew the session's own lease and every live ancestor lease: child
-     * activity (a subagent doing the shell work) keeps the parent bypass the
-     * child inherits from expiring mid-work. Expired leases are ignored (the
-     * sweep owns removal + notification) so unrelated activity cannot revive a
-     * stale lease. */
-    function renewBypassLease(sessionID: string) {
+    /** Absolute expiry for a new/updated lease. `timeoutSec` is the optional
+     *  /bypass trailing argument in seconds: undefined → the configured
+     *  bypassLeaseTtlMs default; <= 0 → never expires on its own (Infinity);
+     *  a positive value → exactly now + timeoutSec seconds, clamped to the
+     *  safe-integer range so huge values cannot overflow into the past. */
+    function bypassExpiry(timeoutSec?: number): number {
+      if (timeoutSec !== undefined && timeoutSec <= 0) return Infinity
+      const ms = timeoutSec === undefined ? resolved.bypassLeaseTtlMs : timeoutSec * 1000
+      const expiresAt = Date.now() + ms
+      return Number.isSafeInteger(expiresAt) ? expiresAt : Number.MAX_SAFE_INTEGER
+    }
+
+    /** Effective expiry deadline for RPC payloads: the earliest live lease
+     *  along the session's own chain (the set a session actually inherits
+     *  ends when its earliest contributor does). null → armed without a
+     *  natural expiry; undefined → no live lease. */
+    function leaseExpiryForRpc(sessionID: string): number | null | undefined {
       const now = Date.now()
+      let earliest: number | undefined
       for (const target of [sessionID, ...bypassAncestors(sessionID)]) {
         const lease = bypassLeases.get(target)
-        if (lease && lease.expiresAt > now) lease.expiresAt = now + resolved.bypassLeaseTtlMs
+        if (lease && lease.expiresAt > now) {
+          if (lease.expiresAt === Infinity) return null
+          earliest = Math.min(earliest ?? lease.expiresAt, lease.expiresAt)
+        }
       }
+      return earliest
+    }
+
+    /** Milliseconds until the soonest lease expiry (the next sweep deadline),
+     *  capped so expiry is also detected after an unrelated wake. Never-
+     *  expiring leases contribute only the cap. */
+    const BYPASS_SWEEP_MAX_MS = 20_000
+    function nextBypassSweepDelay(): number {
+      const now = Date.now()
+      let soonest = BYPASS_SWEEP_MAX_MS
+      for (const lease of bypassLeases.values()) {
+        if (lease.expiresAt === Infinity) continue
+        soonest = Math.min(soonest, Math.max(50, lease.expiresAt - now))
+      }
+      return soonest
+    }
+
+    // Opened by lease mutations so the sweep loop re-computes its sleep
+    // instead of waiting out the previous (possibly much longer) deadline.
+    const bypassSweepWake = Latch.makeUnsafe(false)
+    function wakeBypassSweep() {
+      Latch.openUnsafe(bypassSweepWake)
     }
 
     /** Active bypass categories for a session: permanent config set ∪ the
@@ -1290,7 +1330,8 @@ const plugin: Plugin = {
       const permanent = [...resolved.bypassClassifier].sort()
       const active = activeForRpc(sessionID)
       const temporary = active.filter((category) => !resolved.bypassClassifier.has(category as BypassCategory))
-      void run(bypassRpc.events.emit("changed", { sessionID, reason, active, temporary, permanent })).catch(
+      const expiresAt = leaseExpiryForRpc(sessionID)
+      void run(bypassRpc.events.emit("changed", { sessionID, reason, active, temporary, permanent, expiresAt })).catch(
         () => {},
       )
     }
@@ -1393,17 +1434,39 @@ const plugin: Plugin = {
       | { kind: "categories"; action: "arm" | "disarm" | "toggle"; which: "allCategories" | readonly BypassCategory[] }
       | { kind: "killSwitch"; action: "arm" | "disarm" | "toggle" }
 
-    /** Parses /bypass arguments into ordered operations. Case rules: the
-     *  literal "ALL" (also +ALL/-ALL) is the kill switch; everything else is
-     *  lowercased before matching. Explicit `+token` always arms, `-token`
-     *  always disarms (never toggles); a bare token toggles against the
-     *  pre-command snapshot. Aliases: fs→filesystem, 0→off, all→* (the
-     *  complete category set — lowercase `all` is NOT the kill switch). */
-    function parseBypassArguments(text: string): { ops: BypassOp[]; invalid: string[] } {
+    /** Parses /bypass arguments into ordered operations plus an optional
+     *  timeout. Case rules: the literal "ALL" (also +ALL/-ALL) is the kill
+     *  switch; everything else is lowercased before matching. Explicit
+     *  `+token` always arms, `-token` always disarms (never toggles); a bare
+     *  token toggles against the pre-command snapshot. Aliases:
+     *  fs→filesystem, 0→off (when it is the only token — see the timeout rule
+     *  below), all→* (the complete category set — lowercase `all` is NOT the
+     *  kill switch).
+     *
+      *  Timeout: the LAST token may be a signed number, interpreted as
+     *  seconds until the session's lease expires (`/bypass fs 120` arms fs
+      *  for 120s; zero or a negative value arms it without a natural expiry). It is an
+     *  absolute deadline: activity never extends it. A bare `0` ALONE stays
+     *  the `off` alias for compatibility — the never-expire spelling is only
+      *  read as a timeout when at least one other token precedes it. A
+      *  number in any non-final position is an invalid
+     *  token, so malformed input rejects atomically without touching the
+     *  lease. */
+    function parseBypassArguments(text: string): { ops: BypassOp[]; invalid: string[]; timeoutSec?: number } {
       const ops: BypassOp[] = []
       const invalid: string[] = []
+      let timeoutSec: number | undefined
       const rawTokens = text.split(/[\s,]+/).map((t) => t.trim()).filter(Boolean)
-      for (const raw of rawTokens) {
+      for (const [index, raw] of rawTokens.entries()) {
+        // Timeout: a trailing signed number (non-integer seconds like 0.5
+        // are accepted; "Infinity" and 1e5 spellings are not and reject).
+        if (index === rawTokens.length - 1 && rawTokens.length > 1 && /^[+-]?\d+(\.\d+)?$/.test(raw)) {
+          const value = Number(raw)
+          if (Number.isFinite(value)) {
+            timeoutSec = value
+            continue
+          }
+        }
         // Sign is checked on the RAW token so "+ALL" resolves like "ALL".
         let sign: "+" | "-" | undefined
         let body = raw
@@ -1434,7 +1497,9 @@ const plugin: Plugin = {
         }
         invalid.push(raw)
       }
-      return { ops, invalid }
+      // Reject before mutating state: a timeout cannot apply after clearing.
+      if (timeoutSec !== undefined && ops.at(-1)?.kind === "clear") invalid.push("timeout after off")
+      return { ops, invalid, timeoutSec }
     }
 
     function bypassUsage(invalid: string[]): string {
@@ -1443,7 +1508,9 @@ const plugin: Plugin = {
         `Usage: /bypass <${[...BYPASS_CATEGORIES].join("|")}|fs|*|all|ALL|off> — ` +
         `categories space or comma separated; legacy aliases: fs=filesystem, os=host+privilege+indirection, web=network+remote; ` +
         `* or all = all ${BYPASS_CATEGORIES.length} categories; uppercase ALL or yolo/YOLO = the kill switch (all plugin enforcement off) — prefer specific categories when possible; ` +
-        `off/0 clears everything. +token arms, -token disarms, a bare token toggles.\n` +
+        `off/0 clears everything. +token arms, -token disarms, a bare token toggles. ` +
+        `A trailing bare number is the timeout in seconds — an absolute deadline, never extended by activity; ` +
+        `A zero or negative timeout (e.g. "/bypass fs -1") means no natural expiry until /bypass off.\n` +
         `host = running-system state (processes, services, power, persistence); privilege = crossing permission or ` +
         `isolation boundaries (sudo/doas/su/pkexec/sudoedit, chown, capabilities, kernel parameters, namespaces) — when privilege is ` +
         `armed and a call needs it, that call runs host-direct without the OS sandbox, or is refused loudly if the ` +
@@ -1451,14 +1518,14 @@ const plugin: Plugin = {
       )
     }
 
-    function armBypassLease(sessionID: string, categories: Set<BypassCategory>) {
+    function armBypassLease(sessionID: string, categories: Set<BypassCategory>, timeoutSec?: number) {
       // A new arm keeps an already-armed `all` kill switch: narrowing the
       // category set must not silently re-enable the enforcement layers the
       // user turned off; only `off`/clear or lease expiry lifts `all`.
       const all = bypassLeases.get(sessionID)?.all === true
       bypassLeases.set(sessionID, {
         categories: new Set(categories),
-        expiresAt: Date.now() + resolved.bypassLeaseTtlMs,
+        expiresAt: bypassExpiry(timeoutSec),
         all,
       })
       // Freshly armed session: prior rejection records would keep forcing
@@ -1471,10 +1538,10 @@ const plugin: Plugin = {
       }
     }
 
-    function armBypassAll(sessionID: string) {
+    function armBypassAll(sessionID: string, timeoutSec?: number) {
       bypassLeases.set(sessionID, {
         categories: new Set(activeBypass(sessionID)),
-        expiresAt: Date.now() + resolved.bypassLeaseTtlMs,
+        expiresAt: bypassExpiry(timeoutSec),
         all: true,
       })
       const state = sessions.get(sessionID)
@@ -2008,7 +2075,7 @@ const plugin: Plugin = {
         // reviewer call when no grantable category set could ever let the
         // static layer pass this command.
         await precheckEscalationFloor(sessionID, request, classifyContext)
-        return await performEscalationReview(sessionID, request, failures, pending)
+        return await performEscalationReview(sessionID, request, failures, pending, classifyContext)
       } finally {
         if (escalationPending.get(sessionID) === pending) {
           escalationPending.delete(sessionID)
@@ -2022,6 +2089,7 @@ const plugin: Plugin = {
       request: EscalationRequest,
       failures: FailedEscalationRecord[],
       pending: object,
+      classifyContext: EscalationClassifyContext,
     ): Promise<readonly BypassCategory[]> {
       const dynamic = resolved.dynamicReview
       if (!dynamic.available || !dynamic.endpoint || !dynamic.model || !dynamic.apiKey) {
@@ -2060,6 +2128,8 @@ const plugin: Plugin = {
           currentUserInput,
           recentUserInputs,
           recentContext,
+          cwd: classifyContext.cwd,
+          worktree: classifyContext.worktree,
           permScope: { r: perm.r, w: perm.w, x: perm.x },
           previousFailedEscalations: failures,
         }
@@ -2214,7 +2284,6 @@ const plugin: Plugin = {
           delete (ev.input as Record<string, unknown> | undefined)?.permission
         }
         if (ev.tool === "shell" || ev.tool === "bash") {
-          renewBypassLease(ev.sessionID)
           const input = ev.input as Record<string, unknown>
           const command = commandFromArgs(input)
           if (command !== undefined) {
@@ -2321,9 +2390,8 @@ const plugin: Plugin = {
       // no lease is written, no reminder is sent, nothing survives the call.
       if (escalationGranted) for (const category of escalationGranted) bypassed.add(category)
       const bypassedCategories = bypassed.size > 0 ? bypassed : undefined
-      // Executing a command in this session is activity: renew its lease so an
-      // actively worked session keeps its bypass while the TUI stays open.
-      renewBypassLease(sessionID)
+      // Bypass leases are fixed-deadline: executing a command here must NOT
+      // renew them, or a user-set timeout would silently become idle-based.
 
       const staticDecision: StaticSecurityDecision = await classifyShellCommand({
         script,
@@ -2943,19 +3011,10 @@ const plugin: Plugin = {
     // manual `eventRunning`/iterator cleanup.
     //
     // The same consumer maintains the temporary-bypass lease:
-    //  - `session.created` records parent→child links so subagents inherit an
-    //    armed bypass (bypassPropagateToSubagents, default true);
-    //  - activity events (viewed / inbox delivered / execution started) renew
-    //    the lease of the session they name, approximating "TUI still open":
-    //    with the TUI closed no user-visible activity flows and the lease
-    //    expires after bypassLeaseTtlMs.
-    const BYPASS_RENEWAL_EVENTS = new Set([
-      "session.viewed",
-      "session.inbox.delivered",
-      "session.execution.started",
-      "session.step.started",
-      "session.shell.started",
-    ])
+    // `session.created` records parent→child links so subagents inherit an
+    // armed bypass (bypassPropagateToSubagents, default true). Activity events
+    // deliberately do NOT renew leases: expiry is an absolute deadline so a
+    // user-set timeout (and the default) means exactly that long.
     yield* ctx.event
       .subscribe()
       .pipe(
@@ -3028,9 +3087,6 @@ const plugin: Plugin = {
               }
               return
             }
-            if (typeof sessionID === "string" && BYPASS_RENEWAL_EVENTS.has(e?.type ?? "")) {
-              renewBypassLease(sessionID)
-            }
           }),
         ),
       )
@@ -3051,6 +3107,7 @@ const plugin: Plugin = {
               active,
               temporary: active.filter((category) => !resolved.bypassClassifier.has(category as BypassCategory)),
               permanent: [...resolved.bypassClassifier].sort(),
+              expiresAt: leaseExpiryForRpc(input.sessionID),
             }
           }),
       })
@@ -3058,12 +3115,16 @@ const plugin: Plugin = {
     // --- 8c. lease expiry sweep ---------------------------------------------
     // Lease pruning is otherwise lazy (activeBypass merely skips expired
     // entries), so without a timer the expiry transition — the agent reminder
-    // and the user notification — would never fire.
-    const BYPASS_SWEEP_INTERVAL_MS = 20_000
-    yield* Effect.sync(() => sweepExpiredBypass()).pipe(
-      Effect.repeat(Schedule.spaced(`${BYPASS_SWEEP_INTERVAL_MS} millis`)),
-      Effect.forkScoped,
-    )
+    // and the user notification — would never fire. The delay adapts to the
+    // soonest expiry so a short user-set timeout notifies promptly, and any
+    // lease mutation opens the wake latch to recompute the deadline.
+    yield* Effect.forever(
+      Effect.gen(function* () {
+        sweepExpiredBypass()
+        Latch.closeUnsafe(bypassSweepWake)
+        yield* Effect.race(Effect.sleep(nextBypassSweepDelay()), Latch.await(bypassSweepWake))
+      }),
+    ).pipe(Effect.forkScoped)
 
     // --- 8e. session rwx permission layer -----------------------------------
     // Structural enforcement only: the permission.evaluate hook (primary
@@ -3306,15 +3367,17 @@ const plugin: Plugin = {
     // into an error toast carrying the usage. The agent is told of effective-set
     // transitions via an appended synthetic user message (except the `slow`
     // category, which never notifies the agent); the user, via the RPC event.
-    //   /bypass <cat...>  arm categories (additive; space or comma separated)
-    //   /bypass *         arm every category in BYPASS_CATEGORIES
-    //   /bypass all       session kill switch: ALL plugin enforcement off
-    //   /bypass off       clear the session's lease, including the kill switch
+    //   /bypass <cat...>        arm categories (additive; space or comma separated)
+    //   /bypass <cat...> 120    arm with a 120-second absolute timeout
+    //   /bypass <cat...> 0      arm with no natural expiry (until /bypass off)
+    //   /bypass *               arm every category in BYPASS_CATEGORIES
+    //   /bypass all             session kill switch: ALL plugin enforcement off
+    //   /bypass off             clear the session's lease, including the kill switch
     yield* ctx.command.transform((draft) => {
       draft.add({
         name: "bypass",
         description:
-          `Toggle/arm bypass categories for this session (${BYPASS_CATEGORIES.join("|")}; legacy: fs=filesystem, os=host+privilege+indirection, web=network+remote; '*'|all=all categories, uppercase ALL=kill switch that disables all plugin enforcement — prefer specific categories when possible, off/0=clear; +token arms, -token disarms, bare token toggles)`,
+           `Toggle/arm bypass categories for this session (${BYPASS_CATEGORIES.join("|")}; legacy: fs=filesystem, os=host+privilege+indirection, web=network+remote; '*'|all=all categories, uppercase ALL=kill switch that disables all plugin enforcement — prefer specific categories when possible, off/0=clear; +token arms, -token disarms, bare token toggles; a trailing number is the timeout in seconds — absolute deadline, activity never extends it, <=0=no natural expiry)`,
         execute: (input) =>
           Effect.gen(function* () {
             const sessionID = input.sessionID
@@ -3337,7 +3400,7 @@ const plugin: Plugin = {
               }
               if (op.kind === "killSwitch") {
                 const act = op.action === "toggle" ? (snapshotAll ? "disarm" : "arm") : op.action
-                if (act === "arm") armBypassAll(sessionID)
+                if (act === "arm") armBypassAll(sessionID, args.timeoutSec)
                 else {
                   const lease = bypassLeases.get(sessionID)
                   if (lease) bypassLeases.set(sessionID, { ...lease, all: false })
@@ -3355,9 +3418,25 @@ const plugin: Plugin = {
               const next = activeBypass(sessionID)
               if (act === "arm") for (const c of targets) next.add(c)
               else for (const c of targets) next.delete(c)
-              armBypassLease(sessionID, next)
+              armBypassLease(sessionID, next, args.timeoutSec)
               reason = wasActive ? "updated" : "armed"
             }
+            // The timeout applies to the session's overall lease: it can
+            // re-point the expiry of an existing lease, and an arm without a
+            // timeout resets to the configured default. A timeout that leaves
+            // no live lease ("/bypass off 120", or a bare timeout on a session
+            // with no bypass) is an explicit error.
+            if (args.timeoutSec !== undefined) {
+              const lease = bypassLeases.get(sessionID)
+              if (!lease) {
+                return yield* Effect.fail(
+                  new Error("No active bypass lease to set a timeout on — arm categories first, e.g. /bypass fs 120"),
+                )
+              }
+              bypassLeases.set(sessionID, { ...lease, expiresAt: bypassExpiry(args.timeoutSec) })
+              reason = wasActive ? "updated" : "armed"
+            }
+            wakeBypassSweep()
             syncAgentReminder(sessionID)
             if (!allBypassed(sessionID)) syncPermReminder(sessionID)
             emitBypassChanged(sessionID, reason)

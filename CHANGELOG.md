@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.3.0 (2026-09-30)
+
+- Separate inert payload text from executed commands. Proven data writers no
+  longer inherit destructive findings from their fixture/script bodies;
+  ambiguous consumers route to dynamic review instead of a static hard deny.
+  Actual execution, shell expansion, hard floors and read/write ceilings remain
+  enforced. Both dynamic reviewer prompts explicitly allow merely storing or
+  printing payloads without executing them.
+- Escalation review receives the last five user messages, a larger bounded
+  prose window, and actual cwd/worktree. Routine administration, dependency
+  installation and issuer authentication are not harm by themselves. Jev's
+  deny band requires substantial harm/unsafe corroboration; category matching
+  uses executable positions rather than words inside payload text.
+- Retain Jev, with accident-oriented prompts targeting wrong cwd/targets,
+  empty-variable globs, durable-data overwrites and loss of uncommitted work.
+  Evaluated 20 prompt candidates through the full multi-question pipeline with
+  more than 8,000 new completed HTTP requests; inspected real database refusals
+  separately from test-session logs and infrastructure/permission errors.
+  Development-set accuracy is not a guarantee of zero production false blocks.
+- `/bypass category[,category] [timeout]` accepts seconds. Positive timeouts
+  expire at an absolute deadline, never renewed by session or child activity;
+  zero/negative timeouts never naturally expire. Omitted timeout uses the
+  configured default. `/bypass off`, session deletion and plugin unload still
+  clear leases. TUI notifications show the deadline/never-expire state, and
+  invalid timeout input rejects before mutating the lease.
+
 ## 1.2.1 (2026-09-29)
 
 - Reworked the Jev escalation mapping for LOOSE unattended operation

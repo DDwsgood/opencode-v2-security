@@ -30,16 +30,34 @@ type Context = Plugin.Context
 
 type Toast = { title: string; message: string; variant: "info" | "success" | "warning" | "error"; duration: number }
 
+/** Compact human duration for toast copy ("in 90s", "in 2m", "in 1h"). */
+function formatDuration(ms: number): string {
+  const sec = Math.round(ms / 1000)
+  if (sec < 90) return `${sec}s`
+  const min = Math.round(sec / 60)
+  if (min < 90) return `${min}m`
+  const hr = Math.round(min / 60)
+  return `${hr}h`
+}
+
 function toastFor(data: BypassChangedData): Toast {
   const active = data.active.length > 0 ? data.active.join(", ") : "none"
   const temporary = data.temporary.length > 0 ? data.temporary.join(", ") : "none"
+  // Lease deadlines are absolute (activity never extends them); the payload
+  // carries the effective expiry so the toast can state the real deadline.
+  const expiry =
+    data.expiresAt === null
+      ? "never expires until /bypass off"
+      : typeof data.expiresAt === "number"
+        ? `expires in ${formatDuration(Math.max(0, data.expiresAt - Date.now()))}`
+        : "expires on its own schedule"
   // Kill-switch transitions get their own loud error toast: "armed" with
   // "ALL" in the active list means every plugin enforcement layer is off.
   if (allIsOff(data.active) && (data.reason === "armed" || data.reason === "updated")) {
     return {
       title: "ALL plugin enforcement OFF",
       message:
-        "Static/dynamic classification, slow-command checks, injection detection, sandbox wrapping, and permission gates are all disabled for this session. /bypass off restores them.",
+        `Static/dynamic classification, slow-command checks, injection detection, sandbox wrapping, and permission gates are all disabled for this session (${expiry}). /bypass off restores them.`,
       variant: "error",
       duration: 10000,
     }
@@ -48,14 +66,14 @@ function toastFor(data: BypassChangedData): Toast {
     case "armed":
       return {
         title: "Classifier bypass armed",
-        message: `Active: ${active}. Protections relaxed for this session; expires after inactivity. Run /bypass for details.`,
+        message: `Active: ${active}. Protections relaxed for this session; ${expiry}. Run /bypass for details.`,
         variant: "warning",
         duration: 8000,
       }
     case "updated":
       return {
         title: "Classifier bypass updated",
-        message: `Active: ${active} (temporary: ${temporary}).`,
+        message: `Active: ${active} (temporary: ${temporary}; ${expiry}).`,
         variant: "warning",
         duration: 6000,
       }

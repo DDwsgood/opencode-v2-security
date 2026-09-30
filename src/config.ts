@@ -118,8 +118,10 @@ export type BashClassifierOptions = {
   logReviewerTrace?: boolean
   /** Permanently armed escape-hatch categories (all sessions, all clients). */
   BypassClassifier?: Array<BypassCategory | keyof typeof LEGACY_CATEGORY_ALIASES>
-  /** Activity-renewed lease TTL for temporary per-session bypass entries, in
-   * milliseconds. Default 20 minutes. */
+  /** Default lifetime for temporary per-session bypass leases, in
+   * milliseconds, used when a /bypass arm carries no trailing timeout.
+   * Leases expire at a fixed absolute deadline: activity never renews them.
+   * Default 20 minutes. */
   bypassLeaseTtlMs?: number
   /** Whether a session's temporary bypass also covers its subagent children
    * (default true). */

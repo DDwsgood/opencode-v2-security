@@ -187,7 +187,11 @@ describe("E2: data heredocs masked only when proven inert", () => {
     expect(await rules("cat <<'EOF' | sh\nrm -rf ~/work\nEOF", "LOOSE")).toContain("filesystem.forced-recursive-delete")
     expect(await verdict("cat <<'EOF' | sh\nrm -rf ~/work\nEOF", "LOOSE")).toBe("DENY")
     expect(await verdict("cat <<'EOF' | tee f | sh\nrm -rf ~/work\nEOF", "LOOSE")).toBe("DENY")
-    expect(await verdict("cat <<'EOF' | unknowncmd\nrm -rf ~/work\nEOF", "LOOSE")).toBe("DENY")
+    // An unrecognized downstream consumer is ambiguous payload text: the
+    // dynamic reviewer decides (ASK) instead of the static floor (DENY).
+    expect(await rules("cat <<'EOF' | unknowncmd\nrm -rf ~/work\nEOF", "LOOSE")).toContain("execution.ambiguous-heredoc")
+    expect(await verdict("cat <<'EOF' | unknowncmd\nrm -rf ~/work\nEOF", "LOOSE")).toBe("ASK")
+    expect(await verdict("cat <<'EOF' | unknowncmd | sh\nrm -rf ~/work\nEOF", "LOOSE")).toBe("DENY")
     expect(await verdict("sh <<'EOF'\nrm -rf ~/work\nEOF", "LOOSE")).toBe("DENY")
     expect(await verdict("cat <<EOF\n$(rm -rf /)\nEOF", "LOOSE")).toBe("DENY")
     expect(await verdict("cat <<EOF\n`id`\nEOF", "LOOSE")).not.toBe("ALLOW")

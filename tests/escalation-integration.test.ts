@@ -411,10 +411,33 @@ describe("escalation allow_once", () => {
     expect(user).toContain("needed for the requested audit")
     expect(user).toContain('"secret"')
     expect(user).toContain('"filesystem"')
+    expect(user).toContain("Execution cwd:")
+    expect(user).toContain("Execution worktree:")
+    expect(user).toContain(await ensureWorkdir())
     // Permission scope booleans are passed through verbatim (default = rwx).
     expect(user).toMatch(/"r"\s*:\s*true/)
     expect(user).toMatch(/"w"\s*:\s*true/)
     expect(user).toMatch(/"x"\s*:\s*true/)
+  })
+
+  test("five user turns survive intervening assistant messages in the wire request", async () => {
+    const mock = await startReviewer(decision("allow_once"))
+    const messages: unknown[] = [{ type: "user", text: "obsolete task" }]
+    for (let index = 0; index < 5; index++) {
+      messages.push({ type: "user", text: `user task ${index}` })
+      for (let reply = 0; reply < 4; reply++) {
+        messages.push({ type: "assistant", content: [{ type: "text", text: `step ${index}.${reply}` }] })
+      }
+    }
+    const h = await startPlugin({
+      reviewCommand: async () => ({ decision: "ALLOW", categories: [] }),
+    }, mock, messages)
+    const input = { command: escalation("secret", "inspect requested account metadata", "cat /etc/shadow") }
+    expect(await runBefore(h, "shell", "s1", input)).toBeUndefined()
+    const user = userPromptOf(mock.requests[0].body)
+    for (let index = 0; index < 5; index++) expect(user).toContain(untrusted(`user task ${index}`))
+    expect(user).not.toContain("obsolete task")
+    expect(user).toContain(untrusted("step 4.3"))
   })
 
   test("a denied ask_user escalates nothing: the command never reaches the pipeline", async () => {

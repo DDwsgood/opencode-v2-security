@@ -35,6 +35,10 @@ export const BypassRpc = {
           active: { type: "array", items: { type: "string" } },
           temporary: { type: "array", items: { type: "string" } },
           permanent: { type: "array", items: { type: "string" } },
+          // Effective lease deadline (epoch ms) — the earliest live lease in
+          // the session's chain. null = armed with no natural expiry
+          // (timeout <= 0); absent = no live lease.
+          expiresAt: { type: ["number", "null"] },
         },
         required: ["sessionID", "permission", "active", "temporary", "permanent"],
         additionalProperties: false,
@@ -52,6 +56,9 @@ export const BypassRpc = {
           active: { type: "array", items: { type: "string" } },
           temporary: { type: "array", items: { type: "string" } },
           permanent: { type: "array", items: { type: "string" } },
+          // Effective lease deadline (epoch ms); null = no natural expiry;
+          // absent = no live lease.
+          expiresAt: { type: ["number", "null"] },
         },
         required: ["sessionID", "reason", "active", "temporary", "permanent"],
         additionalProperties: false,
@@ -82,6 +89,10 @@ export type BypassChangedData = {
   readonly active: readonly string[]
   readonly temporary: readonly string[]
   readonly permanent: readonly string[]
+  /** Effective lease deadline (epoch ms). null = armed with no natural
+   * expiry (timeout <= 0); absent = no live lease. Fixed: activity never
+   * pushes it later. */
+  readonly expiresAt?: number | null
 }
 
 /** Reply of the RPC `status` method: the full bypass + permission state for
@@ -93,4 +104,6 @@ export type BypassStatusData = {
   readonly active: readonly string[]
   readonly temporary: readonly string[]
   readonly permanent: readonly string[]
+  /** See BypassChangedData.expiresAt. */
+  readonly expiresAt?: number | null
 }

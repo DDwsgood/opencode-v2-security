@@ -38,10 +38,12 @@ export type EscalationReviewRequest = {
   categories: readonly string[]
   justification: string
   currentUserInput: string
-  /** The user's last three messages, oldest first — one escalation may span
+  /** The user's last five messages, oldest first — one escalation may span
    * several user turns, so the reviewer sees more than the latest input. */
   recentUserInputs?: readonly string[]
   recentContext: readonly EscalationReviewContextMessage[]
+  cwd?: string
+  worktree?: string
   permScope: EscalationReviewPermissionScope
   previousFailedEscalations?: readonly PreviousFailedEscalation[]
   previousDenial?: PreviousDenial

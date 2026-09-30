@@ -117,7 +117,8 @@ class EscalationReviewerTests(unittest.TestCase):
         self.assertIn("never raises the session's read/write/execute permission ceiling", system)
         self.assertIn("permScope.w is false, return ask_user", system)
         self.assertIn("previousFailedEscalations lists only ask_user and deny outcomes", system)
-        self.assertIn("legitimate user request, including the reasonable steps that request implies", system)
+        self.assertIn("reasonable task-related work, including implied steps", system)
+        self.assertIn("last five user messages", system)
         self.assertNotIn("literal shell escape", system)
         self.assertNotIn("explicit user request", system)
         self.assertIn("first attempt", prompt)
@@ -313,7 +314,8 @@ class PromptContentTests(unittest.TestCase):
         self.assertIn("requested categories to cover every riskCategory", system)
         self.assertIn("prefer ask_user over allow_once", system)
         # Write-vs-execute clause.
-        self.assertIn("is inert unless this same command also executes it", system)
+        self.assertIn("merely writing or printing fixtures", system)
+        self.assertIn("command substitutions or subsequent execution", system)
         self.assertIn("executing a script later is a different command", system)
         # Disambiguation list: compact, defines exactly the canonical set, and
         # never teaches layer toggles as grantable families.

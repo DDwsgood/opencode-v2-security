@@ -375,13 +375,18 @@ class TestRmPathNormalization(unittest.TestCase):
         self.assertEqual(jev._normalize_rm_target("a/b/../../x"), "x")
 
     def test_rm_scan_denies_traversal_and_uncertain(self) -> None:
-        # `a/../..` and bare `..` used to normalize to "" / drop the escape.
-        self.assertIsNotNone(jev._rm_scan("rm -rf a/../..", armed=set()))
-        self.assertIsNotNone(jev._rm_scan("rm -rf ..", armed=set()))
-        self.assertIsNotNone(jev._rm_scan("rm -rf ./x/../../", armed=set()))
-        # Unverifiable targets stay flagged even under a filesystem grant.
+        # v1.3.0 semantics: operands whose last component resolves to '.'
+        # or '..' are refused by GNU rm outright — `rm -rf ..`,
+        # `rm -rf a/../..` delete nothing and are no longer flagged.
+        self.assertIsNone(jev._rm_scan("rm -rf a/../..", armed=set()))
+        self.assertIsNone(jev._rm_scan("rm -rf ..", armed=set()))
+        self.assertIsNone(jev._rm_scan("rm -rf .", armed=set()))
+        self.assertIsNone(jev._rm_scan("rm -rf ./x/../../", armed=set()))
+        # But a `..` that escapes with surviving real components still
+        # flags (`a/../../b` normalizes to `../b`).
+        self.assertIsNotNone(jev._rm_scan("rm -rf a/../../b", armed=set()))
         self.assertIsNotNone(
-            jev._rm_scan("rm -rf a/../..", armed={"filesystem"}))
+            jev._rm_scan("rm -rf a/../../b", armed={"filesystem"}))
 
     def test_floor_and_user_targets_unchanged(self) -> None:
         self.assertEqual(jev._normalize_rm_target("/etc"), "/etc")
