@@ -1,5 +1,96 @@
 # Changelog
 
+## 1.4.0 (2026-10-03)
+
+### Jev payload/execution boundaries
+
+- Jev review: apply a shared execution-consumer scope to all 23 questions;
+  distinguish nested code/JSON data from executed programs, and retain actual
+  protected-target overwrite checks even for inert replacement payloads.
+- Present narrowly proven quoted-heredoc file data separately without removing
+  contents or adding an ALLOW shortcut; keep cwd changes, ambiguous producers,
+  protected targets and execution consumers in their original layout.
+- Fix shell-fed heredoc hard guards: interpreter names must be command words,
+  not filename/argument substrings; inspect the appropriate program body with
+  bounded nested execution checks. Invalidate prior prompt verdict caches.
+- Add 29 Python regressions and the small-batch research record, corpora and
+  optimized prompt. Risk thresholds, permissions and sandbox policy unchanged.
+- Carry one-call authorization into every judge and appeal question; align
+  armed appeal floors with the main unconditional floor. Keep the second
+  dynamic review and all DENYs; do not repeat already-authorized risk labels
+  in escalation hints, while retaining full denial records.
+- Enforce HARD's existing complete-script-inspection requirement using
+  host-identified executed-script context. An indirection grant removes only
+  that requirement, not another DENY or a safety floor; LOOSE is unchanged.
+
+### TUI state freshness
+
+- Re-subscribe RPC notifications and fetch authoritative permission/bypass
+  snapshots after reconnects and session lifecycle/compaction events. Refresh
+  known family members when an ancestor's state changes, using each session's
+  own location rather than the current terminal location.
+- Ignore late snapshots after plugin disposal and after session deletion;
+  keep notification-handler errors from terminating subscriptions. No polling
+  or server permission changes were introduced.
+
+### Static proofs and read-only enforcement
+
+- Release-audit fixes: fail closed on unresolved/mutated Python callable and
+  argument aliases, expanded write modes, computed access, writable NumPy
+  mappings and pickle loading. Parse SQL quoting/comments without hiding real
+  writes or quoted executable function names; tighten curl write-out, tmux
+  command chaining, compact gh mutations and stateful SQLite pragmas.
+
+- LOOSE read-write sessions gain semantic static-allow proofs that run after
+  every danger scan: an AST read-only prover for Python (`-c`, stdin heredoc,
+  local scripts), read-only sqlite3 SQL, `gh` reads, tmux listing,
+  version/help queries, loopback-only `curl` GET/HEAD, the RO read-only
+  vocabulary reused for RW, compound-statement bodies, literal variable and
+  loop-variable binding, and credential-safe glob operands of readers. No
+  semantic proof covers remote network requests. On a fixed replay of 9,095
+  reviewer-labelled commands static ALLOW rose from 8.1% to 44.4%, with no
+  reviewer-denied command statically allowed and no new static DENY.
+- LOOSE read-only sessions (`permScope.w=false`) share the lexer and
+  vocabulary relaxations instead of keeping the stricter 1.3.0 verdicts:
+  `sed -n … 2>/dev/null`, `~`-prefixed paths, for/if compound bodies, the
+  `:` builtin, `git worktree list`/`git stash list`, and glob read operands
+  are now proven read-only there too. The write ceiling is unchanged
+  (writes outside the scratch root still deny, with or without the kernel
+  sandbox). Replay: static ALLOW rose from 1,066 to 2,252 of 9,095 without
+  the kernel and from 7,246 to 7,397 with it; no reviewer-denied command
+  became a static ALLOW. HARD keeps the 1.3.0 verdicts row for row.
+- New `trustedCommands` option: user-declared command prefixes are statically
+  allowed in LOOSE read-write sessions once every danger scan passes.
+- False-negative fixes in all modes:
+  - git `--output`/`--ext-diff`/`--open-files-in-pager`, find `-fprint*`/
+    `-fls`, awk `getline`/`print >`/`print |`, sed `w`, `xxd -r`, tar/zip
+    program-running options, and same-directory Python modules that shadow
+    the standard library in `python3 dir/x.py` (now inspected and
+    fingerprinted with the script).
+  - A compound-command keyword left by segment splitting (`then`, `do`,
+    `if`, `else`, `!`, `{` …) no longer hides the command behind it from the
+    read-only interop and mutation gates: an interop binary such as
+    `pwsh.exe -Command 'Remove-Item …'` wrapped in `if … then` used to ride
+    the unrecognized-leaf kernel passthrough in read-only sessions — the
+    Linux kernel sandbox cannot contain Windows-side processes, so these now
+    deny exactly like the bare command.
+  - The temp-confined early allow no longer bypasses the executor-capability
+    scans: `sed -n '1e id' x > /tmp/o` and `awk 'BEGIN{system(…)}' > /tmp/o`
+    executed code behind a /tmp redirect in every mode. awk joins sed, rg,
+    and `git grep` in the executor-capability gate (system/getline/
+    print-pipe shapes, with quoted-string blanking so `print $1" || "$3`
+    is not mistaken for a pipe).
+  - Inline interpreter code that names a credential store
+    (`python3 -c "print(open('/home/u/.ssh/id_rsa').read())"`,
+    `node -e "…readFileSync('/home/u/.ssh/id_rsa')…"`) no longer rides a
+    "pure read" proof or the kernel passthrough: the credential vocabulary
+    from the path registry is matched against argument and code text, and
+    read-only sessions now deny (without kernel) or send it to review
+    (kernel-enforced) instead of statically allowing the read. On the fixed
+    replay this removed the last 4 commands that a read-only
+    kernel-enforced session statically allowed although the dynamic reviewer
+    had denied them.
+
 ## 1.3.0 (2026-09-30)
 
 - Separate inert payload text from executed commands. Proven data writers no

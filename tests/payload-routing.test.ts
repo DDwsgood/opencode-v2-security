@@ -63,16 +63,18 @@ describe("payload text that is only written or stored is never floor-denied", ()
 
   // Language `-c`/`-e` payloads that only manipulate strings/files: no proven
   // execution sink, so the dynamic reviewer decides — ASK, never a floor DENY.
-  for (const [label, script] of [
-    ["python writes payload string", "python3 -c 'open(\"x.sh\",\"w\").write(\"rm -rf /\")'"],
-    ["python prints payload string", "python3 -c 'print(\"rm -rf /\")'"],
-    ["python stores payload string", "python3 -c 's=\"rm -rf /\"'"],
-    ["node writes payload string", "node -e 'require(\"fs\").writeFileSync(\"x.sh\",\"rm -rf /\")'"],
+  // Under LOOSE a Python program the AST prover shows to be read-only is a
+  // static ALLOW instead; writing the payload to a file still reviews.
+  for (const [label, script, looseVerdict] of [
+    ["python writes payload string", "python3 -c 'open(\"x.sh\",\"w\").write(\"rm -rf /\")'", "ASK"],
+    ["python prints payload string", "python3 -c 'print(\"rm -rf /\")'", "ALLOW"],
+    ["python stores payload string", "python3 -c 's=\"rm -rf /\"'", "ALLOW"],
+    ["node writes payload string", "node -e 'require(\"fs\").writeFileSync(\"x.sh\",\"rm -rf /\")'", "ASK"],
   ] as const) {
     for (const mode of ["LOOSE", "HARD"] as const) {
-      test(`${mode}: ${label} routes to dynamic review`, async () => {
+      test(`${mode}: ${label} is never floor-denied`, async () => {
         const d = await classify(script, mode)
-        expect(d.verdict).toBe("ASK")
+        expect(d.verdict).toBe(mode === "LOOSE" ? looseVerdict : "ASK")
         expect(d.rules).not.toContain("filesystem.forced-recursive-delete")
       })
     }

@@ -402,12 +402,14 @@ test("shell heredoc body with definite-destructive command is denied", async () 
 // every body to dynamic review.
 describe("lang heredoc rule scan sees only sink argument blocks", () => {
   test("python comments and string literals do not deny", async () => {
-    const d = await classify(
-      "python3 - <<'EOF'\n# rm -rf /  dangerous comment\npatterns=['rm -rf /tmp/x','sudo id']\nEOF",
-      "LOOSE",
-    )
-    expect(d.verdict).toBe("ASK")
-    expect(d.rules).toContain("execution.local-script")
+    const script = "python3 - <<'EOF'\n# rm -rf /  dangerous comment\npatterns=['rm -rf /tmp/x','sudo id']\nEOF"
+    // LOOSE: the program provably only builds a list.
+    const loose = await classify(script, "LOOSE")
+    expect(loose.verdict).toBe("ALLOW")
+    expect(loose.rules).toContain("execution.python-readonly")
+    const hard = await classify(script, "HARD")
+    expect(hard.verdict).toBe("ASK")
+    expect(hard.rules).toContain("execution.local-script")
   })
   test("subprocess.run shell sink with rm -rf denies", async () => {
     const d = await classify(
@@ -1144,19 +1146,19 @@ describe("read-only session: kernel-enforced pass-through + scratch carve-out", 
     }
   })
 
-  // The for-loop stays unproven without the kernel: read-grep over a loop is
-  // not statically enumerable. Kernel-enforced LOOSE passes it through.
-  test("LIVE-5 for-loop: DENY without kernel (LOOSE)", async () => {
+  // LOOSE binds the loop variable to each literal word, so the body is a
+  // proven read in every iteration with or without the kernel. HARD keeps the
+  // loop unproven.
+  test("LIVE-5 for-loop: LOOSE proves the bound body read-only without kernel", async () => {
     const s = `cd /tmp/opencode; for f in game.js game_formatted.js verify.js index_test.html index_fixed.html; do printf "%-22s " "$f"; grep -c "syncMouseButtons" "$f" 2>/dev/null | tr '\\n' ' '; grep -c "lastLockExit" "$f" 2>/dev/null | tr '\\n' ' '; done`
     const d = await classify(s, "LOOSE", noKern)
-    expect(d.verdict).toBe("DENY")
-    expect(d.rules).toContain("permission.write")
+    expect(d.verdict).toBe("ALLOW")
+    expect(d.rules).toContain("operation.control-flow")
   })
   test("LIVE-5 for-loop: kernel-enforced LOOSE allows", async () => {
     const s = `cd /tmp/opencode; for f in game.js game_formatted.js verify.js index_test.html index_fixed.html; do printf "%-22s " "$f"; grep -c "syncMouseButtons" "$f" 2>/dev/null | tr '\\n' ' '; grep -c "lastLockExit" "$f" 2>/dev/null | tr '\\n' ' '; done`
     const d = await classify(s, "LOOSE", kern)
     expect(d.verdict).toBe("ALLOW")
-    expect(d.rules).toContain("operation.kernel-enforced")
   })
   test("LIVE-5 for-loop: kernel-enforced HARD still denies", async () => {
     const s = `cd /tmp/opencode; for f in game.js game_formatted.js verify.js index_test.html index_fixed.html; do printf "%-22s " "$f"; grep -c "syncMouseButtons" "$f" 2>/dev/null | tr '\\n' ' '; grep -c "lastLockExit" "$f" 2>/dev/null | tr '\\n' ' '; done`

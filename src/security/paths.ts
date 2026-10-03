@@ -2,7 +2,26 @@
 // sensitivity classification against a static registry. Mirrors the design of
 // Claude Code's pathValidation.ts: a command is only provably safe when every
 // read/write argument is known, literal, and inside an allowed area.
+import { AsyncLocalStorage } from "node:async_hooks"
 import path from "node:path"
+
+/** Set for the duration of one classification: LOOSE read-write ("rw"),
+ *  LOOSE read-only ("ro"), or HARD ("off"). Lexer and vocabulary relaxations
+ *  that only exist to raise the LOOSE static-allow rate check it, so HARD
+ *  (and any helper called outside a classification) keeps the stricter
+ *  original behavior. */
+export const looseRelaxationScope = new AsyncLocalStorage<"rw" | "ro" | "off">()
+
+export function looseRelaxationsActive(): boolean {
+  const scope = looseRelaxationScope.getStore()
+  return scope === "rw" || scope === "ro"
+}
+
+/** Relaxations whose only backstop is the RW review path, not the RO
+ *  write ceiling. */
+export function looseReadWriteActive(): boolean {
+  return looseRelaxationScope.getStore() === "rw"
+}
 
 export type Strictness = "LOOSE" | "HARD"
 export type PathContext = {
@@ -231,6 +250,51 @@ export function isWithinLexical(base: string, target: string): boolean {
 }
 
 // --- sensitivity ------------------------------------------------------------
+
+/** Credential-name fragments that can appear inside interpreter code or
+ *  other argument text where the shell-token path extractor never sees them
+ *  (`node -e "…readFileSync('/home/u/.ssh/id_rsa')…"`). Built from the same
+ *  vocabulary as the registry above (home credential dirs, credential file
+ *  names, credential suffixes); matching text keeps a read-side surface in
+ *  review instead of statically allowing it. */
+const EMBEDDED_CREDENTIAL_RE = new RegExp(
+  [
+    String.raw`(?:^|[/\s"'=(,;:&|])\.ssh(?:/|["'\s,;)&|]|$)`,
+    String.raw`(?:^|[/\s"'=(,;:&|])\.gnupg(?:/|["'\s,;)&|]|$)`,
+    String.raw`(?:^|[/\s"'=(,;:&|])\.aws(?:/|["'\s,;)&|]|$)`,
+    String.raw`(?:^|[/\s"'=(,;:&|])\.kube(?:/|["'\s,;)&|]|$)`,
+    String.raw`(?:^|[/\s"'=(,;:&|])\.azure(?:/|["'\s,;)&|]|$)`,
+    String.raw`\.config/gcloud`,
+    String.raw`\.config/azure-cli`,
+    String.raw`(?:^|[/\s"'=(,;:&|])id_(?:rsa|dsa|ecdsa|ed25519|ed448)(?:["'\s,;)&|./]|$)`,
+    String.raw`(?:^|[/\s"'=(,;:&|])\.netrc(?:["'\s,;)&|]|$)`,
+    String.raw`\.git-credentials`,
+    String.raw`(?:^|[/\s"'=(,;:&|])\.npmrc(?:["'\s,;)&|]|$)`,
+    String.raw`(?:^|[/\s"'=(,;:&|])\.pypirc(?:["'\s,;)&|]|$)`,
+    String.raw`\.bash_history`,
+    String.raw`\.zsh_history`,
+    String.raw`\.docker/config\.json`,
+    String.raw`/proc/(?:\d+|self|thread-self)/environ`,
+    String.raw`(?:^|[/\s"'=(,;:&|])sudoers(?:[./]|["'\s,;)&|]|$)`,
+    String.raw`(?:^|[/\s"'=(,;:&|])[\w.-]+\.(?:pem|ppk|p12|pfx|jks|kdbx|age)(?:["'\s,;)&|]|$)`,
+    String.raw`(?:^|[/\s"'=(,;:&|])[\w.-]+\.(?:crt|key)(?:["'\s,;)&|]|$)`,
+    String.raw`(?:^|[/\s"'=(,;:&|])\.env(?:\.[\w.-]+)?(?:["'\s,;)&|]|$)`,
+    String.raw`[\w.-]\.env(?:["'\s,;)&|]|$)`,
+  ].join("|"),
+  "i",
+)
+
+/** A read-side finding for argument text that names a credential store
+ *  without forming a classifiable path token. Returns undefined when the
+ *  text carries no credential hint. */
+export function embeddedCredentialFinding(text: string): PathFinding | undefined {
+  if (!EMBEDDED_CREDENTIAL_RE.test(text)) return undefined
+  return {
+    kind: "ask",
+    rule: "credentials.sensitive-access",
+    reason: "Reading a credential or sensitive system file requires review",
+  }
+}
 
 function matchRegistry(absolute: string, home: string, flags: SensitivityFlags): void {
   const norm = absolute
@@ -506,6 +570,13 @@ export function hasSensitiveEnvPrefix(segment: string): boolean {
   return false
 }
 
+/** A POSIX `$` expands only before a name, digit, `{`, `(`, `[`, a special
+ *  parameter, or a quote (`$'…'`/`$"…"`); elsewhere (`grep "foo$"`,
+ *  `json_extract(d,'$.x')`) it is a literal character. */
+function expandsAt(text: string, index: number): boolean {
+  return !looseRelaxationsActive() || /[A-Za-z0-9_{(\[@*#?$!\-'"]/.test(text[index + 1] ?? "")
+}
+
 /**
  * CC `containsUnquotedExpansion` equivalent: unquoted `$`, backticks, globs,
  * and brace expansions make a segment unprovable. Single quotes are inert in
@@ -551,7 +622,7 @@ export function hasUnquotedExpansion(text: string, shell: string, allowGlobs = f
     if (inDouble) {
       if (ch === '"') inDouble = false
       else if (ch === "\\") i += 1
-      else if (ch === "$") return true
+      else if (ch === "$" && expandsAt(text, i)) return true
       continue
     }
     if (ch === "'") {
@@ -566,7 +637,7 @@ export function hasUnquotedExpansion(text: string, shell: string, allowGlobs = f
       i += 1
       continue
     }
-    if (ch === "$" || ch === "`") return true
+    if ((ch === "$" && expandsAt(text, i)) || ch === "`") return true
     // Glob characters are locally expanded filenames consumed by the command —
     // callers that opt in (LOOSE read surfaces) tolerate them; the shell's own
     // globbing can only name existing local files.

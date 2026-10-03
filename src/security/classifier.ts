@@ -7,6 +7,7 @@ import { ruleBypassed } from "./bypass"
 import {
   analyzeSegmentPaths,
   checkPathSensitivity,
+  embeddedCredentialFinding,
   extractReadPaths,
   extractRedirectTargets,
   extractWriteTargets,
@@ -15,6 +16,9 @@ import {
   resolveLexical,
   isWithinLexical,
   classifyPathTarget,
+  looseReadWriteActive,
+  looseRelaxationScope,
+  looseRelaxationsActive,
   sensitivePathFinding,
   segmentCommandLeaf,
   stripOutputRedirects,
@@ -22,6 +26,18 @@ import {
   type PathContext,
   type PathFinding,
 } from "./paths"
+import {
+  foreignGitConfigArmed,
+  matchesTrustedCommand,
+  parseTrustedCommands,
+  proveLiteralInvocation,
+  provePythonReadOnly,
+  provenPathsReadable,
+  proveSqliteHeredoc,
+  pythonRunsScript,
+  pythonStdinInvocation,
+  type SemanticProof,
+} from "./semantic-allow"
 
 export type SecurityVerdict = "ALLOW" | "DENY" | "ASK"
 
@@ -115,6 +131,10 @@ export type ClassifyShellCommandInput = {
    * tightening checks but only produces temp-confined exemptions after the
    * base itself canonically lands inside a trusted temp root. */
   runtimeWorkdir?: string
+  /** User-declared trusted command prefixes (`trustedCommands` config):
+   *  invocations starting with one of these argv prefixes are allowed once
+   *  every danger scan has passed. */
+  trustedCommands?: readonly string[]
 }
 
 type InternalClassifyInput = ClassifyShellCommandInput & {
@@ -777,6 +797,13 @@ function literalShellArgvDetailed(segment: string): LiteralArgv | undefined {
             i += 2
             continue
           }
+          // `$` only expands before a name, digit, `{`, `(`, `[` or a special
+          // parameter; `"…'$.role'…"` (SQL/jq paths) is literal text.
+          if (c === "$" && looseRelaxationsActive() && !/[A-Za-z0-9_{(\[@*#?$!\-]/.test(segment[i + 1] ?? "")) {
+            word += c
+            i += 1
+            continue
+          }
           if (c === "$" || c === "`") return undefined // expansion inside quotes
           word += c
           i += 1
@@ -863,7 +890,10 @@ function literalShellArgvDetailed(segment: string): LiteralArgv | undefined {
         return undefined
       }
       if (ch === "`") return undefined
-      if (ch === "~" || ch === "*" || ch === "?" || ch === "[") return undefined
+      // Tilde expands only at the start of a word or after `=`/`:`
+      // (`--prefix=~/x`); `HEAD~1` is literal.
+      if (ch === "~" && (word === "" || /[=:]$/.test(word) || !looseRelaxationsActive())) return undefined
+      if (ch === "*" || ch === "?" || ch === "[") return undefined
       if (ch === ">" || ch === "<" || ch === "&" || ch === "|" || ch === ";" || ch === "(" || ch === ")" || ch === "{" || ch === "}") {
         return undefined
       }
@@ -1640,6 +1670,51 @@ function sedExecHazard(args: string[]): ExecutorHazard | undefined {
   return payloads.length > 0 ? { kind: "executor", payloads } : undefined
 }
 
+/** awk script arguments: the first non-flag token is the program text. `-f`
+ *  programs are external files and uninspectable here, so they are unproven.
+ *  Exec shapes: `system("cmd")`, a command piped into `getline`, and
+ *  `print`/`printf` piped into a command. String literals are blanked
+ *  (index-preserving) before the pipe scan so `print $1" || "$3` — an "or"
+ *  inside a quoted string — is not mistaken for a pipe to a command.
+ *  `|&` coprocesses and unquoted pipe targets are unproven; `print > "file"`
+ *  is a write, not an execution, and stays on the write-shape scans. */
+function awkExecHazard(args: string[]): ExecutorHazard | undefined {
+  let script: string | undefined
+  for (let i = 0; i < args.length; i += 1) {
+    const token = args[i] ?? ""
+    if (token === "--") break
+    if (token === "-f" || token.startsWith("--file")) return { kind: "unproven" } // external program file
+    if (token === "-F" || token === "-v" || token === "-m") {
+      i += 1
+      continue
+    }
+    if (/^-[Fvm]./.test(token)) continue // -F: attached separator, -vn=…, -m#
+    if (token.startsWith("-")) continue
+    script = token
+    break
+  }
+  if (script === undefined) return { kind: "unproven" }
+  const blanked = script.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, (m) => "\u0000".repeat(m.length))
+  const payloads: string[] = []
+  // `system("cmd")`: the call is outside quotes; the literal argument is not.
+  if (/\bsystem\s*\(/.test(blanked)) {
+    for (const match of script.matchAll(/\bsystem\s*\(\s*(["'])([\s\S]*?)\1/g)) payloads.push(match[2] ?? "")
+    if (payloads.length === 0) return { kind: "unproven" } // system(<expr>) without an extractable literal
+  }
+  // `"cmd" | getline` (reading from a command's output).
+  if (/[|][ \t]*getline/.test(blanked)) {
+    for (const match of script.matchAll(/(["'])([\s\S]*?)\1[ \t]*\|[ \t]*getline/g)) payloads.push(match[2] ?? "")
+    if (payloads.length === 0) return { kind: "unproven" } // unquoted pipe target
+  }
+  // `print/printf … | "cmd"` (piping into a command).
+  if (/\b(?:print|printf)\b[^;}\n]*?[|]/.test(blanked)) {
+    for (const match of script.matchAll(/\b(?:print|printf)\b[^;}\n]*?\|[ \t]*(["'])([\s\S]*?)\1/g)) payloads.push(match[2] ?? "")
+    if (payloads.length === 0) return { kind: "unproven" } // unquoted pipe target
+  }
+  if (/[|]&/.test(blanked)) return { kind: "unproven" } // coprocess: target not statically extractable
+  return payloads.length > 0 ? { kind: "executor", payloads } : undefined
+}
+
 /** rg `--pre <cmd>`/`--pre=<cmd>` (and the `-M` short form) spawn an external
  *  preprocessor; a missing value means the default preprocessor executes.
  *  `--pre-glob` only selects files, it does not make the preprocessor safe. */
@@ -1701,8 +1776,18 @@ function gitGrepExecHazard(args: string[]): ExecutorHazard | undefined {
  *  segment (after transparent launchers); an invocation that cannot be
  *  resolved is unproven only when its leaf is one of the gated tools. */
 function executorCapabilityHazard(segment: string): ExecutorHazard | undefined {
-  const argv = literalShellArgv(stripOutputRedirects(segment) ?? segment)
+  // `2>/dev/null` and fd merges are not stripped by stripOutputRedirects;
+  // left in place they make the literal lexer give up and turn every
+  // `sed … 2>/dev/null` into an unproven executor.
+  const plain = stripOutputRedirects(segment) ?? segment
+  const argv = literalShellArgv(looseRelaxationsActive() ? withLeadingTildeExpanded(withoutInertRedirects(plain)) : plain)
   if (argv === undefined) {
+    // Only sed/rg carry the unrecognized-leaf strictness here: awk scripts in
+    // the wild are routinely adjacent to unlexable shell text (command
+    // substitutions the splitter cuts mid-paren), and a hard "execute" from
+    // an unlexable argv would deny benign loops wholesale — the resolved
+    // scan above plus the known-safe and RO awk vocab screens still catch
+    // every lexible exec shape.
     const leaf = commandLeaf(simpleInvocationTokens(segment)[0] ?? "")
     return leaf === "sed" || leaf === "gsed" || leaf === "rg" ? { kind: "unproven" } : undefined
   }
@@ -1712,6 +1797,7 @@ function executorCapabilityHazard(segment: string): ExecutorHazard | undefined {
   const leaf = commandLeaf(argv[resolved.index] ?? "")
   const args = argv.slice(resolved.index + 1)
   if (leaf === "sed" || leaf === "gsed") return sedExecHazard(args)
+  if (leaf === "awk" || leaf === "gawk" || leaf === "mawk") return awkExecHazard(args)
   if (leaf === "rg") return rgExecHazard(args)
   if (leaf === "git") {
     // Reuse the global-option skip so `git -C x grep -O…` resolves too.
@@ -1886,6 +1972,9 @@ function classifyTarExtractOrUnzip(
   const isExtract = isUnzip ? /^unzip\b/i.test(segment) : /^tar\b/i.test(segment)
   if (!isExtract) return undefined
   if (!isUnzip && /(?:--absolute-names|--remove-files)\b/i.test(segment)) return undefined
+  // Program-running options (compressor, checkpoint/volume scripts, per-file
+  // command) leave the archive surface for the normal review path.
+  if (!isUnzip && /--to-command|--checkpoint-action|--use-compress-program|--info-script|--new-volume-script|\s-[A-Za-z]*[IF](?:\s|$)/.test(segment)) return undefined
   if (!tarOrUnzipBaseWorktree(segment, ctx.cwd, ctx.worktree)) {
     if (strictness === "HARD") {
       return {
@@ -4063,6 +4152,11 @@ function shellSupportsSingleQuotes(shell: string) {
 }
 
 function strictTimeoutRemainder(tokens: string[]): string | undefined {
+  const start = strictTimeoutCommandIndex(tokens)
+  return start === undefined ? undefined : tokens.slice(start).join(" ")
+}
+
+function strictTimeoutCommandIndex(tokens: string[]): number | undefined {
   let i = 1
   for (;;) {
     if (i >= tokens.length) return undefined
@@ -4085,7 +4179,7 @@ function strictTimeoutRemainder(tokens: string[]): string | undefined {
   if (i >= tokens.length || !/^\d+(\.\d+)?[smhd]?$/.test(tokens[i] ?? "")) return undefined
   i += 1
   if (i >= tokens.length) return undefined
-  return tokens.slice(i).join(" ")
+  return i
 }
 
 /**
@@ -4095,23 +4189,31 @@ function strictTimeoutRemainder(tokens: string[]): string | undefined {
  */
 function stripWrapperPrefix(segment: string): string | undefined {
   const original = segment
-  const tokens = simpleInvocationTokens(segment.trim())
+  const trimmed = segment.trim()
+  const matches = [...trimmed.matchAll(/"(?:[^"]|"")*"|'[^']*'|\S+/g)]
+  const tokens = matches.map((m) => m[0])
   if (tokens.length === 0) return segment
+  // Slice the original text rather than re-joining tokens so heredoc bodies
+  // and other newline-significant text after the wrapper survive intact.
+  const rest = (index: number) => trimmed.slice(matches[index]?.index ?? trimmed.length)
   const leaf = commandLeaf(tokens[0] ?? "")
-  if (leaf === "timeout") return strictTimeoutRemainder(tokens)
+  if (leaf === "timeout") {
+    const start = strictTimeoutCommandIndex(tokens)
+    return start === undefined ? undefined : rest(start)
+  }
   if (leaf === "time" || leaf === "nohup" || leaf === "setsid") {
-    if (tokens.length >= 2 && !(tokens[1] ?? "").startsWith("-")) return tokens.slice(1).join(" ")
+    if (tokens.length >= 2 && !(tokens[1] ?? "").startsWith("-")) return rest(1)
     return original
   }
   if (leaf === "nice") {
     let i = 1
-    if (i < tokens.length && tokens[i] === "--") return tokens.slice(i + 1).join(" ")
-    if (i < tokens.length && /^-\d+$/.test(tokens[i] ?? "")) return tokens.slice(i + 1).join(" ")
+    if (i < tokens.length && tokens[i] === "--") return rest(i + 1)
+    if (i < tokens.length && /^-\d+$/.test(tokens[i] ?? "")) return rest(i + 1)
     if (i < tokens.length && (tokens[i] === "-n" || tokens[i] === "--adjustment")) {
-      if (i + 1 < tokens.length && /^-?\d+$/.test(tokens[i + 1] ?? "")) return tokens.slice(i + 2).join(" ")
+      if (i + 1 < tokens.length && /^-?\d+$/.test(tokens[i + 1] ?? "")) return rest(i + 2)
       return original
     }
-    if (i < tokens.length && !(tokens[i] ?? "").startsWith("-")) return tokens.slice(1).join(" ")
+    if (i < tokens.length && !(tokens[i] ?? "").startsWith("-")) return rest(1)
     return original
   }
   if (leaf === "ionice") {
@@ -4128,7 +4230,7 @@ function stripWrapperPrefix(segment: string): string | undefined {
       }
     }
     if (i >= tokens.length || (tokens[i] ?? "").startsWith("-") || (tokens[i] ?? "") === "--") return original
-    return tokens.slice(i).join(" ")
+    return rest(i)
   }
   if (leaf === "stdbuf") {
     let i = 1
@@ -4150,7 +4252,7 @@ function stripWrapperPrefix(segment: string): string | undefined {
       return original
     }
     if (i >= tokens.length) return original
-    return tokens.slice(i).join(" ")
+    return rest(i)
   }
   if (leaf === "env") {
     let i = 1
@@ -4181,7 +4283,7 @@ function stripWrapperPrefix(segment: string): string | undefined {
       break
     }
     if (!sawCommand || i >= tokens.length) return original
-    return tokens.slice(i).join(" ")
+    return rest(i)
   }
   return segment
 }
@@ -4203,6 +4305,187 @@ function stripHarmlessPrefixes(segment: string): string {
   }
   return result
 }
+
+/** A leading compound-command keyword left behind by segment splitting adds
+ *  no execution semantics: `then pwsh.exe …` executes exactly `pwsh.exe …`.
+ *  The RO gates below classify the keyword-stripped tail so an interop
+ *  binary or a mutator behind `then`/`do`/`if`/… is judged like the bare
+ *  command instead of hiding behind the unrecognized keyword leaf (the Linux
+ *  kernel sandbox cannot contain a Windows-side interop write, so the
+ *  unrecognized-leaf passthrough was a real hole, not a benign default). */
+function stripControlFlowKeywordPrefix(segment: string): string {
+  const match = /^(?:do|then|else|elif|if|while|until|\{|!)\s+([\s\S]+)$/.exec(segment.trim())
+  return match ? (match[1] ?? "").trim() : segment.trim()
+}
+
+/** POSIX compound-command keywords left behind by segment splitting. `inner`
+ *  is the command the keyword introduces; `inert` is a bare keyword, a loop
+ *  header over plain words, or a `read` builtin (stdin into variables). */
+function controlFlowSegment(
+  segment: string,
+  shell: string,
+): { kind: "inner"; text: string } | { kind: "inert" } | undefined {
+  if (shellEscapeCharacter(shell) === "`") return undefined
+  const text = segment.trim()
+  const prefixed = /^(?:do|then|else|elif|if|while|until|\{|!)\s+([\s\S]+)$/.exec(text)
+  if (prefixed) {
+    const rest = prefixed[1].trim()
+    return rest ? { kind: "inner", text: rest } : undefined
+  }
+  const closer = /^(?:done|fi|esac|\}|do|then|else)(?=\s|$)([\s\S]*)$/.exec(text)
+  if (closer) {
+    const tail = closer[1].trim()
+    if (!tail) return { kind: "inert" }
+    // An output redirect on a closer applies to the whole compound command;
+    // it is classified as the write it is. Input redirects stay unproven.
+    if (/^(?:\d*>{1,2}|&>{1,2})/.test(tail) && !/</.test(tail)) return { kind: "inner", text: `true ${tail}` }
+    return undefined
+  }
+  const loop = /^for\s+[A-Za-z_][A-Za-z0-9_]*(?:\s+in\b([\s\S]*))?$/.exec(text)
+  if (loop) {
+    // Substitutions in the word list run commands; plain words, variables
+    // and globs only bind the loop variable.
+    if (/\$\(|`|[<>]\(/.test(loop[1] ?? "")) return undefined
+    return { kind: "inert" }
+  }
+  if (/^(?:IFS=(?:''|"")?\s+)?read(?:\s+-[rsea]+)*(?:\s+-[dnNptu]\s*\S+)*(?:\s+[A-Za-z_][A-Za-z0-9_]*)*$/.test(text)) {
+    return { kind: "inert" }
+  }
+  return undefined
+}
+
+type LoopFrame = { name: string; words: string[] | undefined }
+
+const MAX_LOOP_VARIANTS = 16
+
+/** `for NAME in WORDS` whose words are plain literals or directory-prefixed
+ *  globs that cannot name credential files, and whose variable is never
+ *  reassigned anywhere in the script. Anything else yields an opaque frame
+ *  (`words: undefined`) so its body keeps the normal dynamic-expansion path. */
+function parseForLoopFrame(segment: string, script: string, ctx: PathContext): LoopFrame {
+  const match = /^for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([\s\S]+)$/.exec(segment)
+  if (!match) return { name: "", words: undefined }
+  const name = match[1]
+  const opaque: LoopFrame = { name, words: undefined }
+  const parsed = shellWordsWithGlobs(match[2])
+  if (!parsed || parsed.length === 0 || parsed.length > MAX_LOOP_VARIANTS) return opaque
+  const words: string[] = []
+  for (const word of parsed) {
+    if (word.globAt >= 0) {
+      const prefix = word.text.slice(0, word.globAt)
+      const slash = prefix.lastIndexOf("/")
+      // A bare glob may expand to a name starting with `-`.
+      if (slash < 0) return opaque
+      const dir = prefix.slice(0, slash) || "/"
+      if (classifyPathTarget(dir, "read", ctx).kind !== "pass" || checkPathSensitivity(dir, ctx).sensitive) return opaque
+      if (globMayMatchSensitive(word.text)) return opaque
+    } else if (!/^~?[^\s'"`$\\;&|<>(){}*?[\]~]+$/.test(word.text) || word.text.startsWith("-")) {
+      return opaque
+    }
+    words.push(word.text)
+  }
+  const reassigned = new RegExp(
+    `(?:^|[\\s;&|(])${name}(?:\\[[^\\]]*\\])?\\+?=|\\bread\\b[^;&|\\n]*\\s${name}(?=[\\s;&|)]|$)|\\bfor\\s+${name}\\b[\\s\\S]*\\bfor\\s+${name}\\b|\\b(?:declare|typeset|local|export|readonly|unset|printf\\s+-v)\\b[^;&|\\n]*\\b${name}\\b`,
+    "m",
+  )
+  if (reassigned.test(script)) return opaque
+  return { name, words }
+}
+
+/** Body segment variants with every bound loop variable replaced by each of
+ *  its words. Undefined when the segment uses no bound variable, uses one in
+ *  a form other than `$NAME`/`${NAME}`, or would need too many variants. */
+function loopBoundVariants(segment: string, frames: LoopFrame[]): string[] | undefined {
+  let variants: string[] | undefined
+  for (const frame of frames) {
+    if (!frame.name) continue
+    const uses = new RegExp(`\\$(?:\\{${frame.name}\\}|${frame.name}(?![A-Za-z0-9_]))`, "g")
+    if (!uses.test(segment)) continue
+    if (!frame.words) return undefined
+    // `${NAME%…}`, `${NAME:-…}`, `${#NAME}` and friends are not plain uses.
+    if (new RegExp(`\\$\\{#?${frame.name}[^}A-Za-z0-9_]`).test(segment)) return undefined
+    // Inside single quotes, after a backslash, or in a heredoc body the text
+    // `$NAME` is not expanded by this shell (a nested `sh -c '…$NAME…'` sees
+    // an unset variable), so substituting there would classify other text.
+    if (/<</.test(segment) || !variableUsesExpandHere(segment, frame.name)) return undefined
+    const base = variants ?? [segment]
+    const next: string[] = []
+    for (const text of base) {
+      for (const word of frame.words) next.push(text.replace(uses, () => word))
+    }
+    if (next.length > MAX_LOOP_VARIANTS) return undefined
+    variants = next
+  }
+  return variants
+}
+
+/** Every `$NAME`/`${NAME}` in `segment` sits outside single quotes and is not
+ *  backslash-escaped. */
+function variableUsesExpandHere(segment: string, name: string): boolean {
+  let single = false
+  let double = false
+  for (let i = 0; i < segment.length; i += 1) {
+    const ch = segment[i]
+    if (single) {
+      if (ch === "'") single = false
+      else if (ch === "$" && segmentUsesNameAt(segment, i, name)) return false
+      continue
+    }
+    if (ch === "\\") {
+      if (segment[i + 1] === "$" && segmentUsesNameAt(segment, i + 1, name)) return false
+      i += 1
+      continue
+    }
+    if (ch === "'" && !double) single = true
+    else if (ch === '"') double = !double
+  }
+  return true
+}
+
+function segmentUsesNameAt(segment: string, index: number, name: string): boolean {
+  return new RegExp(`^\\$(?:\\{${name}\\}|${name}(?![A-Za-z0-9_]))`).test(segment.slice(index))
+}
+
+/** Shell and environment variables whose value changes how later commands
+ *  run or what `~`/`cd`/prompts resolve to, even as a plain (unexported)
+ *  assignment when the name is already exported. */
+const ASSIGNMENT_SENSITIVE_NAMES = new Set([
+  "HOME", "PWD", "OLDPWD", "CDPATH", "TMPDIR", "SHELL", "SHELLOPTS", "BASHOPTS", "GLOBIGNORE", "FIGNORE",
+  "PS1", "PS2", "PS3", "PS4", "PROMPT_COMMAND", "INPUTRC", "EXECIGNORE", "MAIL", "MAILPATH", "POSIXLY_CORRECT",
+  "EDITOR", "VISUAL", "PAGER", "MANPAGER", "BROWSER", "CLASSPATH", "KUBECONFIG", "DOCKER_HOST",
+  "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "FTP_PROXY",
+])
+const ASSIGNMENT_SENSITIVE_PREFIXES = ["BASH_", "GIT_", "NODE_", "NPM_CONFIG_", "PYTHON", "PIP_", "SSH_", "GPG", "AWS_", "LC_", "OPENCODE"]
+
+/** A plain `NAME=literal` segment: no expansion, substitution, or glob in
+ *  the value, and a name that cannot redirect later execution. */
+function literalAssignment(segment: string): { name: string; value: string } | undefined {
+  const match = /^([A-Za-z_][A-Za-z0-9_]*)=('[^']*'|"[^"$`\\!]*"|[^\s'"`$\\;&|<>(){}*?[\]~!#]*)$/.exec(segment)
+  if (!match) return undefined
+  const name = match[1]
+  const upper = name.toUpperCase()
+  if (hasSensitiveEnvPrefix(`${name}=x true`) || ASSIGNMENT_SENSITIVE_NAMES.has(upper)) return undefined
+  if (ASSIGNMENT_SENSITIVE_PREFIXES.some((prefix) => upper.startsWith(prefix))) return undefined
+  return { name, value: stripMatchingQuotes(match[2]) }
+}
+
+/** Script-wide facts that let a top-level literal assignment be bound into
+ *  later segments: the name is assigned exactly once and nothing in the
+ *  script (functions, `eval`, `source`, arithmetic, `read`, `${NAME:=…}`)
+ *  could set it some other way. */
+function assignmentBindable(script: string, name: string): boolean {
+  if (/\beval\b|\bsource\b|(?:^|[\s;&|(])\.\s|\(\(|\blet\b|\bfunction\b|\w\s*\(\s*\)|\bset\s+-[a-z]*a/m.test(script)) return false
+  const assignments = script.match(new RegExp(`(?:^|[\\s;&|(])${name}(?:\\[[^\\]]*\\])?\\+?=`, "gm")) ?? []
+  if (assignments.length !== 1) return false
+  return !new RegExp(
+    `\\bread\\b[^;&|\\n]*\\s${name}(?=[\\s;&|)]|$)|\\b(?:for|select)\\s+${name}\\b|\\b(?:declare|typeset|local|export|readonly|unset|printf\\s+-v|getopts|mapfile|readarray)\\b[^;&|\\n]*\\b${name}\\b|\\$\\{${name}:?[=?]`,
+    "m",
+  ).test(script)
+}
+
+const BINDABLE_ASSIGNMENT_VALUE = /^[^\s'"`$\\;&|<>(){}*?[\]~!#]+$/
 
 function maskHeredocBody(text: string): string {
   const match = text.match(/<<-?\s*(?:'([^']+)'|"([^"]+)"|(\w+))/)
@@ -4421,6 +4704,26 @@ function heredocPipelinePart(headerText: string, opOffset: number) {
   return { start, end }
 }
 
+/** Number of leading words taken by `timeout [options] DURATION`, or 0 when
+ *  the prefix is not a recognizable timeout invocation. */
+function timeoutPrefixLength(tokens: string[]): number {
+  if ((tokens[0] ?? "").toLowerCase() !== "timeout") return 0
+  let i = 1
+  while (i < tokens.length) {
+    const token = tokens[i] ?? ""
+    if (token === "-k" || token === "-s" || token === "--kill-after" || token === "--signal") {
+      i += 2
+      continue
+    }
+    if (/^(?:--preserve-status|--foreground|-v|--verbose|-k\S+|-s\S+|--kill-after=\S+|--signal=\S+)$/.test(token)) {
+      i += 1
+      continue
+    }
+    break
+  }
+  return /^\d+(?:\.\d+)?[smhd]?$/.test(tokens[i] ?? "") ? i + 1 : 0
+}
+
 /**
  * Command tokens of the heredoc's own pipeline part: env assignments, leading
  * wrappers, `<<` operators/delimiters, and output redirects are stripped so
@@ -4443,6 +4746,9 @@ function heredocConsumerTokens(h: HeredocInfo): string[] {
     while (tokens[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) tokens = tokens.slice(1)
   }
   if ((tokens[0] ?? "").toLowerCase() === "command") tokens = tokens.slice(1)
+  // Read-only sessions keep the unstripped consumer: naming `ssh` there would
+  // route a remote write body to a credential ASK instead of the write deny.
+  if ((tokens[0] ?? "").toLowerCase() === "timeout" && looseReadWriteActive()) tokens = tokens.slice(timeoutPrefixLength(tokens))
   if ((tokens[0] ?? "").toLowerCase() === "wsl") {
     const separator = tokens.indexOf("--")
     tokens = separator >= 0 ? tokens.slice(separator + 1) : tokens.slice(1)
@@ -5104,20 +5410,65 @@ function normalizeCommandInSegment(segment: string): string {
   return segment
 }
 
+/** Blanks the contents of POSIX quotes (single quotes take no escapes; double
+ *  quotes honour backslash escapes). Unterminated quotes are left as-is. */
+function maskShellQuotedText(text: string): string {
+  let out = ""
+  let i = 0
+  while (i < text.length) {
+    const ch = text[i]
+    if (ch === "\\") {
+      out += text.slice(i, i + 2)
+      i += 2
+      continue
+    }
+    if (ch === "'") {
+      const end = text.indexOf("'", i + 1)
+      if (end < 0) return text
+      out += "'" + " ".repeat(end - i - 1) + "'"
+      i = end + 1
+      continue
+    }
+    if (ch === '"') {
+      let j = i + 1
+      while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1
+      if (j >= text.length) return text
+      out += '"' + " ".repeat(j - i - 1) + '"'
+      i = j + 1
+      continue
+    }
+    out += ch
+    i += 1
+  }
+  return out
+}
+
+// `git -c` keys that only change identity, colour, or line-ending display:
+// stripped before the git vocabulary below. Executable keys (core.pager,
+// core.fsmonitor, alias.*, *.command, …) keep the whole invocation unproven.
+const GIT_INERT_CONFIG_PREFIX =
+  /^git((?:\s+-c\s+(?:user\.(?:name|email)|(?:commit|tag)\.gpgsign|core\.(?:autocrlf|quotepath|safecrlf|filemode)|color\.[\w.]+|advice\.[\w.]+|init\.defaultbranch|pull\.rebase|merge\.ff)=[^\s'"`$;&|<>]*)+)(?=\s)/i
+
 function isKnownSafeSegment(segment: string) {
-  const value = normalizeCommandInSegment(
+  const loose = looseRelaxationsActive()
+  const unprefixed = normalizeCommandInSegment(
     stripTrailingFdMerges(segment)
       .replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*/, "")
       .trim(),
   )
+  const value = loose ? unprefixed.replace(GIT_INERT_CONFIG_PREFIX, "git") : unprefixed
   if (!value) return true
-  const harmlessValue = value
+  // Quoted `<`/`>` are argument text (`awk 'NR>40'`, `jq '.a > 1'`), not
+  // redirects; the tools that can act on them in their own language (awk
+  // print redirection, sed `w`) are screened individually below.
+  const harmlessValue = (loose ? maskShellQuotedText(value) : value)
     .replace(INERT_OUTPUT_REDIRECT, "")
     .replace(/<[ \t]*\/?dev\/(?:null|stdin)\b/gi, "")
     .replace(/(?:^|[\s;&|])<<</g, "")
     .replace(/(?:^|[\s;&|])\d*<[ \t]+[^\s<;&|()]+/g, "")
   if (/[<>](?![=])/.test(harmlessValue)) return false
-  if (/^(?:true|false|:)\b/i.test(value)) return true
+  // `\b` never matches after `:`, so the null builtin needs an explicit end.
+  if (/^(?:true|false|:)\b/i.test(value) || (loose && /^:(?=\s|$)/.test(value))) return true
   // Duration literals only; the slow-command layer enforces the time budget.
   if (/^sleep\s+(?:\d+(?:\.\d+)?[smhd]?)(?:\s+\d+(?:\.\d+)?[smhd]?)*$/.test(value)) return true
 
@@ -5134,6 +5485,8 @@ function isKnownSafeSegment(segment: string) {
     return true
   }
   if (/^(?:tasklist|Get-Process|netstat|ss)\b/i.test(value)) return true
+  // pgrep only matches; the signalling sibling is pkill.
+  if (loose && /^(?:pidof|pgrep)\b/i.test(value)) return true
   // `command -v`/`-V` is a pure PATH lookup — never an execution. `hash`
   // with no arguments (or -l/-r session-cache listing/clearing) is inert.
   if (/^command\s+-[vV]\b/i.test(value)) return true
@@ -5159,12 +5512,23 @@ function isKnownSafeSegment(segment: string) {
     }
   }
   if (/^(?:cat|type|more|less)\b/i.test(value)) {
-    return !hasSensitiveCredentialReference(value) && !/\b(?:credential|token|secret|password|private)\b/i.test(value)
+    // The secret-word screen applies to file names (`api_token.txt`,
+    // `secrets.yaml`, `private.key`), not to any word (`token-usage.ts`).
+    // Outside LOOSE the original any-word screen still applies as well.
+    return (
+      !hasSensitiveCredentialReference(value) &&
+      !/(?:^|[\s/'"=])[\w.-]*?(?:credentials?|tokens?|secrets?|passwords?|passwd|private[-_.]?key)(?:\.\w+)?(?=$|[\s'"])/i.test(value) &&
+      (loose || !/\b(?:credential|token|secret|password|private)\b/i.test(value))
+    )
   }
   if (/^(?:rg|grep|Select-String)\b/i.test(value)) return true
-  if (/^find\b/i.test(value)) return !/(?:^|\s)-(?:delete|exec|execdir|ok|okdir)(?:\s|$)/i.test(value)
+  // -fprint/-fprint0/-fprintf/-fls write their output to a named file.
+  if (/^find\b/i.test(value)) return !/(?:^|\s)-(?:delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)(?:\s|$)/i.test(value)
+  // Read subcommands that still write a file or run a configured program.
+  if (/^git\b/i.test(value) && /\s--(?:output(?:-directory)?|ext-diff|open-files-in-pager)(?:[=\s]|$)/i.test(value)) return false
   if (/^git\s+(?:status|diff|log|show|rev-parse|ls-files|grep|remote\s+-v|add|commit)\b/i.test(value)) return true
   if (/^git\s+(?:fetch|clone|checkout\s+-b|stash\s+(?:list|push)|branch\s+(?!-[dDm]\b)\S+|tag\s+(?!-[dD]\b)\S+|pull|switch|merge)\b/i.test(value)) return true
+  if (loose && /^git\s+cherry-pick\b/i.test(value)) return true
   if (/^git\s+push\b/i.test(value)) {
     // Semantic argv check (fix B): quoted/partially-quoted/ANSI flag and
     // refspec spellings resolve to the same policy, so `--fo"rce"`,
@@ -5176,7 +5540,11 @@ function isKnownSafeSegment(segment: string) {
     return !analysis.dangerous
   }
   if (/^(?:mkdir|New-Item\s+[^\n]*-ItemType\s+Directory)\b/i.test(value)) return true
-  if (/^(?:tar\s+-[a-z]*c[a-z]*f|zip\s+-r)\b/i.test(value)) return !/--remove-files\b/i.test(value)
+  // Archivers can also run programs: tar's compressor/checkpoint/volume
+  // hooks and zip's `-TT` test command.
+  if (/^(?:tar\s+-[a-z]*c[a-z]*f|zip\s+-r)\b/i.test(value)) {
+    return !/--remove-files\b|--to-command|--checkpoint-action|--use-compress-program|--info-script|--new-volume-script|\s-[A-Za-z]*[IF](?:\s|$)|\s-TT\b|--unzip-command/.test(value)
+  }
   if (/^(?:cp|copy|Copy-Item)\b/i.test(value) && /[\s\S]*\s-[A-Za-z]/.test(value)) return false
   if (
     /^(?:(?:python(?:3)?(?:\.exe)?|py(?:\.exe)?)\s+-m\s+pytest|pytest|bun\s+test|cargo\s+(?:test|check|fmt)|go\s+test|black|isort|prettier|eslint|tsc)\b/i.test(
@@ -5193,6 +5561,7 @@ function isKnownSafeSegment(segment: string) {
     return true
   }
   if (/^(?:npm|pnpm|yarn|bun)\s+(?:test|run\s+(?:test|lint|format|check|build))\b/i.test(value)) return true
+  if (loose && /^(?:(?:npm|pnpm|yarn|bun)\s+run|yarn|pnpm|bun)\s+(?:typecheck|type-check)\b/i.test(value)) return true
   if (/^(?:npm|pnpm|yarn|bun)\s+(?:install|i|add|ci)\b/i.test(value)) return true
   if (/^(?:pip(?:3)?|pipx|uv)\s+(?:install|add|list|show|freeze|check)\b/i.test(value)) return true
   if (/^cargo\s+(?:add|fetch|update)\b/i.test(value)) return true
@@ -5204,13 +5573,17 @@ function isKnownSafeSegment(segment: string) {
 
   // ===== M3 (P2) §4.9: false-positive reduction with P/E front-end =====
   // Text processing (read-only); `sed -i` write targets are validated by the path layer.
+  // `xxd -r in out` writes its second operand.
+  if (/^xxd\b/i.test(value) && /\s-r\b/.test(value) && value.split(/\s+/).slice(1).filter((t) => !t.startsWith("-")).length >= 2) return false
   if (/^(?:cut|column|tr|tac|nl|pr|fmt|fold|paste|join|comm|expand|shuf|strings|xxd|od|hexdump)\b/i.test(value)) return true
   // awk is only acceptable as a pure text filter; `system(` / `| getline` / `getline <`
   // primitives can execute commands or read files, so they force a review.
-  if (/^awk\b(?![\s\S]*(?:system\s*\(|\|\s*getline|getline\s*<\s*))/i.test(value)) return true
+  // `print > "file"` / `print | "cmd"` write files or run commands as well.
+  if (/^awk\b(?![\s\S]*(?:system\s*\(|getline|\bprintf?\b[^;}\n]*?(?:>|\|)))/i.test(value)) return true
   if (/^(?:md5sum|sha1sum|sha224sum|sha256sum|sha384sum|sha512sum|basename|dirname|realpath|readlink|seq|expr)\b/i.test(value)) return true
   if (/^yq\b(?![\s\S]*-i\b)/i.test(value)) return true
-  if (/^sed\b/i.test(value)) return true
+  // The `w`/`W` command and the `s///w` flag write to a named file.
+  if (/^sed\b/i.test(value)) return !/(?:^|[\s;'"{}\/]|\d)[wW]\s+[^\s'"]/.test(value.slice(3))
 
   // Read-only system inspection
   if (/^(?:id|uptime|cal|type|lsattr|getfattr|lscpu|lsmod|lsusb|lspci|locale|getent|atq)\b/i.test(value)) return true
@@ -5677,6 +6050,21 @@ function maskQuotedLiteralContents(text: string): string {
 const INERT_OUTPUT_REDIRECT =
   /(?:\d+|&)?>{1,2}\s*(?:\/dev\/(?:null|stdout|stderr)\b|\$null\b|\bNUL\b)/gi
 
+/** Leading `~` of a whitespace-delimited word replaced by the home directory,
+ *  so a literal-argv lexer can resolve `sed -n 1p ~/x`. Quoted tildes are
+ *  never at a whitespace boundary and stay untouched. */
+function withLeadingTildeExpanded(text: string): string {
+  return text.replace(/(^|\s)~(?=\/|\s|$)/g, (_m, lead: string) => `${lead}${expandHome("~")}`)
+}
+
+/** Drops redirects that neither write a file nor read one (`2>/dev/null`,
+ *  `2>&1`, `>&-`) so a literal-argv lexer can resolve the command itself. */
+function withoutInertRedirects(text: string): string {
+  return text
+    .replace(INERT_OUTPUT_REDIRECT, " ")
+    .replace(/(?:^|(?<=\s))\d*>&(?:\d+|-)(?=\s|$)/g, " ")
+}
+
 function hasFileWritePrimitive(text: string): boolean {
   if (/\btee\b/i.test(text)) return true
   if (/\btouch\b/i.test(text)) return true
@@ -5922,7 +6310,9 @@ function localScriptCandidates(script: string, shell: string) {
   return [...candidates]
 }
 
-async function fingerprintLocalScript(candidate: string, cwd: string, worktree: string) {
+/** `outsideWorktree` admits scripts anywhere the read policy allows; callers
+ *  use it only for files they then prove read-only, never for the regex scan. */
+async function fingerprintLocalScript(candidate: string, cwd: string, worktree: string, outsideWorktree = false) {
   if (isCriticalOriginalPath(candidate) || /(?:^|[\\/])\.env(?:\.|$)/i.test(candidate)) return undefined
   const expanded = expandHome(candidate)
   const absolute = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded)
@@ -5932,7 +6322,11 @@ async function fingerprintLocalScript(candidate: string, cwd: string, worktree: 
   } catch {
     return undefined
   }
-  if (!isWithin(worktree, canonical)) return undefined
+  if (!isWithin(worktree, canonical)) {
+    if (!outsideWorktree) return undefined
+    const ctx: PathContext = { cwd, worktree, strictness: "LOOSE" }
+    if (checkPathSensitivity(canonical, ctx).sensitive || classifyPathTarget(canonical, "read", ctx).kind !== "pass") return undefined
+  }
 
   const info = await stat(canonical)
   if (!info.isFile() || info.size > MAX_LOCAL_SCRIPT_BYTES) return undefined
@@ -5970,6 +6364,102 @@ async function fingerprintLocalScript(candidate: string, cwd: string, worktree: 
         : {}),
     } satisfies ScriptFingerprint,
   }
+}
+
+const PYTHON_HOOK_ENV = /\bPYTHON(?:PATH|HOME|STARTUP|WARNINGS|INSPECT|EXECUTABLE|USERBASE|PLATLIBDIR|SAFEPATH)\b/
+
+const PYTHON_IMPORT_LINE = /^[ \t]*(?:from[ \t]+([A-Za-z_][\w.]*)[ \t]+import\b|import[ \t]+([^#\n;]+))/gm
+const PYTHON_DYNAMIC_IMPORT = /\b(?:__import__|importlib|runpy|imp\.load_\w+|load_source|exec_module)\b/
+const MAX_PYTHON_LOCAL_MODULES = 16
+
+function pythonImportedTopNames(source: string): Set<string> {
+  const names = new Set<string>()
+  for (const match of source.matchAll(PYTHON_IMPORT_LINE)) {
+    if (match[1]) {
+      names.add(match[1].split(".")[0] ?? "")
+      continue
+    }
+    for (const part of (match[2] ?? "").split(",")) {
+      const top = part.trim().replace(/[()\\]/g, "").split(/\s+/)[0]?.split(".")[0]
+      if (top && /^[A-Za-z_]\w*$/.test(top)) names.add(top)
+    }
+  }
+  names.delete("")
+  return names
+}
+
+/** `python3 dir/x.py` puts `dir` first on sys.path, so an import there runs
+ *  the sibling file instead of the stdlib or site module of the same name.
+ *  Sibling `.py` modules are read and fingerprinted like the script itself
+ *  (transitively, bounded); packages, compiled modules, dynamic imports, or
+ *  anything over the bound make the script count as uninspected. */
+async function inspectPythonLocalImports(
+  scriptPath: string,
+  content: string,
+  cwd: string,
+  worktree: string,
+  outsideWorktree: boolean,
+): Promise<{ modules: { content: string; reviewPath: string; fingerprint: ScriptFingerprint }[] } | undefined> {
+  const dir = path.dirname(scriptPath)
+  let entries: string[]
+  try {
+    entries = await readdir(dir)
+  } catch {
+    return undefined
+  }
+  const modules: { content: string; reviewPath: string; fingerprint: ScriptFingerprint }[] = []
+  const seen = new Set<string>([scriptPath])
+  const queue = [content]
+  while (queue.length > 0) {
+    const source = queue.shift() ?? ""
+    const imported = pythonImportedTopNames(source)
+    if (PYTHON_DYNAMIC_IMPORT.test(source) && entries.some((e) => /\.(?:py|pyc|so)$/i.test(e) || !e.includes("."))) {
+      return undefined
+    }
+    for (const name of imported) {
+      const local = entries.filter((e) => e === name || (e.startsWith(`${name}.`) && /\.(?:py|pyc|pyw|so|pyd)$/i.test(e)))
+      if (local.length === 0) continue
+      if (local.length !== 1 || local[0] !== `${name}.py`) return undefined
+      const modulePath = path.join(dir, `${name}.py`)
+      if (seen.has(modulePath)) continue
+      seen.add(modulePath)
+      if (modules.length >= MAX_PYTHON_LOCAL_MODULES) return undefined
+      const inspected = await fingerprintLocalScript(modulePath, cwd, worktree, outsideWorktree)
+      if (!inspected) return undefined
+      modules.push(inspected)
+      queue.push(inspected.content)
+    }
+  }
+  return { modules }
+}
+
+/** A `.py` local script whose every mention in the command is a plain
+ *  `python3 [flags] <script>` run and whose AST is proven read-only. Any
+ *  other invocation (shebang exec, `bash x.py`, a venv interpreter) keeps
+ *  the regex signal scan. */
+async function localPythonScriptProven(
+  candidate: string,
+  inspected: { content: string; fingerprint: ScriptFingerprint },
+  scanView: string,
+  input: InternalClassifyInput,
+): Promise<boolean> {
+  if (!/\.py$/i.test(candidate) || input.cwdUnknown || (input.strictness ?? "LOOSE") !== "LOOSE") return false
+  if (input.permScope && !input.permScope.w) return false
+  if (PYTHON_HOOK_ENV.test(scanView)) return false
+  const segments = splitSimpleSegments(scanView, input.shell)
+  if (!segments) return false
+  let runs = 0
+  for (const raw of segments) {
+    if (!raw.includes(candidate)) continue
+    const stripped = stripOutputRedirects(stripHarmlessPrefixes(raw))
+    const argv = stripped === undefined ? undefined : literalShellArgv(withoutInertRedirects(stripped))
+    if (!argv || !pythonRunsScript(argv, candidate)) return false
+    runs += 1
+  }
+  if (runs === 0) return false
+  const proof = await provePythonReadOnly(inspected.content, [path.dirname(inspected.fingerprint.path)])
+  if (!proof.ok) return false
+  return provenPathsReadable(proof.paths, { cwd: input.cwd, worktree: input.worktree, strictness: input.strictness ?? "LOOSE" })
 }
 
 export async function verifyScriptFingerprints(fingerprints: ScriptFingerprint[]) {
@@ -6559,6 +7049,56 @@ function isInertHeredocWriter(part: string): boolean {
  * interpreter-injection); undefined means "leave the segment to the normal
  * flow" (unknown consumers fail closed there, unmasked).
  */
+/** A quoted heredoc program fed to a plain `python3 -` (or a read-only SQL
+ *  script fed to `sqlite3 DB`) that is statically proven read-only. Returns
+ *  the residual command line with the consumer replaced by `cat`, so pipeline
+ *  tails and output redirects keep their normal checks. */
+async function provenHeredocProgram(
+  segment: string,
+  h: HeredocInfo,
+  consumer: HeredocConsumer,
+  residual: string,
+  base: string,
+  input: InternalClassifyInput,
+): Promise<{ residual: string; rule: string; reason: string } | undefined> {
+  if (consumer !== "lang" && consumer !== "db") return undefined
+  if (h.closeEnd === undefined) return undefined
+  const body = segment.slice(h.bodyRange.start, h.bodyRange.end)
+  // An unquoted delimiter expands the body before the consumer sees it.
+  if (!h.quoted && /[$`\\]/.test(body)) return undefined
+  const part = heredocPipelinePart(h.headerText, h.opStart - h.headerStart)
+  const partText = h.headerText.slice(part.start, part.end).replace(/<<-?\s*(?:'[^']*'|"[^"]*"|\\?\w+)/g, " ")
+  const withoutRedirects = stripOutputRedirects(partText)
+  if (withoutRedirects === undefined) return undefined
+  const consumerText = withoutInertRedirects(withoutRedirects)
+  if (/[<>]/.test(consumerText)) return undefined
+  const fullArgv = literalShellArgv(consumerText)
+  if (!fullArgv || fullArgv.length === 0) return undefined
+  // A timeout wrapper bounds the run; it changes nothing the body can do.
+  const argv = fullArgv.slice(timeoutPrefixLength(fullArgv))
+  if (argv.length === 0) return undefined
+  const ctx: PathContext = { cwd: base, worktree: input.worktree, strictness: input.strictness ?? "LOOSE" }
+  let rule: string
+  let reason: string
+  if (consumer === "lang") {
+    if (!pythonStdinInvocation(argv)) return undefined
+    if (definiteDestructiveHit(langDestructiveRuleView(body, "python3"), input.bypassedCategories)) return undefined
+    const proof = await provePythonReadOnly(body, [base])
+    if (!proof.ok || !provenPathsReadable(proof.paths, ctx)) return undefined
+    rule = "execution.python-readonly"
+    reason = "The piped Python program is statically proven read-only"
+  } else {
+    if (!proveSqliteHeredoc(argv, body, ctx)) return undefined
+    rule = "operation.semantic-read"
+    reason = "The piped SQL script is read-only"
+  }
+  const escaped = consumerText.trim().split(/\s+/).map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+  const pattern = new RegExp(`(^|[;&|(]\\s*|\\s)${escaped.join("\\s+")}(?=\\s|$|[;&|)])`, "g")
+  const matches = residual.match(pattern)
+  if (!matches || matches.length !== 1) return undefined
+  return { residual: residual.replace(pattern, "$1cat"), rule, reason }
+}
+
 async function classifyHeredocSegment(
   segment: string,
   base: string,
@@ -6691,6 +7231,14 @@ async function classifyHeredocSegment(
   const decisions: SegmentDecision[] = []
   const bodyInput: InternalClassifyInput = { ...input, cwd: base, baseUnverified: input.baseUnverified }
 
+  if (strictness === "LOOSE" && heredocs.length === 1 && !input.cwdUnknown && !(input.permScope && !input.permScope.w)) {
+    const proven = await provenHeredocProgram(segment, heredocs[0], consumers[0], residual, base, input)
+    if (proven) {
+      const residualDecision = await classifySegments(proven.residual, bodyInput, depth + 1)
+      return combineSegmentDecisions([{ verdict: "ALLOW", rules: [proven.rule], reason: proven.reason }, residualDecision])
+    }
+  }
+
   for (const [index, h] of heredocs.entries()) {
     const consumer = consumers[index]
     const body = segment.slice(h.bodyRange.start, h.bodyRange.end)
@@ -6777,6 +7325,159 @@ async function classifyHeredocSegment(
   // review, `ssh host <<'EOF'` keeps its network review.
   if (residual) decisions.push(await classifySegments(residual, bodyInput, depth + 1))
   return combineSegmentDecisions(decisions)
+}
+
+// --- glob operands of read-only commands ---------------------------------------
+//
+// A glob operand only ever expands to names of existing files, so on a reader
+// with no executing or writing option it can add read operands and nothing
+// else. Two things still need proof: an expansion must not be able to start
+// with `-` (a file named `--pre=sh` turns `rg x *` into an executor), and a
+// content-revealing reader must not be able to pick up credential files.
+
+/** Readers whose every option is read-only: a leading glob is acceptable. */
+// `du` is left out: a glob over a large tree is a budget question the
+// slow-command layer and the reviewer own.
+const GLOB_READERS_ANY_POSITION = new Set([
+  "grep", "egrep", "fgrep", "ls", "wc", "cat", "head", "tail", "file", "stat",
+  "md5sum", "sha1sum", "sha256sum", "sha512sum",
+])
+/** Readers with executing/writing options: globs need a literal directory prefix. */
+const GLOB_READERS_DIR_PREFIX = new Set(["rg", "jq", "sed", "find"])
+/** Readers that print file contents (vs. names, sizes, hashes). */
+const GLOB_CONTENT_READERS = new Set(["grep", "egrep", "fgrep", "cat", "head", "tail", "rg", "jq", "sed"])
+const SENSITIVE_GLOB_SAMPLES = [
+  "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "key.pem", "server.key", "cert.p12", "cert.pfx",
+  ".env", ".env.local", "credentials", "credentials.json", "hosts.yml", "auth.json", ".netrc",
+  ".pgpass", ".git-credentials", ".npmrc", ".pypirc", "shadow", ".bash_history", ".zsh_history",
+  "secrets.yaml", "secrets.json", "token.json",
+]
+
+type GlobWord = { text: string; globAt: number }
+
+/** Shell words with the offset of the first unquoted glob character (-1 when
+ *  none). Undefined when any word carries an expansion or operator. */
+function shellWordsWithGlobs(text: string): GlobWord[] | undefined {
+  const words: GlobWord[] = []
+  let i = 0
+  while (i < text.length) {
+    while (i < text.length && /\s/.test(text[i])) i += 1
+    if (i >= text.length) break
+    let word = ""
+    let globAt = -1
+    while (i < text.length && !/\s/.test(text[i])) {
+      const ch = text[i]
+      if (ch === "'") {
+        const end = text.indexOf("'", i + 1)
+        if (end < 0) return undefined
+        word += text.slice(i + 1, end)
+        i = end + 1
+        continue
+      }
+      if (ch === '"') {
+        i += 1
+        while (i < text.length && text[i] !== '"') {
+          const c = text[i]
+          if (c === "\\" && /[$`"\\\n]/.test(text[i + 1] ?? "")) {
+            word += text[i + 1]
+            i += 2
+            continue
+          }
+          if (c === "`" || (c === "$" && /[A-Za-z0-9_{(\[@*#?$!\-]/.test(text[i + 1] ?? ""))) return undefined
+          word += c
+          i += 1
+        }
+        if (i >= text.length) return undefined
+        i += 1
+        continue
+      }
+      if (ch === "\\") {
+        if (i + 1 >= text.length) return undefined
+        word += text[i + 1]
+        i += 2
+        continue
+      }
+      if (/[$`;&|()<>]/.test(ch)) return undefined
+      if (/[*?[{]/.test(ch) && globAt < 0) globAt = word.length
+      word += ch
+      i += 1
+    }
+    words.push({ text: word, globAt })
+  }
+  return words
+}
+
+function globTailRegex(tail: string): RegExp | undefined {
+  let out = ""
+  for (let i = 0; i < tail.length; i += 1) {
+    const ch = tail[i]
+    if (ch === "*") out += "[^/]*"
+    else if (ch === "?") out += "[^/]"
+    else if (ch === "[") {
+      const end = tail.indexOf("]", i + 2)
+      if (end < 0) return undefined
+      const body = tail.slice(i + 1, end).replace(/^!/, "^").replace(/\\/g, "\\\\")
+      out += `[${body}]`
+      i = end
+    } else if (ch === "{") {
+      const end = tail.indexOf("}", i + 1)
+      if (end < 0) return undefined
+      const alts = tail.slice(i + 1, end).split(",").map((alt) => alt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      out += `(?:${alts.join("|")})`
+      i = end
+    } else out += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  }
+  try {
+    return new RegExp(`^${out}$`)
+  } catch {
+    return undefined
+  }
+}
+
+/** Could the last path component of a glob name a credential file? Leading
+ *  dots follow bash: `*` does not match dotfiles. */
+function globMayMatchSensitive(pattern: string): boolean {
+  const tail = pattern.slice(pattern.lastIndexOf("/") + 1)
+  const regex = globTailRegex(tail)
+  if (!regex) return true
+  return SENSITIVE_GLOB_SAMPLES.some((sample) => (!sample.startsWith(".") || tail.startsWith(".")) && regex.test(sample))
+}
+
+function safeGlobReader(segment: string, ctx: PathContext): boolean {
+  const plain = stripOutputRedirects(segment)
+  if (plain === undefined) return false
+  const words = shellWordsWithGlobs(withoutInertRedirects(plain))
+  if (!words) return false
+  let i = 0
+  while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i].text)) {
+    if (words[i].globAt >= 0) return false
+    i += 1
+  }
+  const head = words[i]
+  if (!head || head.globAt >= 0) return false
+  const leaf = head.text
+  const anyPosition = GLOB_READERS_ANY_POSITION.has(leaf)
+  if (!anyPosition && !GLOB_READERS_DIR_PREFIX.has(leaf)) return false
+  const args = words.slice(i + 1)
+  if (leaf === "sed" && args.some((w) => /^(?:-[a-zA-Z]*i|--in-place)/.test(w.text))) return false
+  let sawGlob = false
+  for (const word of args) {
+    if (word.globAt < 0) continue
+    sawGlob = true
+    if (word.text.startsWith("-")) {
+      // `--include=*.ts` only expands if a file literally named that exists.
+      if (/^(?:grep|egrep|fgrep)$/.test(leaf) && /^--(?:include|exclude|exclude-dir)=/.test(word.text)) continue
+      return false
+    }
+    const prefix = word.text.slice(0, word.globAt)
+    const slash = prefix.lastIndexOf("/")
+    if (!anyPosition && slash < 0) return false
+    const dir = slash < 0 ? "." : prefix.slice(0, slash) || "/"
+    if (classifyPathTarget(dir, "read", ctx).kind !== "pass") return false
+    if (checkPathSensitivity(dir, ctx).sensitive) return false
+    if (GLOB_CONTENT_READERS.has(leaf) && globMayMatchSensitive(word.text)) return false
+  }
+  return sawGlob
 }
 
 async function expandSafeReadGlobs(segment: string, input: InternalClassifyInput): Promise<string | undefined> {
@@ -7466,6 +8167,10 @@ function interopWslResult(args: string[], _ctx: PathContext): InteropResult {
  *  `2>&1`/`2>/dev/null` never reach it because the caller tokenizes after
  *  dropping inert redirects. */
 function pyInlineClass(code: string): "write" | "read" | "spawn" {
+  // Credential names inside the code (`open('/home/u/.ssh/id_rsa')`) never
+  // form a path token the read-side scans can classify, so a "pure read"
+  // verdict must not stand on code that names a credential store.
+  if (embeddedCredentialFinding(code)) return "spawn"
   if (INTEROP_PY_WRITE_RE.test(code)) return "write"
   // open() for writing (the read-mode open("x") is a pure read).
   if (/\bopen\s*\([^)]*["'`]\s*[wax+]/i.test(code) || /\bopen\s*\([^)]*\bmode\s*=\s*["'`]\s*[wax+]/i.test(code)) {
@@ -7544,6 +8249,9 @@ function jsInlineCode(leaf: string, args: string[]): string | undefined {
  *  Anything else stays unproven (ASK under RW, kernel- or static-gated
  *  under RO). */
 function jsInlineReadOnly(code: string): boolean {
+  // Same credential-name guard as the python inline ladder: the code text is
+  // scanned raw (before masking) because the quoted masks hide the path.
+  if (embeddedCredentialFinding(code)) return false
   const masked = maskQuotedLiteralContents(code)
   if (hasFileWritePrimitive(masked) || hasDeletePrimitive(masked)) return false
   // The recognized print sinks and pure-read process properties are masked
@@ -8168,6 +8876,11 @@ function roGitKind(args: string[]): "write" | "unproven" | "read" | undefined {
   const { sub, index } = roSubcommand(args, GIT_VALUE_FLAGS)
   if (!sub) return "read" // bare `git` prints help
   const rest = args.slice(index + 1)
+  // Listing forms of otherwise mutating command groups.
+  if (looseRelaxationsActive()) {
+    if (sub === "worktree" && rest.length > 0 && stripMatchingQuotes(rest[0] ?? "") === "list") return "read"
+    if (sub === "stash" && ["list", "show"].includes(stripMatchingQuotes(rest[0] ?? ""))) return "read"
+  }
   if (RO_GIT_MUTATORS.has(sub)) return "write"
   // Read-only porcelain/plumbing keeps its existing checks.
   if (["status", "diff", "log", "show", "rev-parse", "rev-list", "ls-files", "ls-tree", "ls-remote", "grep", "blame", "annotate", "describe", "shortlog", "whatchanged", "var", "count-objects", "verify-tag", "verify-commit", "fsck", "cat-file", "check-ignore", "check-attr", "check-ref-format", "cherry", "range-diff", "merge-base", "name-rev", "show-ref", "show-branch", "stripspace", "for-each-ref", "diff-tree", "diff-index", "diff-files", "merge-file", "mktag", "pack-objects", "index-pack", "verify-pack", "show-index", "get-tar-commit-id", "interpret-trailers", "mailinfo", "mailsplit", "patch-id", "version", "help"].includes(sub)) {
@@ -9303,6 +10016,19 @@ async function roNonWriteGate(
       }
     }
   }
+  // Interpreter code and other argument text can name a credential store
+  // without ever producing a classifiable path token (`node -e
+  // "…readFileSync('/home/u/.ssh/id_rsa')…"`). The kernel passthrough only
+  // contains writes, so such surfaces stay in review instead of statically
+  // allowing the read.
+  if (!ruleBypassed("credentials.sensitive-access", bypassed)) {
+    for (const surface of surfaces) {
+      const embedded = embeddedCredentialFinding(surface)
+      if (embedded) {
+        return { verdict: "ASK", rules: [embedded.rule], reason: embedded.reason }
+      }
+    }
+  }
   if (!ruleBypassed("operation.context-required.network", bypassed) && NETWORK_CLIENT_WORD.test(combined)) {
     return {
       verdict: "ASK",
@@ -9439,6 +10165,115 @@ function readOnlyExecutionChannel(segment: string, combined: string, shell: stri
   return false
 }
 
+/** git options that write files or run configured programs even on read
+ *  subcommands, and repositories outside the worktree whose config arms
+ *  external programs (`git -C /tmp/x status` runs that repo's fsmonitor). */
+function gitReadArgsSafe(args: string[], ctx: PathContext): boolean {
+  for (let i = 0; i < args.length; i += 1) {
+    const token = stripMatchingQuotes(args[i] ?? "")
+    if (/^--(?:output(?:-directory)?|git-dir|work-tree|exec-path|ext-diff|open-files-in-pager)(?:=|$)/.test(token)) return false
+    if (token === "-o" || token === "-O") return false
+    if (token === "-C") {
+      const dir = stripMatchingQuotes(args[i + 1] ?? "")
+      if (!dir) return false
+      const resolved = resolveLexical(dir, ctx.cwd, expandHome("~"))
+      if (!resolved.absolute) return false
+      if (!isWithin(ctx.worktree, resolved.absolute) && foreignGitConfigArmed(resolved.absolute)) return false
+      i += 1
+    }
+  }
+  return true
+}
+
+function httpServerRootInWorktree(segment: string, base: string, worktree: string): boolean {
+  const tokens = simpleInvocationTokens(segment).map(stripMatchingQuotes)
+  let root = base
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i] ?? ""
+    if (token === "-d" || token === "--directory") root = path.resolve(base, expandHome(tokens[i + 1] ?? ""))
+    else if (token.startsWith("--directory=")) root = path.resolve(base, expandHome(token.slice("--directory=".length)))
+  }
+  return isWithin(worktree, root) && path.resolve(root) !== path.resolve(expandHome("~"))
+}
+
+/** Tools whose RO "read" class is decided by subcommand/flag vocabulary.
+ *  Interpreters (`python -c`, `node -e`), text processors (awk can `print >
+ *  file`), and network clients (curl/wget GET is "read" under RO) are left
+ *  out: under RO the kernel or the network policy backs their read class up,
+ *  in RW nothing would. */
+const RW_REUSABLE_READ_LEAVES = new Set([
+  "git", "npm", "pnpm", "yarn", "bun", "pip", "pip3", "pipx", "uv", "cargo", "go", "ninja", "cmake",
+  "meson", "mvn", "mvnw", "maven", "gradle", "gradlew", "docker", "podman", "nerdctl", "docker-compose",
+  "tar", "bsdtar", "unzip", "zipinfo", "gzip", "gunzip", "bzip2", "bunzip2", "xz", "unxz", "zstd",
+  "unzstd", "lz4", "lzip", "zcat", "bzcat", "xzcat", "zstdcat", "gzcat", "journalctl", "systemctl",
+  "timedatectl", "hostnamectl", "dotnet", "gem", "bundle", "bundler", "composer", "poetry", "pipenv",
+  "pdm", "rye", "hatch", "conda", "mamba", "micromamba", "cabal", "stack", "opam", "mix",
+])
+
+/** The RO session's proven-read vocabulary, reused for RW sessions. Under RO
+ *  the kernel backs it up; here it stands alone, so write-capable shapes the
+ *  RO path leaves to the kernel are excluded explicitly. */
+function rwReadOnlyProof(segment: string, ctx: PathContext, shell: string): SemanticProof | undefined {
+  const leaf = executableInvocation(segment).leaf
+  if (!leaf || !RW_REUSABLE_READ_LEAVES.has(leaf)) return undefined
+  if (readOnlyMutatingInvocation(segment) !== "read") return undefined
+  const roView = maskQuotedLiteralContents(maskHeredocDataBodies(segment, shell))
+  if (hasFileWritePrimitive(roView)) return undefined
+  const withoutRedirects = stripOutputRedirects(roView)
+  if (withoutRedirects === undefined || extractWriteTargets(withoutRedirects).targets.length > 0) return undefined
+  if (hasSensitiveEnvPrefix(segment)) return undefined
+  const invocation = executableInvocation(segment)
+  if (invocation.hadPrivilegeLauncher || invocation.unresolved) return undefined
+  if (readOnlyReadFinding(invocation.args, ctx)) return undefined
+  if (invocation.leaf === "git" && !gitReadArgsSafe(invocation.args, ctx)) return undefined
+  return { rule: "operation.read-only", reason: "The segment is a proven read-only invocation" }
+}
+
+/** User-trusted tools may take variable arguments (`SR_WORK=$R/work
+ *  subject-run …`), but never command/process substitution, a non-literal
+ *  command name, a sensitive env prefix, or a write redirect the path policy
+ *  would not allow. */
+function trustedCommandProof(segment: string, ctx: PathContext, input: InternalClassifyInput): SemanticProof | undefined {
+  const rules = parseTrustedCommands(input.trustedCommands ?? [])
+  if (rules.length === 0) return undefined
+  if (/\$\(|`|[<>]\(/.test(segment) || hasSensitiveEnvPrefix(segment)) return undefined
+  const redirects = extractRedirectTargets(segment)
+  if (redirects.unparseable) return undefined
+  if (redirects.targets.some((target) => classifyPathTarget(target, "write", ctx).kind !== "pass")) return undefined
+  const plain = stripOutputRedirects(segment)
+  if (plain === undefined) return undefined
+  const text = withoutInertRedirects(plain)
+  if (/[<>]/.test(text)) return undefined
+  const tokens = text.match(/(?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\s"'])+/g) ?? []
+  let i = 0
+  while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i += 1
+  const words = tokens.slice(i).map(stripMatchingQuotes)
+  if (!words[0] || /[$*?[{~\\]/.test(words[0])) return undefined
+  if (!matchesTrustedCommand(words, rules)) return undefined
+  return { rule: "operation.trusted-command", reason: "The command is on the user's trusted command list" }
+}
+
+async function semanticSegmentAllow(
+  segment: string,
+  base: string,
+  input: InternalClassifyInput,
+  strictness: Strictness,
+): Promise<SemanticProof | undefined> {
+  if (shellEscapeCharacter(input.shell) === "`") return undefined
+  const ctx: PathContext = { cwd: base, worktree: input.worktree, strictness }
+  const trusted = trustedCommandProof(segment, ctx, input)
+  if (trusted) return trusted
+  if (hasDynamicShellExpansion(segment, input.shell)) return undefined
+  if (analyzeSegmentPaths(segment, ctx).kind !== "pass") return undefined
+  const plain = stripOutputRedirects(segment)
+  if (plain === undefined) return undefined
+  const text = withoutInertRedirects(plain)
+  if (/[<>]/.test(text)) return undefined
+  const argv = literalShellArgv(withLeadingTildeExpanded(text))
+  if (!argv || argv.length === 0) return undefined
+  return rwReadOnlyProof(segment, ctx, input.shell) ?? (await proveLiteralInvocation(argv, ctx))
+}
+
 async function classifySegment(
   segment: string,
   base: string,
@@ -9473,8 +10308,13 @@ async function classifySegment(
       // in EXECUTOR position (`bash -c`, `pwsh -Command`, `python3 -c`, ...)
       // are code, not data — extractQuotedWrappers re-surfaces them and they
       // are scanned raw so the write-shape denial still fires first.
-      const roView = maskQuotedLiteralContents(maskHeredocDataBodies(segment, input.shell))
-      const roStripped = stripHarmlessPrefixes(segment)
+      // The RO gates classify the keyword-stripped tail: a compound-command
+      // keyword left by segment splitting (`then pwsh.exe …`) is not the
+      // executable, and treating it as an unrecognized leaf hid the real
+      // command from the interop and mutation gates below.
+      const roSegment = stripControlFlowKeywordPrefix(segment)
+      const roView = maskQuotedLiteralContents(maskHeredocDataBodies(roSegment, input.shell))
+      const roStripped = stripHarmlessPrefixes(roSegment)
       // Interop payload semantics replace the blanket interop deny. It runs
       // before the mutation gate so `python.exe -c "print(42)"` — whose leaf
       // is otherwise an unproven interpreter — reaches the payload classifier
@@ -9523,11 +10363,11 @@ async function classifySegment(
         // synthetic targets a read-mode vocab emits (unzip -d, tar -f).
         extractRedirectTargets(roView).targets.length > 0 ||
         (roMutation !== "read" && extractWriteTargets(roView).targets.length > 0) ||
-        extractQuotedWrappers(segment).some(
+        extractQuotedWrappers(roSegment).some(
           (payload) =>
             hasFileWritePrimitive(payload) || extractWriteTargets(payload).targets.length > 0,
         )
-      if (writeShaped || explicitRecycleBinOperation(segment, input.shell) !== undefined) {
+      if (writeShaped || explicitRecycleBinOperation(roSegment, input.shell) !== undefined) {
         const bypass = await roWriteGateBypass(segment, roView, base, segInput, strictness, roMutation)
         if (bypass) return bypass
         return readOnlyWriteDeny()
@@ -9541,7 +10381,7 @@ async function classifySegment(
       // left on the normal path by the predicate and never reach this allow.
       const roBenignHolder: { v: string } = { v: "" }
       const roBenign =
-        benignDynamicSurface(segment, roBenignHolder) &&
+        benignDynamicSurface(roSegment, roBenignHolder) &&
         !hasUnquotedExpansion(roBenignHolder.v, input.shell)
       // LOOSE tolerates glob operands on read surfaces (`wc -c *`, `cat *.ts`):
       // the shell expands them to local filenames a read command consumes.
@@ -9550,14 +10390,14 @@ async function classifySegment(
       if (
         roMutation === "read" &&
         (roBenign ||
-          (!hasDynamicShellExpansion(segment, input.shell) &&
-            !hasUnquotedExpansion(maskHeredocDataBodies(segment, input.shell), input.shell, roAllowGlobs))) &&
-        !hasSensitiveEnvPrefix(segment)
+          (!hasDynamicShellExpansion(roSegment, input.shell) &&
+            !hasUnquotedExpansion(maskHeredocDataBodies(roSegment, input.shell), input.shell, roAllowGlobs))) &&
+        !hasSensitiveEnvPrefix(roSegment)
       ) {
         // Benign substitutions are masked for the path scans: the literal
         // text around them still drives sensitivity detection, while the
         // dynamic island (`$(pwd)`, `$(date)`) doesn't poison the parse.
-        const scanSegment = roBenign ? roBenignHolder.v : segment
+        const scanSegment = roBenign ? roBenignHolder.v : roSegment
         const roPathCtx: PathContext = { cwd: base, worktree: input.worktree, strictness }
         const roFinding = analyzeSegmentPaths(scanSegment, roPathCtx)
         if (roFinding.kind === "pass") {
@@ -9668,6 +10508,15 @@ async function classifySegment(
     return classifySegment(stripped, base, input, depth)
   }
 
+  // Compound-command keywords split into their own segments (`for f in *.ts`,
+  // `do wc -l "$f"`, `done`). The keyword is syntax only: the command after
+  // it gets the full classification, and bare closers are inert.
+  const controlFlow = looseRelaxationsActive() ? controlFlowSegment(segment, input.shell) : undefined
+  if (controlFlow?.kind === "inner") return classifySegment(controlFlow.text, base, input, depth)
+  if (controlFlow?.kind === "inert") {
+    return { verdict: "ALLOW", rules: ["operation.control-flow"], reason: "Shell control-flow syntax with no command of its own" }
+  }
+
   // Heredoc segments: the body's role is decided by the consumer (inert write,
   // local/remote code, database shell). Code-consumer bodies are classified
   // recursively; quoted inert bodies are masked out of the text scans below.
@@ -9723,7 +10572,12 @@ async function classifySegment(
   // target of this segment is canonically inside a trusted temp root — the
   // write-family asks (outside-write, tar-extract, unverified base) no longer
   // break the safe path for work staged under /tmp after a `cd`.
-  if (!segInput.cwdUnknown) {
+  // Executor-capable invocations do not ride this early allow: a masked
+  // script payload (`sed '1e id' x > /tmp/o`, `awk 'BEGIN{system(…)}' > /tmp/o`)
+  // can execute code even when every literal write target sits in /tmp, so
+  // the segment falls through to the normal classification where the
+  // executor-hazard gates and the reviewer can see it.
+  if (!segInput.cwdUnknown && executorCapabilityHazard(segment) === undefined) {
     const confinedDecision = await classifyTempConfinedSegment(segment, base, segInput)
     if (confinedDecision && !confinedDecision.rules.every((rule) => ruleBypassed(rule, bypassed))) {
       return { verdict: confinedDecision.verdict, rules: confinedDecision.rules, reason: confinedDecision.reason }
@@ -9764,7 +10618,9 @@ async function classifySegment(
       }
     }
   } else if (/^python(?:3)?(?:\.exe)?\s+-m\s+http\.server\b/i.test(segment) && !input.cwdUnknown) {
-    if (strictness === "LOOSE" && !hasDynamicShellExpansion(segment, input.shell)) {
+    // http.server listens on every interface by default: serving a directory
+    // outside the worktree (a home directory, `/`) publishes its files.
+    if (strictness === "LOOSE" && !hasDynamicShellExpansion(segment, input.shell) && httpServerRootInWorktree(segment, base, input.worktree)) {
       return { verdict: "ALLOW", rules: ["operation.dev-server"], reason: "Serves a local development HTTP server" }
     }
     return { verdict: "ASK", rules: ["operation.context-required"], reason: "Starting a local development server requires review" }
@@ -9870,10 +10726,15 @@ async function classifySegment(
   const benignDynamic =
     benignDynamicSurface(segment, benignHolder) &&
     !hasUnquotedExpansion(benignHolder.v, input.shell)
+  // LOOSE tolerates glob operands on readers proven unable to turn an
+  // expanded name into an option or a credential read (see safeGlobReader).
+  const globReader =
+    knownSafe && looseRelaxationsActive() && !input.cwdUnknown &&
+    safeGlobReader(segment, { cwd: base, worktree: input.worktree, strictness })
   const provablySafe =
     knownSafe &&
     (!hasExpansion || benignDynamic) &&
-    (benignDynamic || !hasUnquotedExpansion(maskHeredocDataBodies(ruleSurface, input.shell), input.shell)) &&
+    (benignDynamic || !hasUnquotedExpansion(maskHeredocDataBodies(ruleSurface, input.shell), input.shell, globReader)) &&
     !hasSensitiveEnvPrefix(segment)
 
   // Kernel-trigger / core_pattern writs must not be masked by the
@@ -10080,6 +10941,15 @@ async function classifySegment(
     }
   }
 
+  // Semantic proofs: every danger scan above came back clean, so a segment
+  // that is proven read-only (or a user-trusted tool) needs no review. RO
+  // sessions keep their own permission-driven path below; HARD keeps every
+  // unproven-by-vocabulary command on review.
+  if (strictness === "LOOSE" && !(permScope && !permScope.w) && !input.cwdUnknown) {
+    const semantic = await semanticSegmentAllow(segment, base, input, strictness)
+    if (semantic) return { verdict: "ALLOW", rules: [semantic.rule], reason: semantic.reason }
+  }
+
   if (localScriptCandidates(segment, input.shell).length > 0 && !ruleBypassed("execution.local-script", bypassed)) {
     if (roKernelPassthrough) return kernelEnforcedAllow()
     return {
@@ -10216,11 +11086,58 @@ async function classifySegments(
   // Write→invoke correlation for this script level: literal file writes
   // (heredocs, `echo 'x' > f`) whose target is later executed or sourced.
   const writtenBodies = new Map<string, string>()
+  // Open `for`/`while`/`until` loops, innermost last. A `for` over plain
+  // words carries those words so body segments can be classified with the
+  // loop variable bound to each of them.
+  const loopFrames: LoopFrame[] = []
+  // Unconditional top-level `NAME=literal` assignments seen so far, bound
+  // into later segments like loop variables (LOOSE only, upgrade only).
+  const assignmentFrames: LoopFrame[] = []
+  let sawCompound = false
+  const loose = looseRelaxationsActive()
 
-  for (const raw of rawSegments) {
+  for (const [index, raw] of rawSegments.entries()) {
     ;({ stable, cond } = advanceSegmentBase(raw, stable, cond, input.cwd))
     const segment = raw.text.trim()
     if (!segment) continue
+    if (/^(?:if|while|until|for|case|select|then|do|else|elif|function)\b|^[({]|\(/.test(segment)) sawCompound = true
+    const assignment = loose && !unresolved && !(input.permScope && !input.permScope.w) ? literalAssignment(segment) : undefined
+    if (assignment) {
+      const next = rawSegments[index + 1]?.incoming
+      if (
+        !sawCompound &&
+        loopFrames.length === 0 &&
+        (raw.incoming === undefined || raw.incoming === ";" || raw.incoming === "newline") &&
+        next !== "|" &&
+        next !== "&" &&
+        BINDABLE_ASSIGNMENT_VALUE.test(assignment.value) &&
+        !assignment.value.startsWith("-") &&
+        assignmentBindable(script, assignment.name)
+      ) {
+        assignmentFrames.push({ name: assignment.name, words: [assignment.value] })
+      }
+      results.push({
+        verdict: "ALLOW",
+        rules: ["operation.variable-assignment"],
+        reason: "The segment assigns a literal value to a shell variable",
+      })
+      continue
+    }
+    if (/^(?:for|while|until)\s/.test(segment)) {
+      const pathCtx: PathContext = { cwd: cond.dir ?? input.cwd, worktree: input.worktree, strictness: input.strictness ?? "LOOSE" }
+      loopFrames.push(cond.dir === undefined ? { name: "", words: undefined } : parseForLoopFrame(segment, script, pathCtx))
+    } else if (/^done(?=\s|$)/.test(segment)) {
+      loopFrames.pop()
+    }
+    // A `cd` behind a compound keyword or inside a loop body may run zero or
+    // many times: the directory after it is unknown.
+    const unwrapped = segment.replace(/^(?:(?:do|then|else|elif|if|while|until|\{|!)\s+)+/, "")
+    if ((unwrapped !== segment || loopFrames.length > 0) && parseCdSegment(unwrapped)) {
+      sawDirectoryChange = true
+      cond = { dir: undefined, unverified: true }
+      stable = cond
+      continue
+    }
     const cd = parseCdSegment(segment)
     if (cd) {
       sawDirectoryChange = true
@@ -10237,6 +11154,18 @@ async function classifySegments(
       ...input,
       cwdUnknown: cond.dir === undefined,
       baseUnverified: cond.unverified || input.baseUnverified === true,
+    }
+    const bound = loose ? loopBoundVariants(segment, [...assignmentFrames, ...loopFrames]) : undefined
+    if (bound) {
+      // Binding the loop variable may only prove a body safe. When any bound
+      // variant is not ALLOW the unbound segment's own verdict stands, so the
+      // substitution never turns a reviewable ASK into a static DENY.
+      const variants: SegmentDecision[] = []
+      for (const variant of bound) variants.push(await classifySegment(variant, cond.dir ?? input.cwd, segInput, depth))
+      const original = await classifySegment(segment, cond.dir ?? input.cwd, segInput, depth)
+      const allBoundAllow = variants.every((variant) => variant.verdict === "ALLOW")
+      results.push(allBoundAllow || original.verdict === "ALLOW" ? combineSegmentDecisions(variants) : original)
+      continue
     }
     const decision = await classifySegment(segment, cond.dir ?? input.cwd, segInput, depth)
     results.push(decision)
@@ -10375,6 +11304,11 @@ export function isolateDetachedStartCommand(command: string, shell: string) {
 }
 
 export async function classifyShellCommand(input: ClassifyShellCommandInput): Promise<StaticSecurityDecision> {
+  const scope = (input.strictness ?? "LOOSE") !== "LOOSE" ? "off" : input.permScope && !input.permScope.w ? "ro" : "rw"
+  return looseRelaxationScope.run(scope, () => classifyShellCommandInScope(input))
+}
+
+async function classifyShellCommandInScope(input: ClassifyShellCommandInput): Promise<StaticSecurityDecision> {
   const source = normalized(input.script).trim()
   if (!source) {
     return { verdict: "DENY", rules: ["input.empty"], reason: "The executable script is empty", fingerprints: [] }
@@ -10500,15 +11434,56 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
   const referenced = referencedPathCandidates(scanView, input.shell)
   const deletionTargets = deletionTargetCandidates(scanView, input.shell, effectiveInput.cwd)
   let cloudScriptChars = 0
+  let provenLocalScripts = 0
 
   for (const candidate of localScriptCandidates(scanView, input.shell)) {
-    const inspected = await fingerprintLocalScript(candidate, effectiveInput.cwd, input.worktree)
+    let inspected = await fingerprintLocalScript(candidate, effectiveInput.cwd, input.worktree)
+    let proven = inspected !== undefined && (await localPythonScriptProven(candidate, inspected, scanView, effectiveInput))
+    if (!inspected && /\.py$/i.test(candidate)) {
+      // Outside the worktree only a proven-read-only Python script counts as
+      // inspected; anything else stays uninspected as before.
+      const outside = await fingerprintLocalScript(candidate, effectiveInput.cwd, input.worktree, true)
+      if (outside && (await localPythonScriptProven(candidate, outside, scanView, effectiveInput))) {
+        inspected = outside
+        proven = true
+      }
+    }
     if (!inspected) {
       uninspectedLocalScripts.push(candidate)
       continue
     }
+    let localModules: { content: string; reviewPath: string; fingerprint: ScriptFingerprint }[] = []
+    if (!proven && /\.py$/i.test(candidate)) {
+      const imports = await inspectPythonLocalImports(
+        inspected.fingerprint.path,
+        inspected.content,
+        effectiveInput.cwd,
+        input.worktree,
+        !isWithin(input.worktree, inspected.fingerprint.path),
+      )
+      if (!imports) {
+        uninspectedLocalScripts.push(candidate)
+        continue
+      }
+      localModules = imports.modules
+    }
+    for (const module of localModules) {
+      fingerprints.push(module.fingerprint)
+      localScriptSurfaces.push(normalized(module.content))
+      if (cloudScriptChars + module.content.length <= MAX_CLOUD_LOCAL_SCRIPT_CHARS) {
+        localScripts.push({ path: module.reviewPath, content: module.content, sha256: module.fingerprint.sha256 })
+        cloudScriptChars += module.content.length
+      }
+    }
     fingerprints.push(inspected.fingerprint)
-    localScriptSurfaces.push(normalized(inspected.content))
+    // A Python script run by a plain interpreter and proven read-only by its
+    // AST is fingerprinted like any inspected script, but its text does not
+    // feed the shell-regex signal scans (they misread Python string literals).
+    if (proven) {
+      provenLocalScripts += 1
+    } else {
+      localScriptSurfaces.push(normalized(inspected.content))
+    }
     if (cloudScriptChars + inspected.content.length <= MAX_CLOUD_LOCAL_SCRIPT_CHARS) {
       localScripts.push({
         path: inspected.reviewPath,
@@ -10582,6 +11557,7 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
     await isExplicitDisposableCleanup(scanView, effectiveInput.cwd, input.worktree) &&
     executableSurfaces.length === 1 &&
     localScriptSurfaces.length === 0 &&
+    provenLocalScripts === 0 &&
     (input.strictness ?? "LOOSE") !== "HARD"
   ) {
     return {
@@ -10638,7 +11614,7 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
     segmentDecision.verdict === "ASK" &&
     segmentDecision.rules.length === 1 &&
     segmentDecision.rules[0] === "execution.local-script" &&
-    localScriptSurfaces.length > 0 &&
+    localScriptSurfaces.length + provenLocalScripts > 0 &&
     uninspectedLocalScripts.length === 0 &&
     extraSignals.size === 0
   ) {

@@ -129,7 +129,7 @@ const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 
 const DYNAMIC_ALLOW_CACHE_TTL_MS = 15 * 60 * 1000
 const DYNAMIC_DENY_CACHE_TTL_MS = 90 * 1000
 const MAX_DYNAMIC_ALLOW_CACHE_ENTRIES = 512
-const PROMPT_VERSION = "v6"
+const PROMPT_VERSION = "v7-execution-scope"
 const SESSION_STATE_TTL_MS = 30 * 60 * 1000
 const MAX_SESSION_STATES = 512
 const MAX_OUTPUT_TAIL_CHARS = 2000
@@ -300,9 +300,15 @@ function conciseReason(reason: string, limit = 160) {
 
 // The risk-family line appended to classifier blocks so the agent knows which
 // categories to request instead of guessing (category-fix design §2).
-function riskCategoryHint(categories: readonly string[]): string {
-  if (categories.length === 0) return ""
-  return ` Risk categories: ${categories.join(", ")} — request escalation with these categories.`
+// `armed` carries the categories already authorized for this call (session
+// leases plus this call's allow_once grant): re-advertising one would point a
+// retry at an already-approved label instead of the outstanding risk. The
+// filter is presentation-only — the recorded denial (lastDynamicDenial) keeps
+// the full judged set, and the DENY itself is never lifted by it.
+function riskCategoryHint(categories: readonly string[], armed?: ReadonlySet<string>): string {
+  const outstanding = armed ? categories.filter((category) => !armed.has(category)) : categories
+  if (outstanding.length === 0) return ""
+  return ` Risk categories: ${outstanding.join(", ")} — request escalation with these categories.`
 }
 
 // Static rules name the categories that would clear the static layer; the
@@ -1992,6 +1998,7 @@ const plugin: Plugin = {
         roWritableRoots: [resolved.sandbox.scratch],
         sandboxDenyWrite: resolved.sandbox.denyWrite,
         runtimeWorkdir: classifyContext.runtimeWorkdir,
+        trustedCommands: resolved.trustedCommands,
       })
       const terminal = decision.rules.filter((rule) => isFloorRule(rule) || TERMINAL_ESCALATION_RULES.has(rule))
       if (terminal.length === 0) return
@@ -2405,6 +2412,7 @@ const plugin: Plugin = {
         roWritableRoots: [resolved.sandbox.scratch],
         sandboxDenyWrite: resolved.sandbox.denyWrite,
         runtimeWorkdir: requestedWorkdir,
+        trustedCommands: resolved.trustedCommands,
       })
       if (bypassedCategories && resolved.logReviewerTrace) {
         writeReviewerTrace({
@@ -2568,7 +2576,7 @@ const plugin: Plugin = {
               script,
               claimEscalationGuidance(sessionID),
               resolved.escalationEnabled,
-              riskCategoryHint(denyEntry.riskCategories),
+              riskCategoryHint(denyEntry.riskCategories, bypassed),
             )
           }
         }
@@ -2726,7 +2734,7 @@ const plugin: Plugin = {
           throw blockMessage(
             "dynamic", reason, true, staticDecision.rules, script,
             claimEscalationGuidance(sessionID), resolved.escalationEnabled,
-            riskCategoryHint(riskCategories),
+            riskCategoryHint(riskCategories, bypassed),
           )
         }
 
@@ -2752,7 +2760,7 @@ const plugin: Plugin = {
             script,
             claimEscalationGuidance(sessionID),
             resolved.escalationEnabled,
-            riskCategoryHint(riskCategories),
+            riskCategoryHint(riskCategories, bypassed),
           )
         }
 

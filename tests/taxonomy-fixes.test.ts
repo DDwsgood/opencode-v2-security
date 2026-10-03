@@ -446,7 +446,8 @@ describe("D4: shell heredoc bodies carry non-ALLOW findings", () => {
     expect(d.rules).toContain("operation.heredoc")
   })
   for (const [label, script] of [
-    ["lang heredoc", "python3 <<EOF\nprint(1)\nEOF"],
+    // A network import keeps the body off the read-only proof path.
+    ["lang heredoc", "python3 <<EOF\nimport socket\nprint(1)\nEOF"],
     ["shell heredoc of ls", "bash <<'EOF'\nls\nEOF"],
     ["shell heredoc of echo", "bash <<EOF\necho hi\nEOF"],
   ] as const) {

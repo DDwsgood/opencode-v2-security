@@ -116,6 +116,10 @@ export type BashClassifierOptions = {
   /** Append one JSONL line to ~/.opencode/reviewer-trace.jsonl for every
    * dynamic review (verdict or error) and every dynamic cache hit. */
   logReviewerTrace?: boolean
+  /** Command prefixes the user trusts (`"agent-browser"`, `"opencode2 --version"`).
+   * A shell segment whose argv starts with one of them is statically allowed
+   * after every danger scan has passed. Bare names match PATH lookups only. */
+  trustedCommands?: string[]
   /** Permanently armed escape-hatch categories (all sessions, all clients). */
   BypassClassifier?: Array<BypassCategory | keyof typeof LEGACY_CATEGORY_ALIASES>
   /** Default lifetime for temporary per-session bypass leases, in
@@ -293,6 +297,7 @@ export type ResolvedPluginConfig = {
   failPolicy: FailPolicy
   slowCommands: ResolvedSlowCommands
   logReviewerTrace: boolean
+  trustedCommands: readonly string[]
   bypassClassifier: ReadonlySet<BypassCategory>
   bypassLeaseTtlMs: number
   bypassPropagateToSubagents: boolean
@@ -316,6 +321,7 @@ const ALLOWED_TOP_LEVEL = new Set([
   "dynamicReview",
   "slowCommands",
   "logReviewerTrace",
+  "trustedCommands",
   "BypassClassifier",
   "bypassLeaseTtlMs",
   "bypassPropagateToSubagents",
@@ -1182,6 +1188,20 @@ export function resolvePluginConfig(raw?: BashClassifierOptions): ResolvedPlugin
     logReviewerTrace = source.logReviewerTrace
   }
 
+  let trustedCommands: string[] = []
+  if (source.trustedCommands !== undefined) {
+    if (!Array.isArray(source.trustedCommands) || !source.trustedCommands.every((entry) => typeof entry === "string")) {
+      throw new Error("trustedCommands must be an array of strings")
+    }
+    for (const entry of source.trustedCommands) {
+      const words = entry.trim().split(/\s+/).filter(Boolean)
+      if (words.length === 0 || words.some((word) => /[$`'"\\;&|<>(){}*?[\]]/.test(word))) {
+        throw new Error(`trustedCommands entry must be plain words without shell syntax: ${JSON.stringify(entry)}`)
+      }
+    }
+    trustedCommands = source.trustedCommands.map((entry) => entry.trim())
+  }
+
   const bypass = resolveBypassCategories(source.BypassClassifier)
   const bypassLeaseTtlMs = resolveBypassLeaseTtlMs(source.bypassLeaseTtlMs)
   let bypassPropagateToSubagents = true
@@ -1222,6 +1242,7 @@ export function resolvePluginConfig(raw?: BashClassifierOptions): ResolvedPlugin
     failPolicy,
     slowCommands,
     logReviewerTrace,
+    trustedCommands,
     bypassClassifier: bypass.value,
     bypassLeaseTtlMs,
     bypassPropagateToSubagents,
