@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.4.1 (2026-10-03)
+
+- Fix the actual RPC contract regression behind missing `/bypass off` and
+  expiry notifications: omit `expiresAt` when no lease is live, instead of
+  emitting a present-but-undefined optional field rejected by the host.
+  Preserve `null` exclusively for a lease without natural expiry.
+- Report the earliest finite deadline across inherited leases, even when
+  another contributor never expires. Do not silently discard notification
+  delivery errors.
+- Add a bounded lease-deadline refresh fallback: expiry re-subscribes and
+  fetches the authoritative snapshot without requiring a session switch,
+  compaction or reconnect. Cancel obsolete/deleted/disposed timers.
+- Mark unavailable snapshots as unsynchronized instead of presenting stale
+  permission or YOLO state as current. Add raw-object RPC contract regressions
+  alongside the TUI event/deadline tests.
+- Compute each snapshot from one clock reading so a deadline cannot split its
+  active categories from its expiry field. Ignore outdated request failures,
+  and filter notifications using the affected session's own workspace.
+
 ## 1.4.0 (2026-10-03)
 
 ### Jev payload/execution boundaries

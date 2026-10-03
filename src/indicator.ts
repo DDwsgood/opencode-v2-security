@@ -7,6 +7,12 @@ export type IndicatorState = {
   permission: string
   /** Bypass categories currently in effect (temporary + permanent). */
   active: string[]
+  /** Whether the last authoritative snapshot applied. RPC events carry
+   *  complete per-field data but are partial overall and ephemeral — only a
+   *  full `status` reply marks the entry synced. False (or absent on entries
+   *  written by older plugin generations) renders an honest "unknown" badge
+   *  instead of a possibly stale claim like [YOLO ON]. */
+  synced?: boolean
 }
 
 /** Structural slice of the reactive theme the indicator reads (kept loose so
@@ -62,6 +68,12 @@ export function permissionLabel(permission: string): string {
  * With the kill switch armed the danger badge REPLACES the bypass label —
  * individual categories are moot while all enforcement is off. */
 export function segmentsFor(state: IndicatorState, theme: IndicatorTheme): Segment[] {
+  // A badge that cannot prove freshness must not make a confident claim —
+  // e.g. still showing [YOLO ON] after the bypass actually expired is worse
+  // than admitting the state is unknown until the next snapshot lands.
+  if (state.synced !== true) {
+    return [{ text: "[Security state unknown]", fg: theme.text.subdued }]
+  }
   const writable = state.permission.includes("w")
   if (allIsOff(state.active)) {
     // While the kill switch is armed the badge is just [YOLO ON, Bypassing all

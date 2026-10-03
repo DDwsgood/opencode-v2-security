@@ -207,6 +207,15 @@ describe("/bypass timeout argument", () => {
       setSystemTime()
       expect(await invoke(h, "s1", "off")).toBeUndefined()
       expect((await h.status("s1")).active).toEqual([])
+      await delay(25) // the emit is fire-and-forget; let it land
+      // The cleared event must omit expiresAt — a present-but-undefined value
+      // fails the host schema and the event is silently dropped (the TUI badge
+      // stayed armed). Presence, not JSON.stringify output, is what matters.
+      const cleared = h.rpcEvents.findLast(
+        (e) => e.name === "changed" && (e.data as { sessionID?: string }).sessionID === "s1",
+      )
+      expect((cleared?.data as { reason?: string }).reason).toBe("cleared")
+      expect("expiresAt" in (cleared?.data as object)).toBe(false)
     } finally {
       setSystemTime()
     }
@@ -310,6 +319,9 @@ describe("/bypass timeout argument", () => {
     }
     expect(expired).toBeDefined()
     expect((expired as { data: { active: string[] } }).data.active).toEqual([])
+    // The expired transition is the dropped-event regression shape: no live
+    // lease, so expiresAt must be absent (not undefined) for the host schema.
+    expect("expiresAt" in (expired as { data: object }).data).toBe(false)
     expect(
       h.synthetic.some((s) => s.text.includes("temporary security allowance ended")),
     ).toBe(true)
@@ -369,6 +381,57 @@ describe("/bypass timeout argument", () => {
     await invoke(h, "s1", "off")
     expect((await h.status("s1")).active).toEqual([])
   })
+
+  test("children converge on parent expiry for ALL and normal grants alike", async () => {
+    const h = await startPlugin({}, [
+      { type: "session.created", data: { sessionID: "child-all", parentID: "s1" } },
+      { type: "session.created", data: { sessionID: "child-cat", parentID: "s2" } },
+    ])
+    for (let i = 0; i < 20; i++) await delay(25)
+    expect(await invoke(h, "s1", "ALL 1")).toBeUndefined()
+    expect(await invoke(h, "s2", "+fs 1")).toBeUndefined()
+
+    // Pull-based status already converges through the inherited chain: both
+    // children see the parent's grant while it is live.
+    let childAll: BypassStatusData | undefined
+    let childCat: BypassStatusData | undefined
+    for (let i = 0; i < 40; i++) {
+      await delay(25)
+      childAll = await h.status("child-all")
+      childCat = await h.status("child-cat")
+      if (childAll.active.includes("ALL") && childCat.active.includes("filesystem")) break
+    }
+    expect(childAll?.active).toContain("ALL")
+    expect(childCat?.active).toContain("filesystem")
+
+    // After the parent leases lapse, both children converge to empty without
+    // any command of their own — the sweep deadline wakes the loop itself.
+    // The wait predicate is the pushed `expired` event for BOTH owners, not a
+    // status pull: a lazy pull already reports the lease dead the moment its
+    // deadline passes, while the sweep's event emit may land later — polling
+    // status first and then asserting the events races that emit.
+    for (const owner of ["s1", "s2"]) {
+      let expired: { name: string; data: unknown } | undefined
+      for (let i = 0; i < 140 && !expired; i++) {
+        await delay(50)
+        expired = h.rpcEvents.find(
+          (e) =>
+            e.name === "changed" &&
+            (e.data as { sessionID?: string }).sessionID === owner &&
+            (e.data as { reason?: string }).reason === "expired",
+        )
+      }
+      expect(expired).toBeDefined()
+      expect("expiresAt" in (expired?.data as object)).toBe(false)
+    }
+    // The sweep has run, so both pull-based views have converged too.
+    childAll = await h.status("child-all")
+    childCat = await h.status("child-cat")
+    expect(childAll?.active).toEqual([])
+    expect(childCat?.active).toEqual([])
+    expect("expiresAt" in (childAll as object)).toBe(false)
+    expect("expiresAt" in (childCat as object)).toBe(false)
+  }, 15_000)
 
   test("fractional and large timeouts parse; overflow is clamped to a future deadline", async () => {
     const h = await startPlugin()

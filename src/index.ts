@@ -1097,6 +1097,18 @@ const plugin: Plugin = {
       appendAgentReminder(sessionID, PERM_ACTIVE_REMINDER(effective))
     }
 
+    /** Report a failed RPC event push. Only the error constructor name and a
+     * whitelisted `rpc.<word>` error code are logged — never the raw message,
+     * which can echo back arbitrary payload/config detail. */
+    function reportRpcEmitFailure(kind: "changed" | "permission", error: unknown) {
+      const type = error instanceof Error ? error.name : typeof error
+      const code =
+        error instanceof Error ? /\brpc\.[a-z0-9_.-]+/i.exec(error.message)?.[0] : undefined
+      console.error(
+        `[opencode-v2-security] bypass ${kind} event was not delivered (${type}${code ? `, ${code}` : ""})`,
+      )
+    }
+
     function emitPermChanged(sessionID: string, reason: string) {
       if (!bypassRpc) return
       const effective = effectivePerm(sessionID)
@@ -1106,7 +1118,7 @@ const plugin: Plugin = {
           reason,
           permission: permLabel(effective),
         }),
-      ).catch(() => {})
+      ).catch((error) => reportRpcEmitFailure("permission", error))
     }
 
     /** Re-announce descendants whose effective set moved with an ancestor
@@ -1229,21 +1241,27 @@ const plugin: Plugin = {
       return Number.isSafeInteger(expiresAt) ? expiresAt : Number.MAX_SAFE_INTEGER
     }
 
-    /** Effective expiry deadline for RPC payloads: the earliest live lease
-     *  along the session's own chain (the set a session actually inherits
-     *  ends when its earliest contributor does). null → armed without a
-     *  natural expiry; undefined → no live lease. */
-    function leaseExpiryForRpc(sessionID: string): number | null | undefined {
-      const now = Date.now()
+    /** Effective expiry deadline for RPC payloads: the earliest FINITE live
+     *  lease along the session's chain — the active set changes when its
+     *  earliest bounded contributor expires, so a never-expiring ancestor
+     *  lease must not hide a finite child deadline. null → live lease(s)
+     *  exist but none expires on its own; undefined → no live lease.
+     *  `now` defaults to the call instant; the RPC status/emit paths pass one
+     *  shared capture so every field of a payload describes the same instant. */
+    function leaseExpiryForRpc(sessionID: string, now: number = Date.now()): number | null | undefined {
       let earliest: number | undefined
+      let unbounded = false
       for (const target of [sessionID, ...bypassAncestors(sessionID)]) {
         const lease = bypassLeases.get(target)
-        if (lease && lease.expiresAt > now) {
-          if (lease.expiresAt === Infinity) return null
-          earliest = Math.min(earliest ?? lease.expiresAt, lease.expiresAt)
+        if (!lease || lease.expiresAt <= now) continue
+        if (lease.expiresAt === Infinity) {
+          unbounded = true
+          continue
         }
+        earliest = Math.min(earliest ?? lease.expiresAt, lease.expiresAt)
       }
-      return earliest
+      if (earliest !== undefined) return earliest
+      return unbounded ? null : undefined
     }
 
     /** Milliseconds until the soonest lease expiry (the next sweep deadline),
@@ -1270,9 +1288,10 @@ const plugin: Plugin = {
     /** Active bypass categories for a session: permanent config set ∪ the
      * union of every live lease along the ancestor chain (the session's own
      * lease plus inherited parent leases). Expired leases are skipped without
-     * mutating the map; the sweep removes them. */
-    function activeBypass(sessionID: string): Set<BypassCategory> {
-      const now = Date.now()
+     * mutating the map; the sweep removes them. `now` defaults to the call
+     * instant; the RPC status/emit paths share one capture across all lease
+     * reads in a payload. */
+    function activeBypass(sessionID: string, now: number = Date.now()): Set<BypassCategory> {
       const active = new Set<BypassCategory>(resolved.bypassClassifier)
       for (const target of [sessionID, ...bypassAncestors(sessionID)]) {
         const lease = bypassLeases.get(target)
@@ -1284,8 +1303,7 @@ const plugin: Plugin = {
     /** Whether the `all` kill switch is active for a session: any live lease
      * along the ancestor chain with the flag set (same lease + propagation
      * rules as categories; never armable via config). */
-    function allBypassed(sessionID: string): boolean {
-      const now = Date.now()
+    function allBypassed(sessionID: string, now: number = Date.now()): boolean {
       return [sessionID, ...bypassAncestors(sessionID)].some((target) => {
         const lease = bypassLeases.get(target)
         return lease !== undefined && lease.all === true && lease.expiresAt > now
@@ -1295,9 +1313,9 @@ const plugin: Plugin = {
     /** RPC-facing active list: the real categories plus the literal "all"
      * while the kill switch is armed, so the TUI companion can render the
      * ALL-OFF badge from the same payload. */
-    function activeForRpc(sessionID: string): string[] {
-      const active = [...activeBypass(sessionID)].sort()
-      if (allBypassed(sessionID)) active.push("ALL")
+    function activeForRpc(sessionID: string, now: number = Date.now()): string[] {
+      const active = [...activeBypass(sessionID, now)].sort()
+      if (allBypassed(sessionID, now)) active.push("ALL")
       return active
     }
 
@@ -1333,12 +1351,27 @@ const plugin: Plugin = {
      * is the only user-visible channel that does not enter the model context. */
     function emitBypassChanged(sessionID: string, reason: string) {
       if (!bypassRpc) return
+      // ONE clock read per payload: if a lease crosses its deadline between
+      // reads, an `active` list built at t and an `expiresAt` read at t+ε
+      // could claim "armed with no lease" — the TUI trusts the snapshot and
+      // would show a stale badge until the next event.
+      const now = Date.now()
       const permanent = [...resolved.bypassClassifier].sort()
-      const active = activeForRpc(sessionID)
+      const active = activeForRpc(sessionID, now)
       const temporary = active.filter((category) => !resolved.bypassClassifier.has(category as BypassCategory))
-      const expiresAt = leaseExpiryForRpc(sessionID)
-      void run(bypassRpc.events.emit("changed", { sessionID, reason, active, temporary, permanent, expiresAt })).catch(
-        () => {},
+      // expiresAt is optional on the wire: absent = no live lease, null =
+      // armed without a natural expiry. Emitting the key with `undefined`
+      // fails the host schema's optional-presence check, and the host then
+      // drops the whole event — an "off"/"expired" transition would never
+      // reach the TUI badge.
+      const payload: Record<string, unknown> = { sessionID, reason, active, temporary, permanent }
+      const expiresAt = leaseExpiryForRpc(sessionID, now)
+      if (expiresAt !== undefined) payload.expiresAt = expiresAt
+      void run(bypassRpc.events.emit("changed", payload)).catch(
+        // A dead TUI channel must not block command handling, but it must not
+        // vanish silently either: log the error type/message only (the
+        // payload never carries credentials).
+        (error) => reportRpcEmitFailure("changed", error),
       )
     }
 
@@ -3108,15 +3141,23 @@ const plugin: Plugin = {
       bypassRpc = yield* ctx.rpc.register(BypassRpc, {
         status: (input: { sessionID: string }) =>
           Effect.sync(() => {
-            const active = activeForRpc(input.sessionID)
-            return {
+            // ONE clock capture for the whole snapshot: active, ALL and
+            // expiresAt must describe the same instant (see emitBypassChanged).
+            const now = Date.now()
+            const active = activeForRpc(input.sessionID, now)
+            const result: Record<string, unknown> = {
               sessionID: input.sessionID,
               permission: permLabel(effectivePerm(input.sessionID)),
               active,
               temporary: active.filter((category) => !resolved.bypassClassifier.has(category as BypassCategory)),
               permanent: [...resolved.bypassClassifier].sort(),
-              expiresAt: leaseExpiryForRpc(input.sessionID),
             }
+            // Same optional-presence rule as the `changed` event: a present
+            // `expiresAt: undefined` fails the output schema; omit the key
+            // when no live lease exists, keep `null` for a never-expiring one.
+            const expiresAt = leaseExpiryForRpc(input.sessionID, now)
+            if (expiresAt !== undefined) result.expiresAt = expiresAt
+            return result
           }),
       })
 

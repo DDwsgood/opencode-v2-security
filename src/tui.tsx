@@ -30,9 +30,16 @@
 //   `session.forked` (a child inherits the parent's bypass/permission),
 //   `session.moved` (the session's location — and therefore the owning
 //   plugin instance — changed), and `session.deleted` (drop the entry).
-// - A `status` reply applies only while it is the newest pull and no event
+// - A status reply applies only while it is the newest pull and no event
 //   arrived after it started, so a stale reply can never overwrite fresher
 //   event state (`src/indicator-refresh.ts`).
+// - The server snapshot/event `expiresAt` field drives a per-session
+//   deadline timer (single-shot, rescheduled on every update, never a poll):
+//   when a finite bypass lease reaches its deadline without an event — a
+//   dropped emit, a dead subscription, a silent queue overflow — the timer
+//   resubscribes the RPC handlers and pulls a fresh snapshot. Entries that
+//   cannot prove freshness render "[Security state unknown]" rather than a
+//   confident claim (e.g. stale [YOLO ON]).
 import { createEffect, For, Show } from "solid-js"
 import type { Plugin } from "@opencode-ai/plugin/tui"
 import { BypassRpc, type BypassChangedData, type BypassStatusData } from "./bypass-rpc"
@@ -164,21 +171,6 @@ const plugin: Plugin.Definition = {
 
     const revisions = new StatusRevisions()
 
-    // The server RPC event is not location-scoped, so a host with several
-    // locations would deliver all of them. Only filter when the reliable
-    // identity (workspaceID) is present on both sides and actually differs;
-    // never drop on a directory spelling/timing mismatch. `context.location`
-    // is a live getter: read it per event, not once at setup.
-    const sameWorkspace = (event: { location?: unknown }) => {
-      const here = context.location as { workspaceID?: string } | undefined
-      const there = event.location as { workspaceID?: string } | undefined
-      return !(
-        here?.workspaceID !== undefined &&
-        there?.workspaceID !== undefined &&
-        here.workspaceID !== there.workspaceID
-      )
-    }
-
     const rpc = client.rpc(BypassRpc)
 
     // Persistent indicator state: ephemeral store keyed by sessionID (the
@@ -195,7 +187,10 @@ const plugin: Plugin.Definition = {
         ? undefined
         : (sessionID: string, patch: Partial<IndicatorState>) =>
             mutateIndicator((draft) => {
-              const current = draft[sessionID] ?? { permission: "rwx", active: [] }
+              // New entries start unsynced: the defaults below are
+              // placeholders, not observations — only a full status snapshot
+              // or a live event field plus a confirming pull marks synced.
+              const current = draft[sessionID] ?? { permission: "rwx", active: [], synced: false }
               draft[sessionID] = { ...current, ...patch }
             })
 
@@ -212,30 +207,126 @@ const plugin: Plugin.Definition = {
       }
     }
 
+    // --- lease-deadline timer (bounded fallback, not a poll) ----------------
+    // The `expiresAt` in RPC events/status replies is the earliest live lease
+    // deadline for the session's chain. A finite deadline arms a single-shot
+    // timer that resubscribes the RPC handlers and pulls a fresh snapshot —
+    // covering events the TUI never received (dropped emit, dead
+    // subscription, per-subscriber queue overflow without a reconnect).
+    // `null`/absent expiresAt means no natural expiry → no timer.
+    const canPull = typeof rpc.status === "function"
+    // setTimeout clamps beyond ~24.8 days; far-future leases re-arm instead.
+    const TIMER_MAX_MS = 2_147_483_000
+    // A deadline that already passed (or a pull that fails at the deadline)
+    // retries on this spacing, capped — a stale badge is corrected without
+    // ever becoming a tight retry loop.
+    const DEADLINE_RETRY_MS = 10_000
+    const DEADLINE_MAX_RETRIES = 3
+    const deadlineTimers = new Map<string, ReturnType<typeof setTimeout>>()
+    const deadlineAttempts = new Map<string, number>()
+
+    const clearDeadlineTimer = (sessionID: string) => {
+      const timer = deadlineTimers.get(sessionID)
+      if (timer !== undefined) clearTimeout(timer)
+      deadlineTimers.delete(sessionID)
+    }
+
+    const markUnsynced = (sessionID: string) => writeIndicator?.(sessionID, { synced: false })
+
+    // The server RPC event is not location-scoped, so a host with several
+    // locations would deliver all of them. The right identity to check is the
+    // event's TARGET SESSION's own location — the instance that actually owns
+    // the session's leases and permission baseline — never the TUI's default
+    // `context.location` (the terminal's cwd), which routinely differs from
+    // the opened session's location and once dropped legitimate events.
+    // Only a definite workspaceID mismatch filters; a missing workspaceID or
+    // a transient session-lookup failure never drops (a late status pull
+    // self-corrects either way — a dropped OFF would not).
+    const sameWorkspace = (sessionID: string, event: { location?: unknown }) => {
+      const emitted = (event.location as { workspaceID?: string } | undefined)?.workspaceID
+      if (emitted === undefined) return true
+      const session = locationOf(sessionID)?.workspaceID
+      if (session === undefined) return true
+      return emitted === session
+    }
+
+    const armDeadline = (sessionID: string, expiresAt: number | null | undefined) => {
+      clearDeadlineTimer(sessionID)
+      if (!canPull || typeof expiresAt !== "number" || !Number.isFinite(expiresAt)) return
+      const remaining = expiresAt - Date.now()
+      if (remaining > 0) {
+        deadlineAttempts.delete(sessionID)
+        const timer = setTimeout(() => void onDeadline(sessionID, expiresAt), Math.min(remaining, TIMER_MAX_MS))
+        ;(timer as { unref?: () => void }).unref?.()
+        deadlineTimers.set(sessionID, timer)
+        return
+      }
+      // Deadline already passed: the badge is stale right now — flag it
+      // BEFORE the retry cap. A pull that keeps answering with a past
+      // deadline (clock skew, stale reply, slow server sweep) must stop
+      // requesting after the cap while still admitting "unknown", never
+      // leaving the just-applied stale state looking trustworthy.
+      markUnsynced(sessionID)
+      const attempts = (deadlineAttempts.get(sessionID) ?? 0) + 1
+      if (attempts > DEADLINE_MAX_RETRIES) return
+      deadlineAttempts.set(sessionID, attempts)
+      const timer = setTimeout(() => void onDeadline(sessionID, expiresAt), DEADLINE_RETRY_MS)
+      ;(timer as { unref?: () => void }).unref?.()
+      deadlineTimers.set(sessionID, timer)
+    }
+
+    const onDeadline = async (sessionID: string, expiresAt: number) => {
+      deadlineTimers.delete(sessionID)
+      if (disposed) return
+      if (expiresAt - Date.now() > 0) {
+        // Fired early because the deadline overflowed setTimeout's range.
+        armDeadline(sessionID, expiresAt)
+        return
+      }
+      markUnsynced(sessionID)
+      subscribeRpc()
+      const ok = await pullStatus(sessionID)
+      if (!disposed && !ok) armDeadline(sessionID, expiresAt)
+    }
+
     // Late attach / session switch / any refresh trigger: pull the full
     // state so the indicator can never go stale. Older hosts without RPC
     // methods degrade to event-only updates. Every failure — including a
-    // missing location or a rejected RPC — degrades to event-only updates.
-    const pullStatus = async (sessionID: string, location?: Location) => {
+    // missing location or a rejected RPC — marks the entry unsynced (the
+    // badge then admits "unknown" instead of asserting stale state).
+    const pullStatus = async (sessionID: string, location?: Location): Promise<boolean> => {
+      // The ticket must span the catch: a pull that fails AFTER a newer
+      // pull/event applied is handled state, not a failure — marking it
+      // unsynced would knock out the fresher badge, and letting onDeadline
+      // retry its stale deadline would cancel the newer lease's timer.
+      let ticket: ReturnType<typeof revisions.beginPull> | undefined
       try {
-        if (disposed) return
+        if (disposed) return false
+        if (!canPull) return true
         const target = location ?? locationOf(sessionID)
-        if (!target) return
-        const ticket = revisions.beginPull(sessionID)
-        const data = await rpc.status?.({ sessionID }, { location: target })
-        if (
-          !disposed &&
-          data &&
-          data.sessionID === sessionID &&
-          revisions.mayApply(sessionID, ticket)
-        ) {
-          writeIndicator?.(data.sessionID, {
-            permission: data.permission,
-            active: [...data.active],
-          })
-        }
+        if (!target) throw new Error("session location unavailable")
+        ticket = revisions.beginPull(sessionID)
+        const data = await rpc.status!({ sessionID }, { location: target })
+        if (!data || data.sessionID !== sessionID) throw new Error("status reply mismatched")
+        // A stale or post-dispose reply writes nothing: a newer event or pull
+        // already holds the truth, and a previous generation must not touch
+        // the shared store.
+        if (disposed || !revisions.mayApply(sessionID, ticket)) return true
+        writeIndicator?.(data.sessionID, {
+          permission: data.permission,
+          active: [...data.active],
+          synced: true,
+        })
+        armDeadline(sessionID, data.expiresAt)
+        return true
       } catch {
-        /* event-only fallback */
+        if (disposed) return false
+        // A synchronous pre-pull failure (no ticket) is the latest attempt;
+        // a late rejection whose ticket went stale is not.
+        const current = ticket === undefined || revisions.mayApply(sessionID, ticket)
+        if (!current) return true
+        markUnsynced(sessionID)
+        return false
       }
     }
     const pullFamily = (sourceID: string) => {
@@ -255,6 +346,9 @@ const plugin: Plugin.Definition = {
     const rpcStops: Array<() => void> = []
     let rpcGeneration = 0
     const subscribeRpc = () => {
+      // A teardown-racing event must not create subscriptions that outlive
+      // the generation — runCleanups already drained rpcStops.
+      if (disposed) return
       for (const stop of rpcStops.splice(0)) {
         try {
           stop()
@@ -268,10 +362,24 @@ const plugin: Plugin.Definition = {
         rpcStops.push(
           rpc.events.on("changed", (event) => {
             try {
-              if (!live() || !sameWorkspace(event)) return
               const data = event.data as BypassChangedData
+              if (!live() || typeof data?.sessionID !== "string") return
+              if (!sameWorkspace(data.sessionID, event)) return
               revisions.markEvent(data.sessionID)
-              writeIndicator?.(data.sessionID, { active: [...data.active] })
+              // Without a status method the host is event-only: live events
+              // are the only authority, so they certify the badge directly.
+              writeIndicator?.(data.sessionID, {
+                active: [...data.active],
+                ...(canPull ? {} : { synced: true }),
+              })
+              // The event carries the lease deadline (finite | null | absent)
+              // — arm or clear the fallback timer from it.
+              armDeadline(data.sessionID, data.expiresAt)
+              // A partial event cannot certify a badge that lost sync;
+              // converge it with a snapshot pull.
+              if (canPull && indicator && indicator[data.sessionID]?.synced !== true) {
+                void pullStatus(data.sessionID)
+              }
               // Descendants inherit the change but get no event of their own.
               pullFamily(data.sessionID)
               context.ui.toast.show(toastFor(data))
@@ -285,10 +393,19 @@ const plugin: Plugin.Definition = {
             // A throwing handler rejects the event pump's async loop and
             // silently kills the subscription — keep the body fault-free.
             try {
-              if (!live() || !sameWorkspace(event)) return
-              const data = event.data as { sessionID: string; permission: string }
+              const data = event.data as { sessionID?: string; permission?: string }
+              if (!live() || typeof data?.sessionID !== "string") return
+              if (!sameWorkspace(data.sessionID, event)) return
               revisions.markEvent(data.sessionID)
-              writeIndicator?.(data.sessionID, { permission: data.permission })
+              if (typeof data.permission === "string") {
+                writeIndicator?.(data.sessionID, {
+                  permission: data.permission,
+                  ...(canPull ? {} : { synced: true }),
+                })
+              }
+              if (canPull && indicator && indicator[data.sessionID]?.synced !== true) {
+                void pullStatus(data.sessionID)
+              }
               pullFamily(data.sessionID)
             } catch (error) {
               console.error("[opencode-v2-security] permission indicator update failed", error)
@@ -319,8 +436,14 @@ const plugin: Plugin.Definition = {
     // Re-subscribe and re-pull every session we already track.
     listen("server.connected", () => {
       subscribeRpc()
-      if (!indicator) return
-      for (const sessionID of Object.keys(indicator)) void pullStatus(sessionID)
+      if (!indicator || !writeIndicator || !canPull) return
+      // Events published while the stream was down are lost: every tracked
+      // entry is suspect until its snapshot lands. (Event-only hosts keep
+      // trusting events — there is no snapshot to recover with.)
+      for (const sessionID of Object.keys(indicator)) {
+        writeIndicator(sessionID, { synced: false })
+        void pullStatus(sessionID)
+      }
     })
     // A completed compaction is a natural desync point for the visible
     // badge; re-pull the session's authoritative state. Handlers guard the
@@ -356,6 +479,8 @@ const plugin: Plugin.Definition = {
     listen("session.deleted", (event) => {
       const sessionID = event.data?.sessionID
       if (typeof sessionID !== "string") return
+      clearDeadlineTimer(sessionID)
+      deadlineAttempts.delete(sessionID)
       revisions.drop(sessionID)
       mutateIndicator?.((draft) => {
         delete draft[sessionID]
@@ -397,6 +522,9 @@ const plugin: Plugin.Definition = {
 
     cleanups.push(() => {
       rpcGeneration++
+      for (const timer of deadlineTimers.values()) clearTimeout(timer)
+      deadlineTimers.clear()
+      deadlineAttempts.clear()
       for (const stop of rpcStops.splice(0)) {
         try {
           stop()
