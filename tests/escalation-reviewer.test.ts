@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, writeFile } from "node:fs/promises"
+import { cleanupTestArtifacts as rm } from "./artifacts"
 import os from "node:os"
 import path from "node:path"
 import {
@@ -41,7 +42,8 @@ async function fakeReviewer(source: string): Promise<string> {
 describe("escalation reviewer output protocol", () => {
   test("accepts exactly one decision and one leading think block", () => {
     expect(parseEscalationReviewOutput("allow_once\n")).toBe("allow_once")
-    expect(parseEscalationReviewOutput("<think>private reasoning</think>ask_user")).toBe("ask_user")
+    // Legacy wire spelling normalizes to the unattended verdict.
+    expect(parseEscalationReviewOutput("<think>private reasoning</think>ask_user")).toBe("collect_evidence")
     expect(parseEscalationReviewOutput("<think>private reasoning</think>\ndeny")).toBe("deny")
   })
 

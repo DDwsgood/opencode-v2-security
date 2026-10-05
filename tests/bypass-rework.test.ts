@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp } from "node:fs/promises"
+import { cleanupTestArtifacts as rm } from "./artifacts"
 import path from "node:path"
 import { Cause, Effect, Exit, Option, Scope, Stream } from "effect"
 import plugin from "../src/index"
@@ -41,6 +42,11 @@ type Harness = {
   commands: Map<string, CommandExec>
   synthetic: Array<{ sessionID: string; text: string; description?: string }>
   rpcEvents: Array<{ name: string; data: unknown }>
+  /** What the next model request's context.system would contain for the
+   * session — the no-wake notice channel (session.hook("context")).
+   * Synthetic reminders no longer carry bypass/perm state; this is the
+   * assertion point that replaces them. */
+  notice: (sessionID: string) => Promise<string>
   status: (sessionID: string) => Promise<{ active: string[]; temporary: string[]; permanent: string[]; permission: string }>
 }
 
@@ -65,6 +71,9 @@ async function startPlugin(
   const commands = new Map<string, CommandExec>()
   const synthetic: Harness["synthetic"] = []
   const rpcEvents: Harness["rpcEvents"] = []
+  let contextCb:
+    | ((ev: { sessionID: string; system: Array<{ type: string; text: string }> }) => Effect.Effect<void>)
+    | undefined
   let statusHandler: ((input: { sessionID: string }) => Effect.Effect<unknown, unknown>) | undefined
 
   const ctx = {
@@ -94,6 +103,13 @@ async function startPlugin(
     session: {
       get: () => Effect.succeed({ location: { directory } }),
       interrupt: () => Effect.void,
+      /** Context hook registrar: captures the "context" callback so tests can
+       *  run the same system-part mutation the host performs while building a
+       *  model request. */
+      hook: (name: string, cb: (ev: { sessionID: string; system: Array<{ type: string; text: string }> }) => Effect.Effect<void>) => {
+        if (name === "context") contextCb = cb
+        return Effect.void
+      },
       synthetic: (input: { sessionID: string; text: string; description?: string }) =>
         Effect.sync(() => {
           synthetic.push(input)
@@ -126,6 +142,12 @@ async function startPlugin(
   const status = async (sessionID: string) =>
     (await Effect.runPromise(statusHandler!({ sessionID }))) as Awaited<ReturnType<Harness["status"]>>
 
+  const notice = async (sessionID: string) => {
+    const event = { sessionID, system: [{ type: "text", text: "base" }] }
+    if (contextCb) await Effect.runPromise(contextCb(event as never))
+    return event.system.map((p) => p.text).join("\n")
+  }
+
   return {
     executeBefore: collected["execute.before"]!,
     executeAfter: collected["execute.after"]!,
@@ -134,6 +156,7 @@ async function startPlugin(
     commands,
     synthetic,
     rpcEvents,
+    notice,
     status,
   }
 }
@@ -204,25 +227,26 @@ describe("/bypass command parse + kill switch", () => {
     status = await h.status("s1")
     expect(status.active).toContain("ALL")
     expect(status.temporary).toContain("ALL")
-    const allReminder = h.synthetic.find((s) => s.sessionID === "s1" && s.text.includes("/bypass ALL"))
-    expect(allReminder?.text).toContain("removed all opencode-v2-security enforcement")
-    // Synthetic reminders carry the plugin prefix and no internal event tokens.
-    expect(allReminder?.text.startsWith("opencode-v2-security:")).toBe(true)
-    expect(allReminder?.text).not.toMatch(/token=/)
+    const allNotice = await h.notice("s1")
+    expect(allNotice).toContain("removed all opencode-v2-security enforcement")
+    // Notices carry the plugin prefix and no internal event tokens.
+    expect(allNotice).toContain("opencode-v2-security:")
+    expect(allNotice).not.toMatch(/token=/)
 
-    // Category arms don't lift the kill switch — and stay silent while armed.
-    const silentCount = h.synthetic.length
+    // Category arms don't lift the kill switch — the notice stays the
+    // ALL-OFF text while armed (the state is tracked, not re-announced).
     expect(await invoke(h, "bypass", "s1", "+os")).toBeUndefined()
     status = await h.status("s1")
     expect(status.active).toContain("ALL")
     expect(status.active).toContain("host")
     expect(status.active).toContain("indirection")
-    expect(h.synthetic.length).toBe(silentCount)
+    expect(await h.notice("s1")).toContain("removed all opencode-v2-security enforcement")
 
     expect(await invoke(h, "bypass", "s1", "off")).toBeUndefined()
     status = await h.status("s1")
     expect(status.active).toEqual([])
-    expect(h.synthetic.some((s) => s.sessionID === "s1" && s.text.includes("Enforcement restored"))).toBe(true)
+    // Restored: the snapshot clears — nothing armed anymore.
+    expect(await h.notice("s1")).toBe("base")
   })
 
   test("yolo/YOLO is a case-insensitive alias for the ALL kill switch", async () => {
@@ -281,24 +305,24 @@ describe("/bypass command parse + kill switch", () => {
     expect((await h.status("s1")).active).toEqual([])
   })
 
-  test("ALL disarm emits restore notice + re-announces armed categories", async () => {
+  test("ALL disarm re-announces the effective armed categories", async () => {
     const h = await startPlugin()
     await invoke(h, "bypass", "s1", "+os", )
     await invoke(h, "bypass", "s1", "ALL")
-    const armedCount = h.synthetic.length
-    // Silent while armed.
+    // Silent while armed: only the ALL-OFF notice, no per-category noise.
     await invoke(h, "bypass", "s1", "+fs")
-    expect(h.synthetic.length).toBe(armedCount)
+    expect(await h.notice("s1")).toContain("removed all opencode-v2-security enforcement")
     await invoke(h, "bypass", "s1", "-ALL")
-    const texts = h.synthetic.map((s) => s.text).join("\n")
-    expect(texts).toContain("Enforcement restored")
+    // The restore produces the CURRENT effective state (still-armed
+    // categories), not a stale transition log.
+    const texts = await h.notice("s1")
     expect(texts).toContain("The user temporarily allowed some sensitive commands")
     expect(texts).toContain("host")
     expect(texts).toContain("indirection")
     expect(texts).toContain("filesystem")
     expect(texts).not.toMatch(/token=/)
-    // Every bypass reminder is prefixed with the plugin name.
-    for (const s of h.synthetic) expect(s.text.startsWith("opencode-v2-security:")).toBe(true)
+    // Every notice carries the plugin prefix.
+    expect(texts).toContain("opencode-v2-security:")
   })
 
   test("kill switch propagates to subagent sessions via session.created", async () => {
@@ -313,39 +337,38 @@ describe("/bypass command parse + kill switch", () => {
       childActive = (await h.status("child-1")).active
     }
     expect(childActive).toContain("ALL")
-    // The child session gets the all-enforcement-removed reminder at link time.
-    expect(h.synthetic.some((s) => s.sessionID === "child-1" && s.text.includes("/bypass ALL"))).toBe(
+    // The child session's notice carries the all-enforcement-removed text.
+    expect((await h.notice("child-1")).includes("removed all opencode-v2-security enforcement")).toBe(
       true,
     )
   })
 
-  test("slow arm/disarm sends NO agent reminder; sandbox and all do notify", async () => {
+  test("slow arm/disarm sends NO agent notice; sandbox and all do notify", async () => {
     const h = await startPlugin()
-    const count = () => h.synthetic.length
+    const noticeText = () => h.notice("s1")
 
     await invoke(h, "bypass", "s1", "slow")
-    expect(count()).toBe(0)
+    expect(await noticeText()).toBe("base")
     expect((await h.status("s1")).active).toEqual(["slow"])
     // The user still sees it via the RPC event.
     expect(h.rpcEvents.some((e) => e.name === "changed")).toBe(true)
 
     await invoke(h, "bypass", "s1", "off")
-    expect(count()).toBe(0)
+    expect(await noticeText()).toBe("base")
 
     await invoke(h, "bypass", "s1", "sandbox")
-    expect(
-      h.synthetic.some((s) => s.text.includes("temporarily allowed") && s.text.includes("sandbox")),
-    ).toBe(true)
+    const sandboxNotice = await noticeText()
+    expect(sandboxNotice.includes("temporarily allowed") && sandboxNotice.includes("sandbox")).toBe(
+      true,
+    )
 
-    h.synthetic.length = 0
     await invoke(h, "bypass", "s1", "ALL")
-    expect(h.synthetic.some((s) => s.text.includes("/bypass ALL"))).toBe(true)
+    expect((await h.notice("s1")).includes("removed all opencode-v2-security enforcement")).toBe(true)
 
-    // Re-arming slow on top of other categories still adds no reminder.
+    // Re-arming slow on top of other categories still adds no notice.
     await invoke(h, "bypass", "s2", "sandbox")
-    h.synthetic.length = 0
     await invoke(h, "bypass", "s2", "slow")
-    expect(count()).toBe(0)
+    expect(await h.notice("s2")).not.toContain("slow")
   })
 
   test("`off *` rearms cleanly and bare `/bypass` reports status", async () => {
@@ -358,17 +381,16 @@ describe("/bypass command parse + kill switch", () => {
     expect((await h.status("s1")).active).toEqual([])
   })
 
-  test("disarming emits an ENDED reminder naming the ended categories", async () => {
+  test("disarming clears the bypass notice (snapshot reflects current state)", async () => {
     const h = await startPlugin()
     await invoke(h, "bypass", "s1", "+os")
-    const active = h.synthetic.find((s) => s.text.includes("temporarily allowed"))
-    expect(active).toBeDefined()
+    const active = await h.notice("s1")
+    expect(active).toContain("temporarily allowed")
+    expect(active).toContain("host")
     await invoke(h, "bypass", "s1", "-os")
-    const ended = h.synthetic.find((s) => s.text.includes("temporary security allowance ended"))
-    expect(ended?.text).toContain("host")
-    expect(ended?.text).toContain("indirection")
-    expect(ended?.text).toContain("Normal checks are active again")
-    expect(ended?.text).not.toMatch(/token=|closed event/)
+    // Nothing armed: the notice clears to the base system text — the model
+    // never sees a stale "allowed" reminder.
+    expect(await h.notice("s1")).toBe("base")
   })
 
   test("ACTIVE reminder carries the per-category layer notes", async () => {
@@ -376,12 +398,12 @@ describe("/bypass command parse + kill switch", () => {
     await invoke(h, "bypass", "s1", "+os", )
     await invoke(h, "bypass", "s1", "+sandbox")
     await invoke(h, "bypass", "s1", "+privilege")
-    const last = [...h.synthetic].reverse().find((s) => s.text.includes("temporarily allowed"))
-    expect(last?.text).toContain("processes, services, and other running-system state")
-    expect(last?.text).toContain("operating-system sandbox is removed")
+    const last = await h.notice("s1")
+    expect(last).toContain("processes, services, and other running-system state")
+    expect(last).toContain("operating-system sandbox is removed")
     // The privilege note states the host-direct contract honestly.
-    expect(last?.text).toContain("runs host-direct without the OS sandbox")
-    expect(last?.text).toContain("refused loudly")
+    expect(last).toContain("runs host-direct without the OS sandbox")
+    expect(last).toContain("refused loudly")
   })
 })
 
@@ -421,31 +443,33 @@ describe("/perm bit syntax", () => {
   test("/perm emits no reminder while the ALL kill switch is armed", async () => {
     const h = await startPlugin()
     await invoke(h, "bypass", "s1", "ALL")
-    const count = h.synthetic.length
     await invokePerm(h, "s1", "ro")
-    expect(h.synthetic.length).toBe(count)
-    // Restore re-announces the (now non-default) perm ceiling.
+    // While ALL is armed the perm notice stays suppressed (ALL-OFF only).
+    expect(await h.notice("s1")).toContain("removed all opencode-v2-security")
+    expect(await h.notice("s1")).not.toContain("r-x")
+    // Restore surfaces the (now non-default) perm ceiling.
     await invoke(h, "bypass", "s1", "-ALL")
-    expect(h.synthetic.some((s) => s.text.includes("r-x"))).toBe(true)
+    expect(await h.notice("s1")).toContain("r-x")
   })
 
   test("the permission reminder describes the concrete label and never claims a user change", async () => {
     const h = await startPlugin()
     await invokePerm(h, "s1", "ro")
-    const ro = h.synthetic.find((s) => s.text.includes("permission ceiling"))
-    expect(ro?.text).toContain("This session's permission ceiling changed")
-    expect(ro?.text).not.toContain("user changed")
-    expect(ro?.text).toContain("r=read actions, w=write/edit/delete actions")
-    expect(ro?.text).toContain("x cannot be set; it is always on and only shown in the label")
+    const ro = await h.notice("s1")
+    expect(ro).toContain("This session's permission ceiling changed")
+    expect(ro).not.toContain("user changed")
+    expect(ro).toContain("r=read actions, w=write/edit/delete actions")
+    expect(ro).toContain("x cannot be set; it is always on and only shown in the label")
     // RO keeps read actions and a read-only shell.
-    expect(ro?.text).toContain("read actions are available but write actions are denied")
+    expect(ro).toContain("read actions are available but write actions are denied")
 
     await invokePerm(h, "s1", "none")
-    const none = [...h.synthetic].reverse().find((s) => s.text.includes("--x"))
-    expect(none?.text).toContain("all tool actions that require r or w are denied")
+    const none = await h.notice("s1")
+    expect(none).toContain("--x")
+    expect(none).toContain("all tool actions that require r or w are denied")
     // Under --x there is no read exemption to promise.
-    expect(none?.text).not.toContain("read actions are available")
-    expect(none?.text).not.toContain("read-only shell remains")
+    expect(none).not.toContain("read actions are available")
+    expect(none).not.toContain("read-only shell remains")
   })
 
   test("bit ops respect the ancestor cap like absolute forms", async () => {

@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, setSystemTime, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp } from "node:fs/promises"
+import { cleanupTestArtifacts as rm } from "./artifacts"
 import path from "node:path"
 import { Cause, Effect, Exit, Option, Scope, Stream } from "effect"
 import plugin from "../src/index"
@@ -34,6 +35,9 @@ type Harness = {
   commands: Map<string, CommandExec>
   synthetic: Array<{ sessionID: string; text: string; description?: string }>
   rpcEvents: Array<{ name: string; data: unknown }>
+  /** No-wake notice snapshot: runs the captured session "context" hook the
+   *  way the host does while building a model request. */
+  notice: (sessionID: string) => Promise<string>
   status: (sessionID: string) => Promise<BypassStatusData>
 }
 
@@ -55,6 +59,9 @@ async function startPlugin(
   const commands = new Map<string, CommandExec>()
   const synthetic: Harness["synthetic"] = []
   const rpcEvents: Harness["rpcEvents"] = []
+  let contextCb:
+    | ((ev: { sessionID: string; system: Array<{ type: string; text: string }> }) => Effect.Effect<void>)
+    | undefined
   let statusHandler: ((input: { sessionID: string }) => Effect.Effect<unknown, unknown>) | undefined
 
   const ctx = {
@@ -88,6 +95,10 @@ async function startPlugin(
         Effect.sync(() => {
           synthetic.push(input)
         }),
+      hook: (name: string, cb: (ev: { sessionID: string; system: Array<{ type: string; text: string }> }) => Effect.Effect<void>) => {
+        if (name === "context") contextCb = cb
+        return Effect.void
+      },
     },
     rpc: {
       register: (_def: unknown, handlers: Record<string, unknown>) => {
@@ -116,11 +127,18 @@ async function startPlugin(
   const status = async (sessionID: string) =>
     (await Effect.runPromise(statusHandler!({ sessionID }))) as BypassStatusData
 
+  const notice = async (sessionID: string) => {
+    const event = { sessionID, system: [{ type: "text", text: "base" }] }
+    if (contextCb) await Effect.runPromise(contextCb(event as never))
+    return event.system.map((p) => p.text).join("\n")
+  }
+
   return {
     executeBefore: collected["execute.before"]!,
     commands,
     synthetic,
     rpcEvents,
+    notice,
     status,
   }
 }
@@ -228,9 +246,9 @@ describe("/bypass timeout argument", () => {
       expect(await invoke(h, "negative", "filesystem,network -5")).toBeUndefined()
       expect((await h.status("negative")).expiresAt).toBeNull()
       expect(await invoke(h, "kill", "ALL -1")).toBeUndefined()
-      const notice = h.synthetic.find((message) => message.sessionID === "kill" && message.text.includes("/bypass ALL"))
-      expect(notice?.text).toContain("zero or negative timeouts have no natural expiry")
-      expect(notice?.text).not.toContain("it also expires on its own")
+      const notice = await h.notice("kill")
+      expect(notice).toContain("removed all opencode-v2-security enforcement")
+      expect(notice).toContain("zero or negative timeouts have no natural expiry")
       setSystemTime(new Date("2030-09-30T12:00:00Z"))
       expect((await h.status("negative")).active).toEqual(["filesystem", "network"])
       expect((await h.status("kill")).active).toContain("ALL")
@@ -322,20 +340,23 @@ describe("/bypass timeout argument", () => {
     // The expired transition is the dropped-event regression shape: no live
     // lease, so expiresAt must be absent (not undefined) for the host schema.
     expect("expiresAt" in (expired as { data: object }).data).toBe(false)
-    expect(
-      h.synthetic.some((s) => s.text.includes("temporary security allowance ended")),
-    ).toBe(true)
+    // Expired: the notice snapshot clears — the model never sees a stale
+    // "allowed" state on its next request.
+    expect(await h.notice("expiring")).toBe("base")
   }, 15_000)
 
   test("kill-switch expiry lifts ALL and re-announces enforcement", async () => {
     const h = await startPlugin()
     expect(await invoke(h, "s1", "ALL 1")).toBeUndefined()
-    let restored = false
-    for (let i = 0; i < 120 && !restored; i++) {
+    expect(await h.notice("s1")).toContain("removed all opencode-v2-security enforcement")
+    // The lease sweep lifts ALL: the kill-switch notice clears on the next
+    // snapshot (the model never sees a stale ALL-OFF state).
+    let cleared = false
+    for (let i = 0; i < 120 && !cleared; i++) {
       await delay(50)
-      restored = h.synthetic.some((s) => s.text.includes("Enforcement restored"))
+      cleared = !(await h.notice("s1")).includes("removed all opencode-v2-security enforcement")
     }
-    expect(restored).toBe(true)
+    expect(cleared).toBe(true)
     expect((await h.status("s1")).active).toEqual([])
   }, 15_000)
 

@@ -72,19 +72,33 @@ const RULE_PREFIXES: ReadonlyArray<readonly [string, RequiredCategories]> = [
 ]
 
 /** Exact overrides for rules the prefix table cannot express precisely.
- * `undefined` marks a rule that is deliberately NOT bypassable. */
+ * `undefined` marks a rule that is deliberately NOT bypassable.
+ *
+ * Owner semantics (policyVersion 1.5): a rule bills the categories that own
+ * the PRIMITIVE's risk — never the mechanical side-effects of the object it
+ * acts on. Credential/key-material rules own `secret` alone: deleting,
+ * overwriting, weakening the protection of, or staging a copy of a
+ * credential object is a secret judgment; the generic filesystem/privilege
+ * repeat on the same object is not billed (an independent filesystem or
+ * privilege segment in the same command still bills its own category).
+ * Download-and-execute and destructive remote APIs own `remote`: the
+ * network fetch is the remote execution's intrinsic channel, not a second
+ * kind. Genuinely independent exfiltration keeps {secret, network}. */
 const RULE_EXACT: ReadonlyArray<readonly [string, RequiredCategories | undefined]> = [
-  // Credential/key-material data rules key to the secret category, not the
-  // filesystem category: reading needs `secret` alone, while modifying or
-  // deleting needs both `filesystem` and `secret` — arming `filesystem`
-  // alone must not clear them.
-  ["data.critical-delete", required("filesystem", "secret")],
+  // Credential objects: the data rule owns the secret judgment on read,
+  // delete, and overwrite alike — the object's own filesystem mechanics are
+  // not a second owner.
+  ["data.critical-delete", required("secret")],
   ["data.critical-read", required("secret")],
-  ["data.critical-write", required("filesystem", "secret")],
-  // Secret-flavored filesystem rules.
-  ["filesystem.compression-sensitive", required("filesystem", "secret")],
-  ["filesystem.critical-backup", required("filesystem", "secret")],
-  ["permissions.sensitive-mode", required("privilege", "secret")],
+  ["data.critical-write", required("secret")],
+  // Staging a credential into a compressed or backup copy is a secret
+  // judgment: the destination's ordinary filesystem effect stays its own
+  // rule/category when it is a genuinely independent object.
+  ["filesystem.compression-sensitive", required("secret")],
+  ["filesystem.critical-backup", required("secret")],
+  // Weakening a credential's own protection is a secret judgment, not a
+  // privilege crossing.
+  ["permissions.sensitive-mode", required("secret")],
   // Privilege/isolation-boundary crossings that would otherwise inherit the
   // broader remote/host families.
   ["infrastructure.privileged-container", required("privilege")],
@@ -107,8 +121,10 @@ const RULE_EXACT: ReadonlyArray<readonly [string, RequiredCategories | undefined
   ["execution.script-one-liner-destructive", required("filesystem")],
   ["execution.xargs-destructive", required("filesystem")],
   // Web-flavored execution rule (download-and-execute).
-  ["execution.remote-pipe", required("network", "remote")],
-  ["network.destructive-api", required("network", "remote")],
+  // Fetch-and-execute / destructive remote APIs own `remote`: the network
+  // hop is the remote operation's intrinsic channel, not a second kind.
+  ["execution.remote-pipe", required("remote")],
+  ["network.destructive-api", required("remote")],
   // HARD-mode policy rules follow the filesystem category they enforce.
   ["hard.forced-recursive-delete", required("filesystem")],
   ["hard.temp-target-delete", required("filesystem")],

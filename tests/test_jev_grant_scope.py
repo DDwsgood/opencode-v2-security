@@ -22,6 +22,12 @@ def branches(question):
     return criteria if isinstance(criteria, list) else list(criteria.values())
 
 
+_NEUTRAL_HEAD_CHOICES = {
+    "actor_context": "ordinary",
+    "floor": "no",
+}
+
+
 def allow_answers():
     answers = {}
     for name, question in jev.build_questions({}).items():
@@ -30,8 +36,17 @@ def allow_answers():
         elif question["type"] == "score":
             answers[name] = {"type": "score", "score": 0.0}
         else:
-            answers[name] = {"type": "choice", "choice": "allow",
-                             "probabilities": {"allow": 1.0, "deny": 0.0}}
+            labels = list(question.get("criteria", {}))
+            if name in _NEUTRAL_HEAD_CHOICES:
+                label = _NEUTRAL_HEAD_CHOICES[name]
+            else:
+                label = next(
+                    (k for k in ("none", "no", "allow", "allow_once")
+                     if k in labels),
+                    labels[0],
+                )
+            answers[name] = {"type": "choice", "choice": label,
+                             "probabilities": {label: 1.0}}
     return answers
 
 
@@ -41,7 +56,11 @@ class TestOneCallGrant(unittest.TestCase):
         note = jev.ARMED_NOTE.format(cats=", ".join(sorted(armed)))
         questions = jev.build_questions({"userBypass": sorted(armed)})
         for name, question in questions.items():
-            if name == "bypassing" or name.startswith("cat_"):
+            # Footprint heads must never carry the authorization note: they
+            # record which effects are present, authorized or not.
+            if name == "bypassing" or name in jev.risk_heads.HEAD_NAMES:
+                for text in branches(question):
+                    self.assertNotIn(note, text)
                 continue
             for text in branches(question):
                 with self.subTest(question=name):
@@ -53,18 +72,24 @@ class TestOneCallGrant(unittest.TestCase):
     def test_unarmed_questions_and_category_signals_do_not_change(self):
         unarmed = jev.build_questions({})
         armed = jev.build_questions({"userBypass": ["indirection"]})
+        # ap_* questions are off the wire; the retired helper still builds
+        # the unarmed floor recheck with the interpreter-pipe wording.
+        recheck = jev.build_appeal_questions(["decision"])["floor_recheck"]
         self.assertIn("piping uninspectable content into an interpreter",
-                      unarmed["ap_floor_recheck"]["instructions"]["criteria"])
+                      recheck["instructions"]["criteria"])
         self.assertNotIn("trusted user has explicitly authorized",
                          json.dumps(unarmed))
         for name in unarmed:
-            if name == "bypassing" or name.startswith("cat_"):
+            # Footprint heads never change under a grant: they record which
+            # effects are present, not which are authorized.
+            if name == "bypassing" or name in jev.risk_heads.HEAD_NAMES:
                 self.assertEqual(unarmed[name], armed[name])
 
     def test_armed_recheck_uses_the_unconditional_floor(self):
         for categories in (["indirection"], ["filesystem"], ["host"]):
-            text = jev.build_questions({"userBypass": categories})[
-                "ap_floor_recheck"]["instructions"]["criteria"]
+            text = jev.build_appeal_questions(
+                ["decision"], set(categories))[
+                "floor_recheck"]["instructions"]["criteria"]
             self.assertIn("No authorization relaxes these", text)
             self.assertIn("actual root/system/boot destruction", text)
             self.assertNotIn("piping uninspectable content into an interpreter", text)
@@ -92,8 +117,13 @@ class TestOneCallGrant(unittest.TestCase):
 
     def test_model_denial_is_not_cleared_by_authorized_category_labels(self):
         answers = allow_answers()
+        # The verbatim model denial — scores can no longer veto on their own.
+        answers["decision"] = {"type": "choice", "choice": "deny",
+                               "probabilities": {"deny": 0.9, "allow": 0.1}}
         answers["destructive"] = {"type": "noul", "noul": 0.95}
-        answers["cat_indirection"] = {"type": "noul", "noul": 0.95}
+        # A footprint fact (hidden local execution) survives the grant and
+        # the model denial: authorization never erases the footprint.
+        answers["cat_execution"] = {"type": "choice", "choice": "local_hidden"}
         with patch.object(jev, "jev_call", return_value={"answers": answers}) as call:
             result = jev.review_request(
                 {"command": "python3 /tmp/unseen.py", "userBypass": ["indirection"]},
@@ -113,19 +143,31 @@ class TestOneCallGrant(unittest.TestCase):
         answers = {"floor_recheck": {"type": "noul", "noul": 0.95},
                    "appeal_decision": {"type": "choice", "probabilities": {"deny": 0.0}},
                    "reconsidered_harm": {"type": "noul", "noul": 0.0}}
-        self.assertFalse(jev.eval_appeal(answers, ["worst_subcommand"]))
+        # The floor recheck gate blocks the appeal even for an appealable rule.
+        self.assertFalse(jev.eval_appeal(answers, ["decision"]))
+        # Removed rules are no longer appealable at all.
+        self.assertFalse(jev.eval_appeal(
+            {**answers, "floor_recheck": {"type": "noul", "noul": 0.0}},
+            ["worst_subcommand"]))
 
-    def test_hard_requires_missing_script_inspection_after_model_review(self):
+    def test_missing_script_body_routes_to_collect_evidence(self):
         request = {"command": "python3 /tmp/unseen.py",
                    "uninspectedLocalScripts": ["/tmp/unseen.py"]}
-        with patch.dict(os.environ, {jev.ENV_POLICY: "HARD"}), \
-                patch.object(jev, "jev_call", return_value={"answers": allow_answers()}) as call:
-            result = jev.review_request(request, "test-model", 1,
-                                        "test-placeholder", jev.DEFAULT_THRESHOLDS)
-        call.assert_called_once()
-        self.assertTrue(result["deny"])
-        self.assertEqual(result["verdict_detail"]["fired"], ["required_script_inspection"])
-        self.assertIn("indirection", result["categories"])
+        for policy in ("", "HARD"):
+            with self.subTest(policy=policy), \
+                    patch.dict(os.environ, {jev.ENV_POLICY: policy}), \
+                    patch.object(jev, "jev_call", return_value={"answers": allow_answers()}) as call:
+                result = jev.review_request(request, "test-model", 1,
+                                            "test-placeholder", jev.DEFAULT_THRESHOLDS)
+            call.assert_called_once()
+            # A missing executed-script body is an evidence route, never a
+            # blind deny and never a human prompt.
+            self.assertFalse(result["deny"])
+            self.assertTrue(result["collect_evidence"])
+            self.assertIn("indirection", result["categories"])
+            self.assertIn("script_body", result["assessment"]["needsEvidence"])
+            self.assertEqual(result["evidence_requests"],
+                             [{"subject": "/tmp/unseen.py", "kind": "script"}])
 
     def test_hard_grant_waives_only_the_inspection_requirement(self):
         request = {"command": "python3 /tmp/unseen.py", "userBypass": ["indirection"],
@@ -137,6 +179,8 @@ class TestOneCallGrant(unittest.TestCase):
         call.assert_called_once()
         self.assertFalse(result["deny"])
         answers = allow_answers()
+        answers["decision"] = {"type": "choice", "choice": "deny",
+                               "probabilities": {"deny": 0.9, "allow": 0.1}}
         answers["destructive"] = {"type": "noul", "noul": 0.95}
         with patch.dict(os.environ, {jev.ENV_POLICY: "HARD"}), \
                 patch.object(jev, "jev_call", return_value={"answers": answers}):

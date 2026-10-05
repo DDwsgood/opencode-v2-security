@@ -19,14 +19,29 @@ jev = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(jev)
 
 
+_NEUTRAL_HEAD_CHOICES = {
+    "actor_context": "ordinary",
+    "floor": "no",
+}
+
+
+def _neutral_choice(labels: list[str], name: str) -> str:
+    if name in _NEUTRAL_HEAD_CHOICES:
+        return _NEUTRAL_HEAD_CHOICES[name]
+    for label in ("none", "no", "allow", "allow_once"):
+        if label in labels:
+            return label
+    return labels[0]
+
+
 def _allow_answers() -> dict:
-    """A minimal, fully valid answers object for the v49 question set."""
+    """A minimal, fully valid answers object for the head-based question set."""
     questions = jev.build_questions({})
     answers: dict = {}
     for name, q in questions.items():
         if not isinstance(name, str) or not isinstance(q, dict):
             continue
-        if name.startswith(("ap_", "cat_")) or name == "bypassing":
+        if name.startswith("ap_") or name == "bypassing":
             continue
         qtype = q.get("type")
         if qtype == "noul":
@@ -34,7 +49,10 @@ def _allow_answers() -> dict:
         elif qtype == "score":
             answers[name] = {"type": "score", "score": 0}
         elif qtype == "choice":
-            answers[name] = {"type": "choice", "choice": "allow"}
+            answers[name] = {
+                "type": "choice",
+                "choice": _neutral_choice(list(q.get("criteria", {})), name),
+            }
     return answers
 
 
@@ -73,30 +91,51 @@ class TestAnswerValidation(unittest.TestCase):
 
     def test_wrong_answer_type_raises(self) -> None:
         answers = _allow_answers()
-        answers["safety_floor"] = {"type": "score", "score": 0}
+        answers["floor"] = {"type": "score", "score": 0}
+        with self.assertRaises(jev.JevProtocolError):
+            jev._validate_answers(answers, self.questions)
+        answers = _allow_answers()
+        answers["floor"] = {"type": "noul", "noul": 0.4}
         with self.assertRaises(jev.JevProtocolError):
             jev._validate_answers(answers, self.questions)
 
     def test_out_of_range_noul_raises(self) -> None:
+        # bypassing is the only noul in the slim bank and it is only
+        # required under HARD — exercise the range check under that policy.
+        with patch.dict(os.environ, {jev.ENV_POLICY: "HARD"}):
+            answers = _allow_answers()
+            answers["bypassing"] = {"type": "noul", "noul": 1.5}
+            with self.assertRaises(jev.JevProtocolError):
+                jev._validate_answers(answers, self.questions)
+            answers["bypassing"] = {"type": "noul", "noul": float("nan")}
+            with self.assertRaises(jev.JevProtocolError):
+                jev._validate_answers(answers, self.questions)
+            answers["bypassing"] = {"type": "noul", "noul": True}
+            with self.assertRaises(jev.JevProtocolError):
+                jev._validate_answers(answers, self.questions)
+        # Stale legacy answer keys (retired judges) are ignored — they are
+        # no longer asked, so a stray response key is not a protocol error.
         answers = _allow_answers()
-        answers["safety_floor"] = {"type": "noul", "noul": 1.5}
-        with self.assertRaises(jev.JevProtocolError):
-            jev._validate_answers(answers, self.questions)
-        answers["safety_floor"] = {"type": "noul", "noul": float("nan")}
-        with self.assertRaises(jev.JevProtocolError):
-            jev._validate_answers(answers, self.questions)
-        answers["safety_floor"] = {"type": "noul", "noul": True}
-        with self.assertRaises(jev.JevProtocolError):
-            jev._validate_answers(answers, self.questions)
+        answers["privilege_or_kernel"] = {"type": "noul", "noul": 9.9}
+        jev._validate_answers(answers, self.questions)
 
     def test_malformed_choice_raises(self) -> None:
         answers = _allow_answers()
         answers["decision"] = {"type": "choice", "choice": "banana"}
         with self.assertRaises(jev.JevProtocolError):
             jev._validate_answers(answers, self.questions)
-        # probabilities alone are acceptable when well-formed
+        # Probabilities alone are NEVER a substitute for the selected
+        # choice: guessing intent from unselected labels would fabricate a
+        # verdict — so a probabilities-only answer is a protocol error.
         answers["decision"] = {"type": "choice", "probabilities": {"deny": 0.9, "allow": 0.1}}
-        jev._validate_answers(answers, self.questions)
+        with self.assertRaises(jev.JevProtocolError):
+            jev._validate_answers(answers, self.questions)
+        # The same holds for the footprint heads.
+        answers = _allow_answers()
+        answers["cat_data"] = {"type": "choice",
+                               "probabilities": {"local": 0.9, "none": 0.1}}
+        with self.assertRaises(jev.JevProtocolError):
+            jev._validate_answers(answers, self.questions)
 
     def test_corrupt_probabilities_raise_despite_valid_choice(self) -> None:
         # choice:"deny" beside an out-of-range/NaN probability map must not

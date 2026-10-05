@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { createServer, type Server } from "node:http"
 import type { AddressInfo } from "node:net"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp } from "node:fs/promises"
+import { cleanupTestArtifacts as rm } from "./artifacts"
 import path from "node:path"
 import { Cause, Effect, Exit, Option, Scope, Stream } from "effect"
 import plugin from "../src/index"
@@ -258,6 +259,9 @@ async function startPluginRaw(
         Effect.sync(() => {
           synthetic.push(input)
         }),
+      // Context hook registrar (session-notifications channel): captured so
+      // the plugin's attach returns true and no fallback warning fires.
+      hook: () => Effect.void,
     },
     rpc: {
       register: () =>
@@ -348,12 +352,11 @@ describe("escalation allow_once", () => {
     // The escalation reviewer was consulted exactly once.
     expect(mock.requests).toHaveLength(1)
 
-    // The allowed category reached the normal pipeline: the static DENY/ASK was
-    // relaxed to bypass.static-allow and the dynamic reviewer saw the real
-    // command with the `secret` userBypass.
-    expect(h.dynamicCalls).toHaveLength(1)
-    expect(h.dynamicCalls[0].command).toBe("cat /etc/shadow")
-    expect(h.dynamicCalls[0].userBypass).toContain("secret")
+    // allow_once IS this call's assessment report and admission: the
+    // ordinary dynamic reviewer does NOT re-judge the granted command (no
+    // second attribution, no fresh categories). The unconditional layers
+    // (floor, permission ceiling, routing) still ran.
+    expect(h.dynamicCalls).toHaveLength(0)
   })
 
   test("an allow_once does not form a lease: later commands need their own review", async () => {
@@ -370,8 +373,8 @@ describe("escalation allow_once", () => {
     const second = { command: "cat /etc/shadow" }
     expect(await runBefore(h, "shell", "s1", second)).toBeUndefined()
     expect(mock.requests).toHaveLength(1) // no second escalation review
-    expect(h.dynamicCalls).toHaveLength(2)
-    expect(h.dynamicCalls[1].userBypass ?? []).not.toContain("secret")
+    expect(h.dynamicCalls).toHaveLength(1)
+    expect(h.dynamicCalls[0].userBypass ?? []).not.toContain("secret")
     expect(second.command).toBe("cat /etc/shadow")
 
     // No bypass reminder was emitted to the agent or the user channel.
@@ -454,7 +457,11 @@ describe("escalation allow_once", () => {
 
     const input = { command: escalation("host", "restart service for the user", "kill 4242") }
     const blocked = await runBefore(h, "shell", "s1", input)
-    expect(blocked).toContain("The escalation reviewer requires the user's explicit confirmation")
+    // ask_user resolves automatically: one bounded evidence pass finds
+    // nothing to add, so the denial names the evidence limitation — the
+    // plugin never waits on a human.
+    expect(blocked).toContain("could not be authorized automatically")
+    expect(blocked).toContain("nothing further to collect")
     // The agent-facing refusal must not leak the internal decision enum.
     expect(blocked).not.toContain('"ask_user"')
     // The command must not run; the header was stripped but nothing executed.
@@ -529,9 +536,8 @@ describe("permission ceiling beats allow_once", () => {
     expect(await runBefore(h, "shell", "s1", input)).toBeUndefined()
     expect(input.command).toBe("rm -rf /var/tmp/escalation-rw-target")
     expect(mock.requests).toHaveLength(1)
-    // bypass.static-allow routed through the dynamic reviewer (injected ALLOW).
-    expect(h.dynamicCalls).toHaveLength(1)
-    expect(h.dynamicCalls[0].userBypass).toContain("filesystem")
+    // allow_once is the admission report — no ordinary dynamic re-review.
+    expect(h.dynamicCalls).toHaveLength(0)
   })
 })
 
@@ -593,9 +599,9 @@ describe("deny / ask_user records", () => {
     const blocked = await runBefore(h, "shell", "s1", first)
     expect(blocked).toContain("The escalation reviewer denied this one-time request")
     expect(blocked).not.toContain('"deny"')
-    // Terminal ending: the user authorizes the requested category directly;
+    // Terminal ending: authorization can only come from the session surface;
     // the message must not suggest another escalation request.
-    expect(blocked).toContain("/bypass host")
+    expect(blocked).toContain("armed bypass for categories host")
     expect(blocked).not.toContain("ask for escalation")
     expect(mock.requests).toHaveLength(1)
     expect(h.dynamicCalls).toHaveLength(0)
@@ -619,7 +625,7 @@ describe("deny / ask_user records", () => {
     const first = {
       command: escalation("host", "restart nginx per request", "systemctl restart nginx"),
     }
-    expect(await runBefore(h, "shell", "s1", first)).toContain("requires the user's explicit confirmation")
+    expect(await runBefore(h, "shell", "s1", first)).toContain("could not be authorized automatically")
     expect(mock.requests).toHaveLength(1)
 
     const second = {
@@ -757,44 +763,30 @@ describe("dynamic denial hint names only unarmed categories", () => {
     categories: ["indirection"],
   })
 
-  test("allow_once indirection + DENY [indirection]: still blocked, no repeat hint", async () => {
+  test("armed indirection lease + DENY [indirection]: still blocked, no repeat hint", async () => {
     const mock = await startReviewer(decision("allow_once"))
     const h = await startPluginWithReview({}, mock, "array", denyIndirection)
 
-    // allow_once arms indirection for this call only; the dynamic reviewer
-    // still runs once, sees the grant, and denies. The block message must not
-    // tell the agent to escalate the category that was just approved.
-    const escalated = {
-      command: escalation("indirection", "run the task's helper script", "python3 helper.py"),
-    }
-    const first = await runBefore(h, "shell", "s1", escalated)
+    // A session lease arms indirection; the dynamic reviewer still runs,
+    // sees the grant, and denies. The block message must not tell the agent
+    // to escalate the category that is already armed.
+    await invoke(h, "bypass", "s1", "indirection")
+    const first = await runBefore(h, "shell", "s1", { command: "python3 helper.py" })
     expect(first).toContain("Blocked by dynamic classifier")
     expect(first).not.toContain("Risk categories")
-    expect(mock.requests).toHaveLength(1)
     expect(h.dynamicCalls).toHaveLength(1)
     expect(h.dynamicCalls[0].command).toBe("python3 helper.py")
     expect(h.dynamicCalls[0].userBypass).toContain("indirection")
-    // The grant was consumed, not turned into a session lease: nothing was
-    // armed for later calls.
-    expect(escalated.command).toBe("python3 helper.py")
 
-    // A second identical escalation gets a fresh allow_once and a fresh
-    // dynamic review — this command is uncacheable (the script is
-    // uninspected), so the reviewer really is re-consulted with the grant —
-    // and the re-denial still does not re-advertise the armed category.
-    const retry = {
-      command: escalation("indirection", "run the task's helper script", "python3 helper.py"),
-    }
-    const second = await runBefore(h, "shell", "s1", retry)
+    // A retry re-denies without re-advertising the armed category.
+    const second = await runBefore(h, "shell", "s1", { command: "python3 helper.py" })
     expect(second).toContain("Blocked by dynamic classifier")
     expect(second).not.toContain("Risk categories")
-    expect(mock.requests).toHaveLength(2)
     expect(h.dynamicCalls).toHaveLength(2)
-    expect(h.dynamicCalls[1].userBypass).toContain("indirection")
 
-    // No lease formed: the plain command is dynamically reviewed again with
-    // no grant, and that denial names indirection as the outstanding risk.
-    const plain = await runBefore(h, "shell", "s1", { command: "python3 helper.py" })
+    // With nothing armed the same denial names indirection as outstanding.
+    await invoke(h, "bypass", "s1", "off")
+    const plain = await runBefore(h, "shell", "s1", { command: "python3 other.py" })
     expect(plain).toContain("Blocked by dynamic classifier")
     expect(plain).toContain("Risk categories: indirection")
     expect(h.dynamicCalls).toHaveLength(3)
@@ -804,38 +796,34 @@ describe("dynamic denial hint names only unarmed categories", () => {
   test("a cached deny replay filters the armed category without a new review", async () => {
     const mock = await startReviewer(decision("allow_once"))
     // `cat /etc/shadow` is fully inspectable (no local scripts), so the deny
-    // lands in the 90s negative cache and the retry replays it.
+    // lands in the 90s report cache and the retry replays it.
     const h = await startPluginWithReview({}, mock, "array", () => ({
       decision: "DENY",
       categories: ["secret"],
     }))
-    const make = () => ({
-      command: escalation("secret", "read credential file", "cat /etc/shadow"),
-    })
+    await invoke(h, "bypass", "s1", "secret")
 
-    const first = await runBefore(h, "shell", "s1", make())
+    const first = await runBefore(h, "shell", "s1", { command: "cat /etc/shadow" })
     expect(first).toContain("Blocked by dynamic classifier")
     expect(first).not.toContain("Risk categories")
     expect(h.dynamicCalls[0].userBypass).toContain("secret")
 
-    const second = await runBefore(h, "shell", "s1", make())
+    const second = await runBefore(h, "shell", "s1", { command: "cat /etc/shadow" })
     expect(second).toContain("Blocked by dynamic classifier")
     expect(second).not.toContain("Risk categories")
-    // Fresh escalation review, but the dynamic deny came from cache.
-    expect(mock.requests).toHaveLength(2)
+    // The replay came from the report cache — no second review call.
     expect(h.dynamicCalls).toHaveLength(1)
   })
 
-  test("allow_once indirection + DENY [indirection,secret]: hint keeps only the unarmed risk", async () => {
+  test("armed indirection + DENY [indirection,secret]: hint keeps only the unarmed risk", async () => {
     const mock = await startReviewer(decision("allow_once"))
     const h = await startPluginWithReview({}, mock, "array", () => ({
       decision: "DENY",
       categories: ["indirection", "secret"],
     }))
+    await invoke(h, "bypass", "s1", "indirection")
 
-    const blocked = await runBefore(h, "shell", "s1", {
-      command: escalation("indirection", "run the task's helper script", "python3 helper.py"),
-    })
+    const blocked = await runBefore(h, "shell", "s1", { command: "python3 helper.py" })
     expect(blocked).toContain("Blocked by dynamic classifier")
     expect(blocked).toContain("Risk categories: secret")
     expect(blocked).not.toContain("Risk categories: indirection")
@@ -849,10 +837,9 @@ describe("dynamic denial hint names only unarmed categories", () => {
       categories: ["indirection"],
       bypassing: true,
     }))
+    await invoke(h, "bypass", "s1", "indirection")
 
-    const blocked = await runBefore(h, "shell", "s1", {
-      command: escalation("indirection", "run the task's helper script", "python3 helper.py"),
-    })
+    const blocked = await runBefore(h, "shell", "s1", { command: "python3 helper.py" })
     expect(blocked).toContain("Blocked by dynamic classifier")
     expect(blocked).not.toContain("Risk categories")
     expect(h.dynamicCalls[0].userBypass).toContain("indirection")

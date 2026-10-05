@@ -28,7 +28,7 @@ export {
 } from "./categories"
 
 export type Strictness = "LOOSE" | "HARD"
-export type FailPolicy = "fail_ask" | "fail_open" | "fail_close"
+export type FailPolicy = "fail_open" | "fail_close"
 
 /** Escape-hatch categories the user can arm permanently (config.json
  * `BypassClassifier`) or per-session (`/bypass`). `dynamic` skips the dynamic
@@ -1167,9 +1167,11 @@ export function resolvePluginConfig(raw?: BashClassifierOptions): ResolvedPlugin
       source.failPolicy !== "fail_open" &&
       source.failPolicy !== "fail_close"
     ) {
-      throw new Error('failPolicy must be "fail_ask", "fail_open", or "fail_close"')
+      throw new Error('failPolicy must be "fail_open" or "fail_close"')
     }
-    failPolicy = source.failPolicy
+    // Legacy JSON configuration remains readable without changing the user's
+    // settings, but unattended execution never has a human-confirmation mode.
+    failPolicy = source.failPolicy === "fail_ask" ? "fail_close" : source.failPolicy
   }
 
   let configuredReviewCommand: ReviewCommand | undefined

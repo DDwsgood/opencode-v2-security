@@ -123,7 +123,7 @@ export type ClassifyShellCommandInput = {
   roWritableRoots?: string[]
   /** Config denyWrite entries (sandbox.denyWrite): user-declared write freezes
    *  that override the scratch carve-out even for paths inside it. */
-  sandboxDenyWrite?: string[]
+  sandboxDenyWrite?: readonly string[]
   /** Working directory the shell tool will execute in (the tool call's
    * `workdir` argument), resolved against `cwd` when relative. Unlike `cwd` —
    * the verified session directory — this is a claim made by the tool input,
@@ -6510,19 +6510,31 @@ type SegmentDecision = {
 const MAX_WRAPPER_DEPTH = 4
 
 function combineSegmentDecisions(results: SegmentDecision[]): SegmentDecision {
+  // The verdict is worst-first (DENY > ASK > ALLOW) and the reason comes
+  // from the first segment at that verdict — but the RULE SET is the union
+  // of every segment's already-identified rules, whatever their verdict.
+  // Truncating to the first denied segment hid independently identified
+  // kinds: a compound like `rm .env; rm -f ordinary.json` reported only
+  // the credential rule, and the ordinary target's filesystem kind either
+  // never surfaced or re-appeared only after an approval. The union keeps
+  // every named owner; owner-level coalescing happens downstream via
+  // ruleRequiredCategories (each named owner bills exactly once).
+  const allRules = [...new Set(results.flatMap((result) => result.rules))]
   const denied = results.find((result) => result.verdict === "DENY")
-  if (denied) return denied
+  if (denied) {
+    return { verdict: "DENY", rules: allRules, reason: denied.reason }
+  }
   const asks = results.filter((result) => result.verdict === "ASK")
   if (asks.length > 0) {
     return {
       verdict: "ASK",
-      rules: [...new Set(asks.flatMap((result) => result.rules))],
+      rules: allRules,
       reason: asks[0].reason,
     }
   }
   return {
     verdict: "ALLOW",
-    rules: [...new Set(results.flatMap((result) => result.rules))],
+    rules: allRules,
     reason: "All segments are recognized safe operations",
   }
 }
@@ -9721,7 +9733,7 @@ async function roPathWritable(
   candidate: string,
   base: string,
   roots: string[],
-  denyWrite: string[],
+  denyWrite: readonly string[],
   container = false,
 ): Promise<"ok" | "frozen" | "outside"> {
   const resolved = resolveTempPathCandidate(candidate, base)
@@ -10123,12 +10135,12 @@ function readOnlyReadFinding(args: string[], ctx: PathContext): PathFinding | un
 }
 
 const READ_ONLY_AUTH_HINT =
-  "ask the user to grant write access (/perm +w or /perm rw) and retry afterward"
+  "use a proven read-only operation within this session's permission ceiling, or skip the step"
 const READ_ONLY_EXECUTION_DENY_REASON =
-  "Read-only session: executing scripts, encoded payloads, or interop binaries is blocked pending user authorization — " +
+  "Read-only session: this script, encoded payload, or interop operation exceeds the permitted execution boundary — " +
   READ_ONLY_AUTH_HINT
 const READ_ONLY_UNPROVEN_DENY_REASON =
-  "Read-only session: the command cannot be proven free of filesystem side effects — blocked pending user authorization, " +
+  "Read-only session: the command cannot be proven free of filesystem side effects — the permission ceiling refuses it, " +
   READ_ONLY_AUTH_HINT
 
 function readOnlyWriteDeny(): SegmentDecision {
@@ -10873,6 +10885,16 @@ async function classifySegment(
     worktree: input.worktree,
     strictness,
   })
+  // Owner semantics (policyVersion 1.5): when the mode-weakening rule fired
+  // on a credential object, the generic world-writable signal on the SAME
+  // object is suppressed — weakening a credential's own protection is a
+  // secret judgment, not an additional privilege kind. The check runs on
+  // the unfiltered rule id (not the bypass state) so an armed `secret`
+  // grant never lets the generic privilege rule re-bill the same mode
+  // change; an ordinary file still bills world-writable as its own kind.
+  if (exfilRule === "permissions.sensitive-mode") {
+    reviewSignals.delete("permissions.world-writable")
+  }
   if (exfilRule && !ruleBypassed(exfilRule, bypassed)) {
     const reason = exfilRule === "permissions.sensitive-mode"
       ? "Setting dangerous permissions on a credential or system file requires review"
@@ -10985,12 +11007,34 @@ async function classifySegment(
   }
 
   if (!ruleBypassed("filesystem.scoped-delete", bypassed) && hasDeletePrimitive(combined)) {
-    if (roKernelPassthrough) return kernelEnforcedAllow()
-    return {
-      verdict: "ASK",
-      rules: ["filesystem.scoped-delete"],
-      reason: "The command deletes files but is not an obvious broad or durable-data deletion",
+    // Owner semantics (policyVersion 1.5): when the credential-delete rule
+    // was bypassed (an armed `secret` grant), the generic scoped-delete kind
+    // re-emerges on the same segment. Deleting a credential's own object is
+    // a secret judgment, not an additional filesystem kind — suppress the
+    // generic rule only when EVERY parseable delete target on this segment
+    // is a credential/system object. A mixed-target or unparseable
+    // invocation keeps the filesystem kind: it contains a genuinely
+    // independent filesystem primitive.
+    const credentialOwnedDelete =
+      ruleBypassed("data.critical-delete", bypassed) &&
+      (() => {
+        const deletion = parseDeleteInvocation(segment)
+        if (!deletion?.parseable || deletion.targets.length === 0) return false
+        const pathCtx: PathContext = { cwd: base, worktree: input.worktree, strictness }
+        return deletion.targets.every((target) =>
+          checkPathSensitivity(stripMatchingQuotes(target), pathCtx).sensitive,
+        )
+      })()
+    if (!credentialOwnedDelete) {
+      if (roKernelPassthrough) return kernelEnforcedAllow()
+      return {
+        verdict: "ASK",
+        rules: ["filesystem.scoped-delete"],
+        reason: "The command deletes files but is not an obvious broad or durable-data deletion",
+      }
     }
+    // Credential-owned delete: the secret layer already judged the objects —
+    // fall through to the remaining checks.
   }
 
   // Composite context-required check: each trigger family follows the category

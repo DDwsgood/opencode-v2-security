@@ -9,7 +9,8 @@
 // isolation test.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, writeFile } from "node:fs/promises"
+import { cleanupTestArtifacts as rm } from "./artifacts"
 import os from "node:os"
 import path from "node:path"
 import {

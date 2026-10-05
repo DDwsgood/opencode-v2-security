@@ -41,7 +41,7 @@
 
 import { createHash } from "node:crypto"
 import { readFileSync } from "node:fs"
-import { access, appendFile, mkdir, readFile, realpath } from "node:fs/promises"
+import { access, appendFile, lstat, mkdir, readFile, realpath } from "node:fs/promises"
 import { homedir, release as osRelease } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -88,7 +88,7 @@ import {
 } from "./security/reviewer"
 import { analyzeSlowCommand } from "./security/slow-command"
 import { detectInjection } from "./security/injection-detector"
-import { isFloorRule, rulesHintCategories } from "./security/bypass"
+import { isFloorRule, ruleRequiredCategories, rulesHintCategories } from "./security/bypass"
 import {
   CATEGORY_HEADER_PREFIX,
   ESCALATION_MARKER,
@@ -121,14 +121,29 @@ import {
   type SandboxProbeResult,
   type SandboxProfile,
 } from "./sandbox"
+import {
+  attachSessionContextHook,
+  createSessionStateNotices,
+} from "./session-notifications"
+import {
+  AssessmentStore,
+  buildReport,
+  ownersForCategories,
+  reportKeyPayload,
+  type CollectedEvidence,
+} from "./security/assessment"
+import {
+  automaticOutcome,
+  collectBoundedEvidence,
+  terminalOutcomeText,
+  type EvidenceRequest,
+  type RawReviewerDecision,
+} from "./security/automatic"
 
 // Package root, derived from this module's own URL so relative paths (native
 // supervisor, auditor) resolve no matter where the plugin is installed from.
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 
-const DYNAMIC_ALLOW_CACHE_TTL_MS = 15 * 60 * 1000
-const DYNAMIC_DENY_CACHE_TTL_MS = 90 * 1000
-const MAX_DYNAMIC_ALLOW_CACHE_ENTRIES = 512
 const PROMPT_VERSION = "v7-execution-scope"
 const SESSION_STATE_TTL_MS = 30 * 60 * 1000
 const MAX_SESSION_STATES = 512
@@ -141,25 +156,27 @@ const BLOCK_SUFFIX =
 // pointer — the blocked call ends the same way a terminal refusal does,
 // without ever referencing the header protocol.
 const BLOCK_SUFFIX_NO_ESCALATION =
-  "Skip the step (if unnecessary) or ask the user to authorize it with /bypass or /perm instead of trying alternative methods to bypass the check."
+  "Skip the step (if unnecessary) or authorize it on the session surface instead of trying alternative methods to bypass the check."
 
 // Terminal ending for denials that cannot be resolved by submitting another
 // escalation request (pending/history saturated/similar denied/unavailable/
-// context failure/session ended/reviewer ask_user|deny/infra error). Unlike
-// BLOCK_SUFFIX it never says "ask for escalation": the only remaining routes
-// are skipping the step or user-side authorization via /bypass or /perm.
+// context failure/session ended/reviewer deny/infra error). Unlike
+// BLOCK_SUFFIX it never says "request escalation": the only remaining route
+// is skipping the step.
 const TERMINAL_NO_BYPASS =
   "do not try to reach the same effect through other commands, wrappers, or scripts."
 
 // permission.write denials are a hard refuse from the permission ceiling —
 // an independent layer that comment-based escalation can never relax. They
 // carry neither BLOCK_SUFFIX (which points at escalation) nor the full guide.
+// The ceiling is session-level state; nothing in the command path can change
+// it, so the message states the boundary instead of routing to a human.
 const PERM_WRITE_SUFFIX =
   "This is the session permission ceiling, an independent check that escalation cannot override. " +
-  "Ask the user to grant write access with /perm +w or /perm rw, or skip the step."
+  "It only moves when the session's permission surface changes; until then, skip the step."
 const PERM_WRITE_SUFFIX_NO_ESCALATION =
   "This is the session permission ceiling, an independent check that cannot be overridden per call. " +
-  "Ask the user to grant write access with /perm +w or /perm rw, or skip the step."
+  "It only moves when the session's permission surface changes; until then, skip the step."
 
 /** Rules that make an escalation request terminally unrunnable regardless of
  * any reviewer verdict, beyond the unconditional floor (isFloorRule): the
@@ -171,10 +188,10 @@ const TERMINAL_ESCALATION_RULES = new Set(["permission.write", "input.empty", "i
 function terminalAuthorize(categories: readonly string[], options: { skip?: boolean } = {}): string {
   const bypass =
     categories.length > 0
-      ? ` with /bypass ${categories.join(" ")}`
-      : " with /bypass or /perm"
-  const lead = options.skip === false ? " ask the user" : " Skip this step if it is not required, or ask the user"
-  return `${lead} to authorize it themselves${bypass}; ${TERMINAL_NO_BYPASS}`
+      ? ` for categories ${categories.join(", ")}`
+      : ""
+  const lead = options.skip === false ? " Authorization for it" : " Skip this step if it is not required; authorization for it"
+  return `${lead} can only come from the session surface (e.g. an armed bypass${bypass}); ${TERMINAL_NO_BYPASS}`
 }
 
 // Categories a `# - REQUIRE_ESCALATION` request may ask the reviewer to
@@ -192,8 +209,9 @@ const ESCALATION_GUIDANCE =
   `${JUSTIFICATION_HEADER_PREFIX} <one-line reason>\n` +
   `<real command starting on line 4>\n` +
   `A single call is reviewed by an independent reviewer: allow_once runs the command once ` +
-  `(no session state is armed); ask_user or deny records the outcome, and a similar command ` +
-  `cannot be escalated again in this session — the user must authorize it with /bypass instead.\n` +
+  `(no session state is armed); collect_evidence triggers one automatic bounded evidence pass ` +
+  `and one resubmit; deny records the outcome, and a similar command ` +
+  `cannot be escalated again in this session — authorization then only comes from the session surface.\n` +
   `Categories: filesystem (local file changes), host (processes, services, and running-system state), ` +
   `privilege (crossing permission or isolation boundaries: sudo/doas/su/pkexec/sudoedit, ownership and capability changes, ` +
   `kernel parameters, namespaces, privileged containers — a call that needs privilege runs without the OS ` +
@@ -370,24 +388,20 @@ function softSlowMessage(reason: string) {
   return rejectionError(conciseReason(reason, 300))
 }
 
-// failPolicy "fail_ask" normalized to "fail_close" (v2 cannot ask the user, so
-// a reviewer outage is always a denial). `normalizedFromAsk` adds an explicit
-// note to the message explaining that interactive confirmation is unavailable.
+// failPolicy has no interactive mode in v2 (there is no human-confirmation
+// channel): config normalizes the legacy "fail_ask" spelling to fail_close at
+// resolve time, so a reviewer outage always takes the deny path.
 function failClosedBlock(
   reason: string,
-  normalizedFromAsk: boolean,
   strict: boolean,
   rules: string[] = [],
   command = "",
   guidance: string = ESCALATION_GUIDANCE,
   escalationEnabled = true,
 ) {
-  const note = normalizedFromAsk
-    ? " Interactive user confirmation is unavailable in this environment, so the command is denied instead of asked."
-    : ""
   const suffix = escalationEnabled ? BLOCK_SUFFIX : BLOCK_SUFFIX_NO_ESCALATION
   return rejectionError(
-    `Blocked by policy classifier: ${conciseReason(reason, 120)}.${note} ${suffix}${guidance}`,
+    `Blocked by policy classifier: ${conciseReason(reason, 120)}. ${suffix}${guidance}`,
   )
 }
 
@@ -474,14 +488,17 @@ export function normalizeCacheKeyScript(script: string): string {
 }
 
 /**
- * Cache keys are GLOBAL (no session component): the payload already carries
- * every security-relevant context (script, cwd, shell, static rules, script
- * fingerprints, target-directory listings, referenced paths, strictness,
- * endpoint, model, prompt version, bypass categories), and cached entries are
- * only written for non-forced LOOSE reviews, so a verdict from another session
- * for the exact same context is sound to reuse. A shorter TTL bounds staleness.
+ * Cache keys are SESSION-PARTITIONED (the payload carries sessionID): the
+ * payload also carries every security-relevant context (script, cwd, shell,
+ * static rules, script fingerprints, target-directory listings, referenced
+ * paths, strictness, endpoint, model, prompt version, bypass categories),
+ * and cached entries are only written for non-forced LOOSE reviews. A report
+ * authored in one session never admits a call in another — `get` re-checks
+ * report.sessionID as defense-in-depth on top of the key partition. A
+ * shorter TTL bounds staleness.
  */
 export function dynamicAllowCacheKey(
+  sessionID: string,
   script: string,
   cwd: string,
   shell: string,
@@ -501,18 +518,13 @@ export function dynamicAllowCacheKey(
     return undefined
   }
 
-  const payload = {
+  const payload = reportKeyPayload({
+    sessionID,
     script: normalizeCacheKeyScript(script),
     cwd,
     shell,
     rules: decision.rules,
-    fingerprints: decision.fingerprints.map((fingerprint) => ({
-      path: fingerprint.path,
-      size: fingerprint.size,
-      mtimeMs: fingerprint.mtimeMs,
-      sha256: fingerprint.sha256,
-      linkPath: fingerprint.linkPath ?? null,
-    })),
+    fingerprints: decision.fingerprints,
     targetDirectories: context?.targetDirectories ?? [],
     referencedPaths: context?.referencedPaths ?? [],
     referencedPathsTruncated: context?.referencedPathsTruncated ?? false,
@@ -524,68 +536,9 @@ export function dynamicAllowCacheKey(
     endpoint,
     model,
     promptVersion: PROMPT_VERSION,
-  }
+  })
   const digest = createHash("sha256").update(JSON.stringify(payload)).digest("hex")
   return digest
-}
-
-function hasCachedDynamicAllow(cache: Map<string, number>, key: string, now: number) {
-  const expiresAt = cache.get(key)
-  if (expiresAt === undefined) return false
-  if (expiresAt <= now) {
-    cache.delete(key)
-    return false
-  }
-  return true
-}
-
-function cacheDynamicAllow(cache: Map<string, number>, key: string, now: number) {
-  for (const [cachedKey, expiresAt] of cache) {
-    if (expiresAt <= now) cache.delete(cachedKey)
-  }
-  while (cache.size >= MAX_DYNAMIC_ALLOW_CACHE_ENTRIES) {
-    const oldest = cache.keys().next().value
-    if (typeof oldest !== "string") break
-    cache.delete(oldest)
-  }
-  cache.set(key, now + DYNAMIC_ALLOW_CACHE_TTL_MS)
-}
-
-// Short-lived negative cache: a stubborn model retrying an identical denied
-// command re-burns a review call every attempt. Replaying the same DENY for
-// 90s throttles that without meaningfully delaying legitimate state changes.
-type DenyCacheEntry = { expiresAt: number; reason: string; riskCategories: string[] }
-
-function cachedDynamicDenyEntry(
-  cache: Map<string, DenyCacheEntry>,
-  key: string,
-  now: number,
-): DenyCacheEntry | undefined {
-  const entry = cache.get(key)
-  if (!entry) return undefined
-  if (entry.expiresAt <= now) {
-    cache.delete(key)
-    return undefined
-  }
-  return entry
-}
-
-function cacheDynamicDeny(
-  cache: Map<string, DenyCacheEntry>,
-  key: string,
-  reason: string,
-  riskCategories: string[],
-  now: number,
-) {
-  for (const [cachedKey, entry] of cache) {
-    if (entry.expiresAt <= now) cache.delete(cachedKey)
-  }
-  while (cache.size >= MAX_DYNAMIC_ALLOW_CACHE_ENTRIES) {
-    const oldest = cache.keys().next().value
-    if (typeof oldest !== "string") break
-    cache.delete(oldest)
-  }
-  cache.set(key, { expiresAt: now + DYNAMIC_DENY_CACHE_TTL_MS, reason, riskCategories })
 }
 
 // Categories a reviewer may report: the seven static names plus the sandbox
@@ -597,6 +550,15 @@ const REVIEW_RESULT_KEYS = new Set([
   "secondary_categories",
   "bypassing",
   "reason",
+  // Upgraded structured contract: `assessment` carries the strong-reason
+  // footprint, needsEvidence and decision provenance; `needs_evidence` is
+  // the tolerated legacy alias folded into it.
+  "assessment",
+  "needs_evidence",
+  // The upgraded reviewer contract may carry an evidence list with a
+  // collect_evidence decision; tolerate it here (the host resolves it
+  // automatically) so the verdict isn't dropped as a protocol error.
+  "evidence_requests",
 ])
 
 function isValidCategoryList(value: unknown): value is string[] {
@@ -610,18 +572,43 @@ function isValidCategoryList(value: unknown): value is string[] {
 // secondary_categories?, bypassing?(HARD), reason?(legacy)}. `reason` is
 // tolerated for older auditors but is no longer required; a DENY without a
 // usable category falls back to ["indirection"] (mutated onto the record).
+// `collect_evidence` is the newer indecision verdict: it validates like a
+// DENY shape (categories optional) and is resolved by the automatic
+// collection path, never by asking a human.
 export function isValidReviewResult(value: unknown, strict: boolean): value is CloudReviewResult {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
   const record = value as Record<string, unknown>
   for (const key of Object.keys(record)) {
     if (!REVIEW_RESULT_KEYS.has(key)) return false
   }
-  if (record.decision !== "ALLOW" && record.decision !== "DENY") return false
+  const evidenceVerdict = record.decision === "collect_evidence"
+  if (record.decision !== "ALLOW" && record.decision !== "DENY" && !evidenceVerdict) return false
   if (!isValidCategoryList(record.categories) || !isValidCategoryList(record.secondary_categories)) {
     return false
   }
+  if (record.evidence_requests !== undefined) {
+    const requests = record.evidence_requests
+    const ok =
+      Array.isArray(requests) &&
+      requests.every(
+        (item) =>
+          typeof item === "string" ||
+          (item !== null &&
+            typeof item === "object" &&
+            typeof (item as { subject?: unknown }).subject === "string"),
+      )
+    if (!ok) return false
+  }
   if (record.reason !== undefined && typeof record.reason !== "string") return false
   if (strict && typeof record.bypassing !== "boolean") return false
+  // `assessment` must be an object when present (reviewer.ts synthesizes a
+  // default when absent); a non-object value is a protocol error.
+  if (
+    record.assessment !== undefined &&
+    (typeof record.assessment !== "object" || record.assessment === null || Array.isArray(record.assessment))
+  ) {
+    return false
+  }
 
   // Normalize: strip unknown/duplicate category names (a bad hint degrades
   // to "no hint" rather than invalidating the verdict).
@@ -638,8 +625,11 @@ export function isValidReviewResult(value: unknown, strict: boolean): value is C
   }
   let categories = sanitize(record.categories)
   const secondary = sanitize(record.secondary_categories).filter((category) => !categories.includes(category))
-  if (record.decision === "DENY" && categories.length === 0) categories = ["indirection"]
-  if (record.decision === "ALLOW") categories = []
+  if ((record.decision === "DENY" || evidenceVerdict) && categories.length === 0) categories = ["indirection"]
+  // ALLOW keeps its intrinsic footprint: approval and presence are separate
+  // layers (reviewer.ts's parser preserves them too). An ordinary static DENY
+  // completion needs the model's primary categories to bill the report's
+  // full minimal owner set — wiping them here would silently shrink it.
   record.categories = categories
   if (secondary.length > 0) record.secondary_categories = secondary
   else delete record.secondary_categories
@@ -696,6 +686,18 @@ interface EffectPluginContext {
      *  context for escalation requests. Optional so older hosts still load the
      *  plugin — escalation then fails closed instead of allowing blind. */
     readonly context?: (input: { sessionID: string }) => Effect.Effect<unknown, unknown>
+    /** Session context hook (packages/plugin/src/effect/session.ts
+     *  SessionDomain.hook → ModelHooks<SessionHooks>). The "context" callback
+     *  fires while the host is already building a model request; mutating
+     *  `event.system` ships state without a wake. Optional — older hosts lack
+     *  it and notices are simply unavailable there. */
+    readonly hook?: (
+      name: "context",
+      callback: (event: {
+        readonly sessionID: string
+        system: Array<{ type: "text"; text: string; metadata?: Record<string, unknown> }>
+      }) => Effect.Effect<void>,
+    ) => Effect.Effect<unknown, never, Scope.Scope>
     readonly synthetic: (input: {
       sessionID: string
       text: string
@@ -812,15 +814,10 @@ async function resolveStartup(rawOptions: unknown) {
     console.warn(`[opencode-v2-security] ${warning}`)
   }
   // v2's Tool.Context has no `ask`, so human-in-the-loop approval cannot be
-  // implemented. `fail_ask` is normalized to `fail_close`: an unavailable or
-  // failed reviewer becomes a denial, never a question.
-  const failAskNormalized = resolved.failPolicy === "fail_ask"
-  const effectiveFailPolicy = failAskNormalized ? "fail_close" : resolved.failPolicy
-  if (failAskNormalized) {
-    console.warn(
-      '[opencode-v2-security] failPolicy "fail_ask" is not available in v2 and was normalized to "fail_close" (interactive confirmation unavailable)',
-    )
-  }
+  // implemented. `failPolicy` has no "fail_ask" value: resolvePluginConfig
+  // normalizes the legacy spelling to "fail_close" — an unavailable or failed
+  // reviewer becomes a denial, never a question.
+  const effectiveFailPolicy = resolved.failPolicy
   const configuredShell = resolved.shell
   const strictPolicy = resolved.strictness === "HARD"
   let supervisorActive = false
@@ -850,7 +847,6 @@ async function resolveStartup(rawOptions: unknown) {
   }
   return {
     resolved,
-    failAskNormalized,
     effectiveFailPolicy,
     configuredShell,
     strictPolicy,
@@ -874,7 +870,6 @@ const plugin: Plugin = {
 
     const {
       resolved,
-      failAskNormalized,
       effectiveFailPolicy,
       configuredShell,
       strictPolicy,
@@ -886,12 +881,36 @@ const plugin: Plugin = {
     // ctx.session.get(...).location.directory (cached, bounded, TTL-bounded),
     // falling back to process.cwd().
     const sessions = new Map<string, SessionState>()
-    const dynamicAllowCache = new Map<string, number>()
-    const dynamicDenyCache = new Map<string, DenyCacheEntry>()
+    // Whole-assessment report cache: replaces the allow/deny verdict caches.
+    // A report records the full context (command, cwd, fingerprints, perm,
+    // policy version) and replays only on an identical canonical key — a
+    // fact/target/permission change yields a different key, i.e. a NEW
+    // report, never an in-place verdict swap.
+    const assessmentReports = new AssessmentStore()
     const inflightReviews = new Map<string, Promise<CloudReviewResult>>()
     const sessionDirectories = new Map<string, { directory: string; worktree: string; at: number }>()
     let consecutiveDynamicFailures = 0
     let lastDynamicFailureToastAt = 0
+
+    // --- session state notices (no-wake) -------------------------------------
+    // Bypass/permission reminders ride the session-context hook
+    // (ctx.session.hook("context")) instead of synthetic inbox items: a
+    // synthetic admission can wake an idle Runner, while a system-part update
+    // is only observed by the next model request the host builds anyway.
+    // When the host lacks session.hook the attach returns false and notices
+    // are simply unavailable — the enforcement boundary is unaffected, and
+    // no synthetic fallback is sent (that would re-introduce the wake).
+    const sessionNotices = createSessionStateNotices()
+    const sessionContextHookAttached = yield* attachSessionContextHook(
+      ctx as unknown as import("./session-notifications").SessionContextHookHost,
+      sessionNotices,
+    )
+    if (!sessionContextHookAttached) {
+      console.warn(
+        "[opencode-v2-security] host does not expose ctx.session.hook(\"context\"); " +
+          "bypass/permission reminders are disabled (enforcement unchanged)",
+      )
+    }
 
     // --- temporary bypass state (fixed-expiry lease) ------------------------
     // In-memory by design: a service restart clears every lease. `expiresAt`
@@ -907,14 +926,6 @@ const plugin: Plugin = {
     // child → parent links (session lifetime, NOT lease lifetime): written on
     // session.created, cleared on session.deleted only.
     const bypassParent = new Map<string, string>()
-    // Last effective category set announced to the agent per session. Comparing
-    // against this (rather than recomputing "before" from activeBypass) is
-    // essential for expiry: by the time the sweep runs, the lease is already
-    // expired, so activeBypass would exclude it and report "no change".
-    const announcedBypass = new Map<string, Set<BypassCategory>>()
-    // Whether the ALL-OFF kill-switch reminder is the last thing the agent
-    // heard for this session (transitions only, same rule as categories).
-    const announcedAll = new Map<string, boolean>()
     // Assigned once the RPC in section 8b is registered.
     let bypassRpc:
       | { readonly events: { readonly emit: (...args: unknown[]) => Effect.Effect<void, unknown> } }
@@ -1006,8 +1017,6 @@ const plugin: Plugin = {
         permUnresolved.add(sessionID)
       }
     }
-    // Last effective perm announced to the agent (transition-only reminders).
-    const announcedPerm = new Map<string, Perm>()
 
     /** Effective permission includes ancestor baselines and temporary spawn
      * declarations. Boundaries hydrate ancestry before relying on this value. */
@@ -1068,33 +1077,28 @@ const plugin: Plugin = {
       return [
         "This session's permission ceiling changed.",
         `Current permission: ${label} (r=read actions, w=write/edit/delete actions; ${detail}; x cannot be set; it is always on and only shown in the label).`,
-        "If a required action lacks permission, ask the user to grant it with /perm rather than attempting another route.",
+        "If a required action lacks permission, it stays denied until the session's permission surface grants it; do not route around the ceiling.",
       ].join("\n")
     }
 
-    /** Notify the agent (synthetic user message) on effective-set transitions
-     * and the user (RPC event) every time — both channels stay out of model
-     * context semantics: reminders only fire on transitions. */
+    /** Publish the current effective permission to the no-wake notice
+     * channel. The helper compares against what it last published, so callers
+     * can invoke this on every transition without re-announcing the same
+     * state; a default-permission state publishes `undefined` (clearing any
+     * stale notice) rather than noise about an unrestricted session. */
     function syncPermReminder(sessionID: string) {
-      // While the ALL kill switch is armed the agent hears NOTHING but the
-      // [ALL OFF] notices — permission reminders stay silent until restore,
-      // which re-announces the current state once.
-      if (allBypassed(sessionID)) return
+      // While the ALL kill switch is armed the model hears NOTHING but the
+      // [ALL OFF] notice — permission notices stay cleared until restore.
       const effective = effectivePerm(sessionID)
-      const announced = announcedPerm.get(sessionID)
-      if (announced && announced.r === effective.r && announced.w === effective.w && announced.x === effective.x) {
-        return
-      }
-      announcedPerm.set(sessionID, effective)
-      // First announce at the configured default is a no-op baseline write
-      // (e.g. /perm rw on a session whose configured default is rw) — not worth a
-      // reminder; every later transition notifies.
       const isDefault =
         effective.r === resolved.permission.defaultPerm.r &&
         effective.w === resolved.permission.defaultPerm.w &&
         effective.x === resolved.permission.defaultPerm.x
-      if (!announced && isDefault) return
-      appendAgentReminder(sessionID, PERM_ACTIVE_REMINDER(effective))
+      if (allBypassed(sessionID) || isDefault) {
+        sessionNotices.setPerm(sessionID, undefined)
+        return
+      }
+      sessionNotices.setPerm(sessionID, PERM_ACTIVE_REMINDER(effective))
     }
 
     /** Report a failed RPC event push. Only the error constructor name and a
@@ -1154,15 +1158,11 @@ const plugin: Plugin = {
       return { ok: true }
     }
 
-    // Agent-facing reminders are appended to the session as synthetic inputs,
-    // which the runner lowers to an ordinary **user** message
-    // (`runner/to-llm-message.ts`: synthetic -> { role: "user" }). A user
-    // message appended at the end of history leaves the cached prefix intact —
-    // unlike a system-prompt part, which sits near the front and invalidates the
-    // message cache — and is more salient to the agent than a system hint. They
-    // are emitted only on state transitions (arm / change / end), never per
-    // step, and carry no `description`, so they do not clutter the user's chat
-    // transcript (the user is notified separately over RPC).
+    // Agent-facing bypass/permission state rides the no-wake session-context
+    // hook (session-notifications.ts): a synthetic inbox admission can wake
+    // an idle Runner, while a `context.system` part is only seen by the next
+    // real model request. The notices always carry the CURRENT effective
+    // state (undefined clears), so transitions/expiry need no append log.
     /** Exact per-category layer notes (kept compact — reminders enter the
      *  model context). Every note states that the non-bypassed layers —
      *  other classifier categories, the permission ceiling, and the
@@ -1194,8 +1194,6 @@ const plugin: Plugin = {
         ...categories.map((c) => `- ${c}: ${BYPASS_LAYER_NOTES[c] ?? "the corresponding checks are uninspected and unblocked"}.`),
         "You may retry your previous blocked command and continue because the user authorized these categories; be careful with your authorized scope and the changes you make.",
       ].join("\n")
-    const BYPASS_ENDED_REMINDER = (ended: string[]) =>
-      `The user's temporary security allowance ended: ${ended.join(", ")}. Normal checks are active again.`
     // The ALL kill switch is much broader than a category bypass, so its
     // notice is terse but explicit about enforcement being OFF.
     const BYPASS_ALL_REMINDER = () =>
@@ -1204,17 +1202,6 @@ const plugin: Plugin = {
         "You may retry the previously blocked command and continue within the user's authorization; be careful with your authorized scope and the changes you make.",
         "The user can restore enforcement with /bypass off. Positive timeouts expire at their deadline; zero or negative timeouts have no natural expiry.",
       ].join("\n")
-    const BYPASS_ALL_RESTORED_REMINDER = () =>
-      [
-        "Enforcement restored: the user lifted the /bypass ALL kill switch.",
-        "Plugin enforcement is active again; armed categories and the permission ceiling are re-announced below if set.",
-      ].join("\n")
-
-    function sameCategories(a: ReadonlySet<string>, b: ReadonlySet<string>) {
-      if (a.size !== b.size) return false
-      for (const value of a) if (!b.has(value)) return false
-      return true
-    }
 
     /** Ancestors of a session (nearest first), bounded by cycle guard. */
     function bypassAncestors(sessionID: string): string[] {
@@ -1402,53 +1389,28 @@ const plugin: Plugin = {
       })
     }
 
-    /** Bring the agent's bypass reminder in line with the effective state:
-     * append an ACTIVE reminder when the agent-facing set is non-empty, an
-     * ENDED reminder when it emptied, and nothing when unchanged.
+    /** Publish the agent's bypass notice in line with the effective state:
+     * the no-wake channel always carries the CURRENT effective text (or
+     * clears it), never a transition log — a lease expiring while the session
+     * is idle simply produces an empty snapshot on the next model request.
      *
      * `slow` is deliberately excluded from the agent-facing set: the
      * slow-command classifier is a soft deterrent, not a security boundary, so
      * arming/disarming it must not teach the model that a slow-bypass is an
      * escape hatch (the TUI indicator still shows it to the user). The `all`
-     * kill switch gets its own loud ALL-OFF reminder. */
+     * kill switch gets its own loud ALL-OFF notice. */
     function syncAgentReminder(sessionID: string) {
-      const facing = new Set(activeBypass(sessionID))
-      facing.delete("slow")
-      const all = allBypassed(sessionID)
-      const announced = announcedBypass.get(sessionID) ?? new Set<BypassCategory>()
-      const wasAll = announcedAll.get(sessionID) === true
-      if (all === wasAll && sameCategories(announced, facing)) return
-      if (all) {
-        // While the kill switch is armed the agent gets ONLY the [ALL OFF]
-        // arm/restore notices: category transitions stay silent (the state is
-        // still tracked so the restore re-announcement is accurate).
-        if (!wasAll) appendAgentReminder(sessionID, BYPASS_ALL_REMINDER())
-        if (facing.size > 0) announcedBypass.set(sessionID, new Set(facing))
-        else announcedBypass.delete(sessionID)
-        announcedAll.set(sessionID, true)
+      if (allBypassed(sessionID)) {
+        sessionNotices.setBypass(sessionID, BYPASS_ALL_REMINDER())
         return
       }
-      if (wasAll && !all) {
-        // Restore notice first; then the current state is re-announced below
-        // (announcedBypass is cleared so still-armed categories emit a fresh
-        // ACTIVE notice, and ended ones emit ENDED).
-        appendAgentReminder(sessionID, BYPASS_ALL_RESTORED_REMINDER())
-        announcedAll.delete(sessionID)
-        announcedBypass.delete(sessionID)
-      }
-      const ended = [...announced].filter((c) => !facing.has(c))
+      const facing = new Set(activeBypass(sessionID))
+      facing.delete("slow")
       if (facing.size === 0) {
-        // One ENDED reminder covers ended categories (after a restore, an
-        // empty facing needs nothing more — the restore notice said it all).
-        if (ended.length > 0 || (announced.size > 0 && !wasAll)) {
-          appendAgentReminder(sessionID, BYPASS_ENDED_REMINDER(ended))
-        }
-        announcedBypass.delete(sessionID)
-      } else if (!sameCategories(announced, facing) || (wasAll && !all)) {
-        if (ended.length > 0) appendAgentReminder(sessionID, BYPASS_ENDED_REMINDER(ended))
-        appendAgentReminder(sessionID, BYPASS_ACTIVE_REMINDER([...facing].sort()))
-        announcedBypass.set(sessionID, new Set(facing))
+        sessionNotices.setBypass(sessionID, undefined)
+        return
       }
+      sessionNotices.setBypass(sessionID, BYPASS_ACTIVE_REMINDER([...facing].sort()))
     }
 
     /** Remove leases whose TTL elapsed and re-sync the agent reminder. Called on
@@ -1785,12 +1747,13 @@ const plugin: Plugin = {
       command: string,
       reason: string,
       rules: string[] = [],
+      riskHint?: string,
     ): never {
       recordRejection(state, { command, reason, classifier: "STATIC" })
       throw blockMessage(
         "static", reason, strictPolicy, rules, command,
         claimEscalationGuidance(sessionID, rules), resolved.escalationEnabled,
-        riskCategoryHint(rulesHintCategories(rules)),
+        riskHint ?? riskCategoryHint(rulesHintCategories(rules)),
       )
     }
 
@@ -1817,6 +1780,122 @@ const plugin: Plugin = {
         timeout: resolved.dynamicReview.timeoutMs,
       }
       return reviewFn(request, options)
+    }
+
+    /** Automatic collect_evidence resolution for the dynamic reviewer: one
+     *  bounded evidence pass over the command's uninspected references, one
+     *  resubmit. A still-indecisive or denied retry returns a DENY whose
+     *  limitation names what could not be collected — never an ask, never a
+     *  silent allowance. */
+    async function resolveCollectEvidence(
+      sessionID: string,
+      script: string,
+      staticDecision: StaticSecurityDecision,
+      reviewRequest: CloudReviewRequest,
+      base: { cwd: string; worktree: string },
+      needsEvidence: readonly string[] = [],
+    ): Promise<{ result: CloudReviewResult; evidence: CollectedEvidence[]; missing: string[] }> {
+      const subjects: EvidenceRequest[] = [
+        // Reviewer-named evidence needs take priority, then everything the
+        // static layer flagged but could not inspect.
+        ...needsEvidence.map((subject) => ({ subject })),
+        ...(staticDecision.reviewContext?.uninspectedLocalScripts ?? []).map((subject) => ({ subject })),
+        ...(staticDecision.reviewContext?.uninspectedTargetDirectories ?? []).map((subject) => ({ subject })),
+        ...(staticDecision.reviewContext?.referencedPaths ?? []).map((subject) => ({ subject })),
+      ]
+      const { evidence, missing } = await collectBoundedEvidence(subjects, {
+        ...base,
+        allowFullReadAccess: resolved.dynamicReview.allowFullReadAccess,
+      })
+      const syntheticAssessment = (categories: string[]) => ({
+        categories,
+        strongReasons: [],
+        needsEvidence: missing.slice(0, 8),
+        decisionSource: missing.length > 0 ? "evidence_limited" : "model",
+      })
+      if (evidence.length === 0) {
+        writeReviewerTrace({
+          kind: "review_verdict",
+          sessionID,
+          command: script,
+          decision: "DENY",
+          source: "evidence_limited",
+          missing: missing.slice(0, 8),
+        })
+        return {
+          evidence,
+          missing,
+          result: {
+            decision: "DENY",
+            categories: ["indirection"],
+            assessment: syntheticAssessment(["indirection"]),
+            reason:
+              missing.length > 0
+                ? `reviewer asked for evidence that is not collectable automatically (${missing.slice(0, 5).join(", ")})`
+                : "reviewer asked for evidence but nothing further was collectable",
+          },
+        }
+      }
+      // Evidence rides the same request shape; reviewers that do not know
+      // the field ignore it.
+      const retryRequest = {
+        ...reviewRequest,
+        collectedEvidence: evidence.map((e) => ({
+          kind: e.kind,
+          subject: e.subject,
+          excerpt: e.excerpt,
+          truncated: e.truncated,
+        })),
+      } as CloudReviewRequest
+      try {
+        const raw = (await performDynamicReview(retryRequest)) as CloudReviewResult & {
+          decision?: unknown
+        }
+        writeReviewerTrace({
+          kind: "review_verdict",
+          sessionID,
+          command: script,
+          decision: raw.decision,
+          evidence_resubmit: true,
+          engine: raw.engine,
+        })
+        const outcome = automaticOutcome(raw.decision as RawReviewerDecision)
+        if (outcome.kind === "admit") return { result: raw, evidence, missing }
+        const cats =
+          Array.isArray(raw.categories) && raw.categories.length > 0 ? raw.categories : ["indirection"]
+        return {
+          evidence,
+          missing,
+          result: {
+            decision: "DENY",
+            categories: cats,
+            assessment: syntheticAssessment(cats),
+            reason:
+              outcome.kind === "deny"
+                ? "the reviewer denied after seeing the collected evidence"
+                : "the reviewer still requires information that cannot be collected automatically",
+          },
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        writeReviewerTrace({
+          kind: "review_error",
+          sessionID,
+          command: script,
+          error: message.slice(0, 1000),
+          evidence_resubmit: true,
+        })
+        return {
+          evidence,
+          missing,
+          result: {
+            decision: "DENY",
+            categories: ["indirection"],
+            assessment: syntheticAssessment(["indirection"]),
+            reason: "evidence resubmit failed at the reviewer; fail-close",
+          },
+        }
+      }
     }
 
     // --- 6. HARD session interrupt (v1 client.session.abort) ----------------
@@ -1975,11 +2054,12 @@ const plugin: Plugin = {
     // reviewer: a direct Python child (bundled escalation-reviewer.py — never
     // the ordinary auditorPath, never the reviewCommand injection hook). Only
     // allow_once proceeds, and its categories are merged into the bypass set
-    // for THIS shell call alone. ask_user and deny are recorded for the
-    // session lifetime, so a similar request never reaches the reviewer
-    // again. Config/infra/protocol/timeout failures (and an unreadable session
+    // for THIS shell call alone. collect_evidence resolves automatically
+    // (bounded pass + one resubmit); deny is recorded for the session
+    // lifetime, so a similar request never reaches the reviewer again.
+    // Config/infra/protocol/timeout failures (and an unreadable session
     // context) fail closed WITHOUT a permanent record — the agent's remaining
-    // route is asking the user to authorize directly (/bypass).
+    // route is the session surface (/bypass armed by the operator).
 
     /** Inputs the floor pre-check needs to run the static classifier with the
      * same arguments the post-grant classification in runBefore will use. */
@@ -2059,11 +2139,38 @@ const plugin: Plugin = {
       )
     }
 
+    /** The reviewed-facts snapshot an allow_once binds to: the static
+     *  classification + context the P0 inspection actually saw. Admission
+     *  re-verifies the same facts are still true before honoring the grant —
+     *  a script that changed mid-review can never ride the stale approval. */
+    type ReviewedFacts = {
+      decision: StaticSecurityDecision
+      cwd: string
+      worktree: string
+      permLabel: string
+      /** Identity snapshots of evidence objects the reviewer consumed on a
+       *  collect_evidence resubmit (path + dev/ino + size/mtime at read
+       *  time). Admission re-stats them: an approval stays bound to exactly
+       *  the file objects that produced the verdict. */
+      evidenceIdentities?: readonly {
+        resolvedPath: string
+        dev: number
+        ino: number
+        size: number
+        mtimeMs: number
+      }[]
+    }
+
+    type EscalationGrant = {
+      categories: readonly BypassCategory[]
+      facts: ReviewedFacts
+    }
+
     async function reviewEscalationRequest(
       sessionID: string,
       request: EscalationRequest,
       classifyContext: EscalationClassifyContext,
-    ): Promise<readonly BypassCategory[]> {
+    ): Promise<EscalationGrant> {
       if (escalationPending.has(sessionID)) {
         // The in-flight review may still produce an allow_once: waiting is a
         // real option, so it is named before the user-authorization route.
@@ -2088,7 +2195,7 @@ const plugin: Plugin = {
         const ancestorFailures = escalationFailures.get(ancestor)
         if (ancestorFailures) inherited.push(...ancestorFailures)
       }
-      const similar = findSimilarFailedEscalation(
+        const similar = findSimilarFailedEscalation(
         request.command,
         [...failures, ...inherited],
         request.categories,
@@ -2096,7 +2203,7 @@ const plugin: Plugin = {
       if (similar) {
         const earlier =
           similar.decision === "ask_user"
-            ? "already required the user's explicit confirmation for a similar command"
+            ? "already ended as an automatic denial for a similar command"
             : "already denied a similar command"
         throw rejectionError(
           `Escalation denied: the escalation reviewer ${earlier} ` +
@@ -2115,7 +2222,30 @@ const plugin: Plugin = {
         // reviewer call when no grantable category set could ever let the
         // static layer pass this command.
         await precheckEscalationFloor(sessionID, request, classifyContext)
-        return await performEscalationReview(sessionID, request, failures, pending, classifyContext)
+        // P0 fact binding: classify the real command under the CURRENT
+        // bypass set (not the hypothetical grant) BEFORE the reviewer sees
+        // it. The verdict is pinned to exactly these fingerprints/context —
+        // admission re-verifies them afterwards instead of trusting time.
+        const reviewedFacts: ReviewedFacts = {
+          decision: await classifyShellCommand({
+            script: request.command,
+            cwd: classifyContext.cwd,
+            worktree: classifyContext.worktree,
+            shell: classifyContext.shell,
+            strictness: resolved.strictness,
+            bypassedCategories: activeBypass(sessionID),
+            permScope: effectivePerm(sessionID),
+            roKernelEnforced: roKernelEnforcedForCall(sessionID, activeBypass(sessionID)),
+            roWritableRoots: [resolved.sandbox.scratch],
+            sandboxDenyWrite: resolved.sandbox.denyWrite,
+            runtimeWorkdir: classifyContext.runtimeWorkdir,
+            trustedCommands: resolved.trustedCommands,
+          }),
+          cwd: classifyContext.cwd,
+          worktree: classifyContext.worktree,
+          permLabel: permLabel(effectivePerm(sessionID)),
+        }
+        return await performEscalationReview(sessionID, request, failures, pending, classifyContext, reviewedFacts)
       } finally {
         if (escalationPending.get(sessionID) === pending) {
           escalationPending.delete(sessionID)
@@ -2130,7 +2260,8 @@ const plugin: Plugin = {
       failures: FailedEscalationRecord[],
       pending: object,
       classifyContext: EscalationClassifyContext,
-    ): Promise<readonly BypassCategory[]> {
+      facts: ReviewedFacts,
+    ): Promise<EscalationGrant> {
       const dynamic = resolved.dynamicReview
       if (!dynamic.available || !dynamic.endpoint || !dynamic.model || !dynamic.apiKey) {
         // Config-field detail is logged, not shown: the agent cannot fix the
@@ -2220,12 +2351,12 @@ const plugin: Plugin = {
           // thinking-sized default.
           timeout: Math.max(dynamic.timeoutMs, DEFAULT_ESCALATION_REVIEW_TIMEOUT_MS),
         })
-        const decision = result.decision
         if (escalationPending.get(sessionID) !== pending) {
           throw rejectionError(
             `Escalation session ended during review; the command was not run.${terminalAuthorize(request.categories)}`,
           )
         }
+        const rawDecision = result.decision as string
         writeReviewerTrace({
           kind: "escalation_review_verdict",
           sessionID,
@@ -2235,32 +2366,67 @@ const plugin: Plugin = {
           // Report the engine that actually produced the verdict.
           endpoint: result.engine === "jev" ? dynamic.jev?.endpoint : dynamic.endpoint,
           model: result.engine === "jev" ? dynamic.jev?.model : dynamic.model,
-          decision,
+          decision: rawDecision,
           engine: result.engine,
           fallback_reason: result.fallback_reason,
         })
-        if (decision === "allow_once") {
+        // Automatic outcomes only: allow_once admits this call; a legacy
+        // ask_user or a collect_evidence verdict is resolved WITHOUT a human
+        // — one bounded evidence pass + one resubmit, then a denial that
+        // names the evidence limitation.
+        const outcome = automaticOutcome(rawDecision as RawReviewerDecision)
+        if (outcome.kind === "admit") {
           // The parser validated every category against BYPASS_CATEGORIES;
           // filter() narrows the parsed strings back to the canonical union.
-          return BYPASS_CATEGORIES.filter((category) => request.categories.includes(category))
+          return {
+            categories: BYPASS_CATEGORIES.filter((category) => request.categories.includes(category)),
+            facts,
+          }
+        }
+        if (outcome.kind === "recollect") {
+          const retry = await resubmitEscalationWithEvidence(
+            sessionID,
+            request,
+            classifyContext,
+            reviewRequest,
+            pending,
+            dynamic,
+            jevAvailable,
+            escalationReviewer,
+          )
+          if (retry.kind === "admit") {
+            return {
+              categories: BYPASS_CATEGORIES.filter((category) => request.categories.includes(category)),
+              facts: {
+                ...facts,
+                evidenceIdentities: retry.evidence
+                  .map((item) => item.identity)
+                  .filter((identity): identity is NonNullable<typeof identity> => identity !== undefined),
+              },
+            }
+          }
+          recordEscalationFailure(sessionID, {
+            command: request.command,
+            categories: request.categories,
+            justification: request.justification,
+            decision: "deny",
+          })
+          const limitation = retry.limitation ?? "the requested evidence could not be collected"
+          throw rejectionError(
+            `Escalation could not be authorized automatically: ${limitation}; the command was not run. ` +
+              `A similar command cannot request escalation again in this session. ` +
+              `${terminalOutcomeText("evidence")}`,
+          )
         }
         recordEscalationFailure(sessionID, {
           command: request.command,
           categories: request.categories,
           justification: request.justification,
-          decision,
+          decision: "deny",
         })
-        // The internal decision name never reaches the agent: the refusal is
-        // phrased as a natural outcome. Both outcomes are terminal — a similar
-        // command cannot request escalation again, so the message points at
-        // user-side authorization only.
-        const outcome =
-          decision === "ask_user"
-            ? "The escalation reviewer requires the user's explicit confirmation for this command"
-            : "The escalation reviewer denied this one-time request"
         throw rejectionError(
-          `${outcome}; the command was not run. A similar command cannot request ` +
-            `escalation again in this session.${terminalAuthorize(request.categories)}`,
+          `The escalation reviewer denied this one-time request; the command was not run. A similar command ` +
+            `cannot request escalation again in this session.${terminalAuthorize(request.categories)}`,
         )
       } catch (error) {
         if (error instanceof EscalationReviewError) {
@@ -2280,6 +2446,111 @@ const plugin: Plugin = {
           )
         }
         throw error
+      }
+    }
+
+    /** Automatic evidence resolution for collect_evidence (and the legacy
+     *  ask_user verdict): collect bounded evidence ONCE — referenced local
+     *  scripts and paths that are inspectable inside the worktree — attach it
+     *  to the request, and resubmit to the reviewer ONCE. An admit resolves
+     *  the call; anything else (another indecision, deny, or a collection
+     *  failure) ends as a named-limitation denial. No human is involved. */
+    async function resubmitEscalationWithEvidence(
+      sessionID: string,
+      request: EscalationRequest,
+      classifyContext: EscalationClassifyContext,
+      reviewRequest: EscalationReviewRequest,
+      pending: object,
+      dynamic: NonNullable<typeof resolved.dynamicReview>,
+      jevAvailable: boolean,
+      escalationReviewer: string,
+    ): Promise<{ kind: "admit"; evidence: CollectedEvidence[] } | { kind: "deny"; limitation: string }> {
+      // Evidence subjects: what the reviewer referenced that was never
+      // inspected. The static classifier already records which local scripts
+      // it could not fingerprint — reclassify the same command to reuse that
+      // list (read-only, no new authority).
+      const redDecision = await classifyShellCommand({
+        script: request.command,
+        cwd: classifyContext.cwd,
+        worktree: classifyContext.worktree,
+        shell: classifyContext.shell,
+        strictness: resolved.strictness,
+        bypassedCategories: activeBypass(sessionID),
+        permScope: effectivePerm(sessionID),
+        runtimeWorkdir: classifyContext.runtimeWorkdir,
+        trustedCommands: resolved.trustedCommands,
+      })
+      const subjects: EvidenceRequest[] = [
+        ...(redDecision.reviewContext?.uninspectedLocalScripts ?? []),
+        ...(redDecision.reviewContext?.uninspectedTargetDirectories ?? []),
+        ...(redDecision.reviewContext?.referencedPaths ?? []),
+      ].map((subject) => ({ subject }))
+      const { evidence, missing } = await collectBoundedEvidence(subjects, {
+        cwd: classifyContext.cwd,
+        worktree: classifyContext.worktree,
+        allowFullReadAccess: resolved.dynamicReview.allowFullReadAccess,
+      })
+      if (evidence.length === 0) {
+        return {
+          kind: "deny",
+          limitation:
+            missing.length > 0
+              ? `the reviewer asked for evidence that is not collectable automatically (${missing
+                  .slice(0, 5)
+                  .join(", ")}${missing.length > 5 ? `, and ${missing.length - 5} more` : ""})`
+              : "the reviewer asked for evidence but there was nothing further to collect",
+        }
+      }
+      // Attach the bounded excerpts to the resubmitted request. The field is
+      // additive: reviewers that do not know it ignore it.
+      const retryRequest = {
+        ...reviewRequest,
+        collectedEvidence: evidence.map((e) => ({
+          kind: e.kind,
+          subject: e.subject,
+          excerpt: e.excerpt,
+          truncated: e.truncated,
+        })),
+      } as EscalationReviewRequest
+      const retry = await reviewEscalationDetailed(retryRequest, {
+        endpoint: dynamic.endpoint ?? "",
+        model: dynamic.model ?? "",
+        apiKey: dynamic.apiKey ?? "",
+        python: dynamic.pythonPath,
+        reviewer: escalationReviewer === "jev" || escalationReviewer === "openai" ? escalationReviewer : "auto",
+        jev: jevAvailable && dynamic.jev
+          ? {
+              endpoint: dynamic.jev.endpoint ?? "",
+              model: dynamic.jev.model ?? "",
+              apiKey: dynamic.jev.apiKey ?? "",
+            }
+          : undefined,
+        timeout: Math.max(dynamic.timeoutMs, DEFAULT_ESCALATION_REVIEW_TIMEOUT_MS),
+      })
+      if (escalationPending.get(sessionID) !== pending) {
+        return { kind: "deny", limitation: "the session ended while evidence was being collected" }
+      }
+      writeReviewerTrace({
+        kind: "escalation_review_verdict",
+        sessionID,
+        command: request.command,
+        categories: [...request.categories],
+        justification: request.justification,
+        endpoint: retry.engine === "jev" ? dynamic.jev?.endpoint : dynamic.endpoint,
+        model: retry.engine === "jev" ? dynamic.jev?.model : dynamic.model,
+        decision: retry.decision,
+        engine: retry.engine,
+        evidence_resubmit: true,
+      })
+      if (automaticOutcome(retry.decision as RawReviewerDecision).kind === "admit") {
+        return { kind: "admit", evidence }
+      }
+      return {
+        kind: "deny",
+        limitation:
+          retry.decision === "deny"
+            ? "the reviewer denied the request after seeing the collected evidence"
+            : "the reviewer still requires information that cannot be collected automatically",
       }
     }
 
@@ -2397,7 +2668,7 @@ const plugin: Plugin = {
         ? parseEscalation(rawScript, ESCALATION_GRANTABLE_CATEGORIES)
         : { status: "none" as const, command: rawScript }
       let script = rawScript
-      let escalationGranted: readonly BypassCategory[] | undefined
+      let escalationGrant: EscalationGrant | undefined
       if (escalationParsed.status === "malformed") {
         rejectStatic(sessionID, sessionState, rawScript, `Malformed escalation request: ${escalationParsed.reason}`)
       }
@@ -2417,7 +2688,7 @@ const plugin: Plugin = {
         // tool call itself) sees only the real command.
         script = request.command
         input.command = request.command
-        escalationGranted = await reviewEscalationRequest(sessionID, request, {
+        escalationGrant = await reviewEscalationRequest(sessionID, request, {
           cwd,
           worktree,
           shell,
@@ -2428,10 +2699,17 @@ const plugin: Plugin = {
       const bypassed = activeBypass(sessionID)
       // An allow_once escalation adds its categories for THIS shell call only:
       // no lease is written, no reminder is sent, nothing survives the call.
-      if (escalationGranted) for (const category of escalationGranted) bypassed.add(category)
+      if (escalationGrant) for (const category of escalationGrant.categories) bypassed.add(category)
       const bypassedCategories = bypassed.size > 0 ? bypassed : undefined
       // Bypass leases are fixed-deadline: executing a command here must NOT
       // renew them, or a user-set timeout would silently become idle-based.
+      //
+      // An ordinary (non-terminal, non-escalated) static DENY is carried to
+      // the dynamic section below by this flag: the refusal stays static,
+      // but the reviewer runs ONCE first so the denial/report names the
+      // command's full minimal risk set, not the first segment's truncated
+      // rule view.
+      let staticDenyPending = false
 
       const staticDecision: StaticSecurityDecision = await classifyShellCommand({
         script,
@@ -2456,9 +2734,116 @@ const plugin: Plugin = {
         })
       }
 
-      // Static DENY is absolute — cannot be overridden by approval or dynamic review.
+      // Static DENY is absolute — cannot be overridden by approval or
+      // dynamic review. But not every DENY is the same refusal:
+      //
+      //  • Terminal rules (unconditional floor, permission ceiling,
+      //    opaque/empty input) deny immediately — no category can ever
+      //    clear them, so the P0 semantic report would only delay an
+      //    already-final answer.
+      //  • An escalated call whose residual DENY survives the grant is an
+      //    UNCOVERED kind: the report admitted this command's risk set once;
+      //    a rule still firing means the call needs a category the approved
+      //    report did not cover. Admission must never silently admit it.
+      //  • Every other static DENY falls through to one dynamic review so
+      //    the first refusal carries the full minimal risk set (model
+      //    primary footprint ∪ the static rules' own categories) — an
+      //    ordinary compound like `rm -f .env && rm -rf /tmp/docs` denies
+      //    with the complete [filesystem, secret] picture rather than the
+      //    first segment's truncated rule view. The verdict stays the
+      //    static denial: the model completes the report, it never
+      //    overrides it.
       if (staticDecision.verdict === "DENY") {
-        rejectStatic(sessionID, sessionState, script, staticDecision.reason, staticDecision.rules)
+        // Terminality is judged on BOTH this call's classification and the
+        // fully-armed shape — but differently. The unarmed rules carry
+        // every terminal kind (floor, permission ceiling, opaque input);
+        // the armed pass is consulted ONLY for true floor rules, because
+        // floor rules are tagged categories to make the bypass-skip
+        // mechanical and a root-delete can hide behind an earlier
+        // bypassable segment. Armed-only permission.* findings are NOT
+        // terminal here — arming changes how the ceiling masks segments,
+        // it never converts an ordinary deny into an unconditional one.
+        const armedBypass = new Set<BypassCategory>(
+          STATIC_BYPASS_CATEGORIES.map((category) => category as BypassCategory),
+        )
+        const armedDecision = await classifyShellCommand({
+          script,
+          cwd,
+          worktree,
+          shell,
+          strictness: resolved.strictness,
+          bypassedCategories: armedBypass,
+          permScope: effectivePerm(sessionID),
+          roKernelEnforced: roKernelEnforcedForCall(sessionID, armedBypass),
+          roWritableRoots: [resolved.sandbox.scratch],
+          sandboxDenyWrite: resolved.sandbox.denyWrite,
+          runtimeWorkdir: requestedWorkdir,
+          trustedCommands: resolved.trustedCommands,
+        })
+        const armedFloor = armedDecision.rules.filter((rule) => isFloorRule(rule))
+        const terminalRules = new Set(
+          [
+            ...staticDecision.rules.filter(
+              (rule) => isFloorRule(rule) || TERMINAL_ESCALATION_RULES.has(rule),
+            ),
+            ...armedFloor,
+          ],
+        )
+        if (terminalRules.size > 0) {
+          // Name the actual floor when only the armed shape surfaced it —
+          // the first-segment reason would blame the bypassable rule.
+          const reason = armedFloor.length > 0 ? armedDecision.reason : staticDecision.reason
+          rejectStatic(sessionID, sessionState, script, reason, [...terminalRules])
+        }
+        if (escalationGrant) {
+          // Categories this call's remaining DENY rules actually need.
+          const uncovered = new Set<string>()
+          let unmappable = false
+          for (const rule of staticDecision.rules) {
+            const required = ruleRequiredCategories(rule)
+            if (!required || required.length === 0) {
+              unmappable = true
+              continue
+            }
+            for (const category of required) {
+              if (!escalationGrant.categories.includes(category)) uncovered.add(category)
+            }
+          }
+          const reason = unmappable
+            ? `${staticDecision.reason} (residual rule is outside the bypass system and cannot be escalated)`
+            : `${staticDecision.reason} (requires categories outside this call's approved report: ${[...uncovered].sort().join(", ")})`
+          rejectStatic(sessionID, sessionState, script, reason, staticDecision.rules)
+        }
+        staticDenyPending = true
+      }
+
+      // Residual ASK kinds after a grant: the report admitted this call's
+      // risk set once, so a surviving review rule that names a category the
+      // approved report did not cover is an unapproved kind — deny it
+      // instead of riding the stale approval. Rules with no category mapping
+      // (opaque/context-required fallbacks) keep the allow_once semantics:
+      // they were part of what the reviewer saw at P0. Bypass-marker rules
+      // (bypass.static-allow) map to nothing and never gate here.
+      if (escalationGrant && staticDecision.verdict === "ASK") {
+        const uncovered = new Set<string>()
+        for (const rule of staticDecision.rules) {
+          const required = ruleRequiredCategories(rule)
+          if (!required) continue
+          for (const category of required) {
+            if (!escalationGrant.categories.includes(category)) uncovered.add(category)
+          }
+        }
+        if (uncovered.size > 0) {
+          rejectStatic(
+            sessionID,
+            sessionState,
+            script,
+            `${staticDecision.reason} (still requires categories outside this call's approved report: ` +
+              `${[...uncovered].sort().join(", ")})`,
+            staticDecision.rules,
+            riskCategoryHint([...uncovered].sort(), bypassed),
+          )
+        }
       }
 
       // host/privilege ↔ OS sandbox consistency: when the effective bypass
@@ -2483,26 +2868,26 @@ const plugin: Plugin = {
       if (needsOsPrivilege && callSandboxProfile !== "full" && !rwAllowSudoRoute) {
         if (!bypassed.has("privilege")) {
           const escalationRoute = resolved.escalationEnabled
-            ? `, or to include the privilege category when escalating this command`
+            ? `, or the privilege category can be included when escalating this command`
             : ""
           throw rejectionError(
             `Blocked by policy classifier: this command needs OS privilege but the privilege category is not ` +
               `bypassed for this call, so the OS sandbox's no_new_privs floor would make the privilege step ` +
-              `fail silently at runtime — the command was not run. Ask the user to arm the privilege bypass ` +
-              `category (/bypass privilege)${escalationRoute} ` +
+              `fail silently at runtime — the command was not run. The privilege bypass category must be armed ` +
+              `for this call to proceed${escalationRoute} ` +
               `(a rw profile host-direct route also requires sandbox.allowSudo).`,
           )
         }
         if (callSandboxProfile === "ro") {
           const escalationRoute = resolved.escalationEnabled
-            ? `to include the sandbox category when escalating privileged commands, or `
+            ? `the sandbox category can be included when escalating privileged commands, `
             : ""
           throw rejectionError(
             `Blocked by policy classifier: this command needs OS privilege and the privilege category is bypassed ` +
               `for this call, but this call's OS sandbox profile is read-only and cannot run it host-direct — the ` +
               `sandbox's no_new_privs floor would make the privilege step fail silently at runtime, so the command ` +
-              `was not run. Ask the user to arm the sandbox bypass category (/bypass sandbox), ${escalationRoute}` +
-              `or to enable sandbox.allowSudo in the plugin config for read-write sessions.`,
+              `was not run. The sandbox bypass category must be armed for this call, ${escalationRoute}` +
+              `or sandbox.allowSudo must be enabled in the plugin config for read-write sessions.`,
           )
         }
       }
@@ -2541,6 +2926,101 @@ const plugin: Plugin = {
       const forcedByFailure = Boolean(failureAtStart)
       const forced = forcedByRejection || forcedByFailure
 
+      // Escalation admission: a raw allow_once verdict IS this call's
+      // assessment report and its admission — the execution gate does not
+      // re-classify through the ordinary dynamic reviewer, add categories, or
+      // apply a fresh static→ASK pass. The unconditional layers that ran
+      // above (static DENY floor/terminal set, permission ceiling, sandbox
+      // routing, read-only native checks) are untouched: escalation can only
+      // grant bypass categories, never lift the floor. Stored scope
+      // "one_time": the report admits THIS call only and is never replayed.
+      //
+      // Fact binding: the grant was pinned at P0 to the reviewed
+      // classification + context (script fingerprints, local scripts,
+      // referenced/target paths, cwd, worktree, permission scope). The
+      // residual-DENY check above already rejected an uncovered kind; here
+      // the CURRENT classification must still equal the reviewed snapshot —
+      // a script swapped or a path moved between verdict and admission must
+      // not ride the stale approval. Bypass-set drift is deliberately NOT
+      // compared: a lease scope change is not a fact about the command.
+      const admissionGranted = escalationGrant !== undefined
+      if (admissionGranted) {
+        const facts = escalationGrant!.facts
+        let changed =
+          staticDecision.fingerprints.length !== facts.decision.fingerprints.length ||
+          ![...staticDecision.fingerprints.map((f) => f.path)].sort().every(
+            (p, i) => p === [...facts.decision.fingerprints.map((f) => f.path)].sort()[i],
+          ) ||
+          JSON.stringify((staticDecision.reviewContext?.localScripts ?? []).slice().sort()) !==
+            JSON.stringify((facts.decision.reviewContext?.localScripts ?? []).slice().sort()) ||
+          JSON.stringify((staticDecision.reviewContext?.uninspectedLocalScripts ?? []).slice().sort()) !==
+            JSON.stringify((facts.decision.reviewContext?.uninspectedLocalScripts ?? []).slice().sort()) ||
+          JSON.stringify((staticDecision.reviewContext?.referencedPaths ?? []).slice().sort()) !==
+            JSON.stringify((facts.decision.reviewContext?.referencedPaths ?? []).slice().sort()) ||
+          JSON.stringify((staticDecision.reviewContext?.targetDirectories ?? []).slice().sort()) !==
+            JSON.stringify((facts.decision.reviewContext?.targetDirectories ?? []).slice().sort()) ||
+          JSON.stringify((staticDecision.reviewContext?.uninspectedTargetDirectories ?? []).slice().sort()) !==
+            JSON.stringify((facts.decision.reviewContext?.uninspectedTargetDirectories ?? []).slice().sort()) ||
+          cwd !== facts.cwd ||
+          worktree !== facts.worktree ||
+          permLabel(effectivePerm(sessionID)) !== facts.permLabel ||
+          // Verify the t0 (reviewed) fingerprint set is still fresh —
+          // not the t1 re-classification's list: the approval was issued
+          // for the objects the reviewer inspected.
+          !(await verifyScriptFingerprints(facts.decision.fingerprints))
+        // Evidence identities: every object the reviewer consumed on a
+        // collect_evidence resubmit must still be the same file object at
+        // admission — re-stat the resolved path and compare dev/ino plus
+        // the read-time size/mtime. A swapped or rewritten evidence file
+        // invalidates the approval it helped produce.
+        if (!changed && facts.evidenceIdentities) {
+          for (const identity of facts.evidenceIdentities) {
+            const now = await lstat(identity.resolvedPath).catch(() => undefined)
+            if (
+              !now ||
+              now.dev !== identity.dev ||
+              now.ino !== identity.ino ||
+              now.size !== identity.size ||
+              now.mtimeMs !== identity.mtimeMs
+            ) {
+              changed = true
+              break
+            }
+          }
+        }
+        if (changed) {
+          rejectStatic(
+            sessionID,
+            sessionState,
+            script,
+            "Command facts changed after the escalation review (script content, referenced paths, " +
+              "working directory, or permission scope no longer match the reviewed snapshot); " +
+              "the approval was not applied",
+            staticDecision.rules,
+          )
+        }
+        maybeBlockSlow(script, input, shell, cwd, worktree, bypassed)
+        if (
+          !(await applyPostChecks(script, input, staticDecision, shell, {
+            sessionID,
+            bypassedCategories: bypassed,
+            privilegeHostDirect,
+          }))
+        ) {
+          rejectStatic(sessionID, sessionState, script, "Local script changed after review", staticDecision.rules)
+        }
+        writeReviewerTrace({
+          kind: "assessment_admission",
+          sessionID,
+          command: script,
+          source: "model_decision",
+          scope: "one_time",
+          categories: [...escalationGrant!.categories].sort(),
+          owners: ownersForCategories(escalationGrant!.categories),
+        })
+        return
+      }
+
       if (staticDecision.verdict === "ALLOW" && !forced) {
         if (
           !(await applyPostChecks(script, input, staticDecision, shell, {
@@ -2558,6 +3038,7 @@ const plugin: Plugin = {
       let cacheKey: string | undefined
       if (cacheable) {
         cacheKey = dynamicAllowCacheKey(
+          sessionID,
           script,
           cwd,
           shell,
@@ -2568,9 +3049,24 @@ const plugin: Plugin = {
           bypassedCategories ? [...bypassedCategories].sort() : undefined,
           effectivePerm(sessionID),
         )
-        if (cacheKey && hasCachedDynamicAllow(dynamicAllowCache, cacheKey, Date.now())) {
+        // Whole-report replay: the stored report admits or denies only when
+        // every canonical input (command text, script fingerprints/mtimes,
+        // cwd, permission scope, bypass set, policy version) is identical —
+        // a changed fact yields a different key and a fresh review.
+        // A pending static DENY never replays a cached allow: the static
+        // verdict is absolute, so only a fresh review (or a cached deny)
+        // can complete its report.
+        const cached = cacheKey ? assessmentReports.get(cacheKey, sessionID) : undefined
+        if (cacheKey && !staticDenyPending && cached?.decision === "allow") {
           maybeBlockSlow(script, input, shell, cwd, worktree, bypassed)
-          writeReviewerTrace({ kind: "cache_allow", sessionID, command: script, cacheKey })
+          writeReviewerTrace({
+            kind: "cache_allow",
+            sessionID,
+            command: script,
+            cacheKey,
+            source: "replay",
+            owners: cached.owners,
+          })
           if (
             !(await applyPostChecks(script, input, staticDecision, shell, {
               sessionID,
@@ -2582,36 +3078,34 @@ const plugin: Plugin = {
           }
           return
         }
-        if (cacheKey) {
-          const denyEntry = cachedDynamicDenyEntry(dynamicDenyCache, cacheKey, Date.now())
-          if (denyEntry !== undefined) {
-            writeReviewerTrace({
-              kind: "cache_deny",
-              sessionID,
-              command: script,
-              cacheKey,
-              reason: denyEntry.reason,
-            })
-            // Refresh the coverage-gate record: a cached DENY replays the
-            // same risk categories a live verdict would, and without this
-            // the escalation reviewer loses previousDenial evidence whenever
-            // the denial came from cache.
-            sessionState.lastDynamicDenial = {
-              command: script,
-              riskCategories: [...denyEntry.riskCategories],
-              at: Date.now(),
-            }
-            throw blockMessage(
-              "dynamic",
-              denyEntry.reason,
-              strictPolicy,
-              staticDecision.rules,
-              script,
-              claimEscalationGuidance(sessionID),
-              resolved.escalationEnabled,
-              riskCategoryHint(denyEntry.riskCategories, bypassed),
-            )
+        if (cacheKey && cached?.decision === "deny") {
+          writeReviewerTrace({
+            kind: "cache_deny",
+            sessionID,
+            command: script,
+            cacheKey,
+            reason: cached.reason,
+            source: "replay",
+          })
+          // Refresh the coverage-gate record: a cached DENY replays the
+          // same risk categories a live verdict would, and without this
+          // the escalation reviewer loses previousDenial evidence whenever
+          // the denial came from cache.
+          sessionState.lastDynamicDenial = {
+            command: script,
+            riskCategories: [...cached.categories],
+            at: Date.now(),
           }
+          throw blockMessage(
+            "dynamic",
+            cached.reason ?? "Denied by policy",
+            strictPolicy,
+            staticDecision.rules,
+            script,
+            claimEscalationGuidance(sessionID),
+            resolved.escalationEnabled,
+            riskCategoryHint(cached.categories, bypassed),
+          )
         }
       }
 
@@ -2656,6 +3150,11 @@ const plugin: Plugin = {
       // Environment awareness is part of every dynamic review, not only
       // bypassed ones.
       reviewRequest.environment = detectEnvironment()
+
+      // Evidence the collect_evidence path gathered this call; attached to
+      // deny/allow reports so the record shows what the reviewer actually saw.
+      let collectedEvidence: CollectedEvidence[] = []
+      let missingEvidence: string[] = []
 
       let cloudReview: CloudReviewResult | undefined
       let reviewError: Error | undefined
@@ -2751,12 +3250,100 @@ const plugin: Plugin = {
           engine: cloudReview.engine,
           fallback_reason: cloudReview.fallback_reason,
         })
+
+        // collect_evidence: the reviewer asked for context before deciding.
+        // Bounded automatic collection (no human, no new authority): ONE
+        // evidence pass over the command's uninspected references + ONE
+        // resubmit. A second indecision or a denied retry ends the call with
+        // a named limitation; a missing-everything collection denies without
+        // burning the second review call.
+        //
+        // Priority rule: an explicit `collect_evidence` DECISION is the only
+        // trigger for a second review. A raw ALLOW whose assessment merely
+        // carries needsEvidence diagnostics ("unclear"/"possible weak" style
+        // soft flags) is a real agreement and admits as-is — metadata on a
+        // verdict never vetoes the verdict. The resubmitted result keeps its
+        // own typed decisionSource (evidence_limited on program truncation),
+        // it is never repainted as a model denial.
+        if ((cloudReview.decision as string) === "collect_evidence") {
+          const resolvedEvidence = await resolveCollectEvidence(
+            sessionID,
+            script,
+            staticDecision,
+            reviewRequest,
+            { cwd, worktree },
+            cloudReview.assessment?.needsEvidence ?? [],
+          )
+          collectedEvidence = resolvedEvidence.evidence
+          missingEvidence = resolvedEvidence.missing
+          cloudReview = resolvedEvidence.result
+        }
+
+        // Ordinary static DENY completion (see the tiered block above): the
+        // reviewer ran for report completeness only — the refusal stays the
+        // static reason. The billed risk set is the model's primary
+        // categories (when it named them) merged with the static rules' own
+        // categories; secondary diagnostic categories never join. The deny
+        // report is keyed to the same canonical inputs so a later identical
+        // escalation or call reads the same verdict history.
+        if (staticDenyPending) {
+          const ruleCats = rulesHintCategories(staticDecision.rules)
+          const riskCategories = [
+            ...new Set([
+              ...(cloudReview.categories.length > 0 ? cloudReview.categories : []),
+              ...ruleCats,
+            ]),
+          ]
+          sessionState.lastDynamicDenial = {
+            command: script,
+            riskCategories,
+            at: Date.now(),
+          }
+          if (cacheKey) {
+            assessmentReports.put(
+              buildReport({
+                key: cacheKey,
+                sessionID,
+                command: script,
+                cwd,
+                worktree,
+                shell,
+                decision: "deny",
+                categories: riskCategories,
+                secondaryCategories: cloudReview.secondary_categories,
+                // The report's judgment is the native static denial; the
+                // model's verdict completed the footprint, it did not issue
+                // the verdict itself — `native_static` keeps that distinct
+                // from an unconditional floor refusal (program_floor).
+                source: "native_static",
+                reason: staticDecision.reason,
+                evidence: collectedEvidence,
+                missingEvidence,
+              }),
+            )
+          }
+          rejectStatic(
+            sessionID,
+            sessionState,
+            script,
+            staticDecision.reason,
+            staticDecision.rules,
+            riskCategoryHint(riskCategories, bypassed),
+          )
+        }
+
         if (strictPolicy && cloudReview.bypassing === true) {
           const reason =
             cloudReview.decision === "DENY"
               ? (cloudReview.reason ?? "Denied by policy")
               : "The command appears to bypass a previous rejection"
-          const riskCategories = denialHintCategories(staticDecision.rules, cloudReview)
+          // Minimal categories: only the model's primary categories bill the
+          // denial — secondary_categories are diagnostics and must not widen
+          // the set the escalation reviewer uses for coverage.
+          const riskCategories =
+            cloudReview.categories.length > 0
+              ? cloudReview.categories
+              : denialHintCategories(staticDecision.rules, cloudReview)
           sessionState.lastDynamicDenial = {
             command: script,
             riskCategories,
@@ -2773,7 +3360,10 @@ const plugin: Plugin = {
 
         if (cloudReview.decision === "DENY") {
           const reason = cloudReview.reason ?? "Denied by policy"
-          const riskCategories = denialHintCategories(staticDecision.rules, cloudReview)
+          const riskCategories =
+            cloudReview.categories.length > 0
+              ? cloudReview.categories
+              : denialHintCategories(staticDecision.rules, cloudReview)
           sessionState.lastDynamicDenial = {
             command: script,
             riskCategories,
@@ -2784,7 +3374,25 @@ const plugin: Plugin = {
             reason,
             classifier: "DYNAMIC",
           })
-          if (cacheKey) cacheDynamicDeny(dynamicDenyCache, cacheKey, reason, riskCategories, Date.now())
+          if (cacheKey) {
+            assessmentReports.put(
+              buildReport({
+                key: cacheKey,
+                sessionID,
+                command: script,
+                cwd,
+                worktree,
+                shell,
+                decision: "deny",
+                categories: riskCategories,
+                secondaryCategories: cloudReview.secondary_categories,
+                source: "model_decision",
+                reason,
+                evidence: collectedEvidence,
+                missingEvidence,
+              }),
+            )
+          }
           throw blockMessage(
             "dynamic",
             reason,
@@ -2816,7 +3424,24 @@ const plugin: Plugin = {
         ) {
           rejectStatic(sessionID, sessionState, script, "Local script changed after review", staticDecision.rules)
         }
-        if (cacheKey) cacheDynamicAllow(dynamicAllowCache, cacheKey, Date.now())
+        if (cacheKey) {
+          assessmentReports.put(
+            buildReport({
+              key: cacheKey,
+              sessionID,
+              command: script,
+              cwd,
+              worktree,
+              shell,
+              decision: "allow",
+              categories: cloudReview.categories,
+              secondaryCategories: cloudReview.secondary_categories,
+              source: "model_decision",
+              evidence: collectedEvidence,
+              missingEvidence,
+            }),
+          )
+        }
         return
       }
 
@@ -2898,7 +3523,6 @@ const plugin: Plugin = {
             })
             throw failClosedBlock(
               `${failReason} (injection detector unavailable; fail-close)`,
-              failAskNormalized,
               strictPolicy,
               staticDecision.rules,
               script,
@@ -2911,12 +3535,28 @@ const plugin: Plugin = {
         recordRejection(sessionState, { command: script, reason: failReason, classifier: "FAIL_POLICY" })
         throw failClosedBlock(
           failReason,
-          failAskNormalized,
           strictPolicy,
           staticDecision.rules,
           script,
           claimEscalationGuidance(sessionID),
           resolved.escalationEnabled,
+        )
+      }
+
+      // infra ReviewError or unknown non-ReviewError → honor failPolicy —
+      // except a pending static DENY: the static verdict is absolute, so an
+      // unavailable/failed reviewer (and fail_open) can never release it.
+      // Without the model the denial still carries the static rules' own
+      // category footprint — the honest rule-shaped hint, never widened by
+      // guessed categories.
+      if (staticDenyPending) {
+        rejectStatic(
+          sessionID,
+          sessionState,
+          script,
+          staticDecision.reason,
+          staticDecision.rules,
+          riskCategoryHint(rulesHintCategories(staticDecision.rules), bypassed),
         )
       }
 
@@ -2939,7 +3579,7 @@ const plugin: Plugin = {
         }
         return
       }
-      // fail_close (including fail_ask normalized to fail_close).
+      // fail_close.
       recordRejection(sessionState, {
         command: script,
         reason: failReason,
@@ -2947,7 +3587,6 @@ const plugin: Plugin = {
       })
       throw failClosedBlock(
         failReason,
-        failAskNormalized,
         strictPolicy,
         staticDecision.rules,
         script,
@@ -3071,17 +3710,16 @@ const plugin: Plugin = {
                 deleteSessionState(sessionID)
                 bypassLeases.delete(sessionID)
                 bypassParent.delete(sessionID)
-                announcedBypass.delete(sessionID)
-                announcedAll.delete(sessionID)
                 sessionPerms.delete(sessionID)
                 permParent.delete(sessionID)
                 permBoundChildren.delete(sessionID)
                 permKnownRoots.delete(sessionID)
                 permUnresolved.delete(sessionID)
-                announcedPerm.delete(sessionID)
                 escalationFailures.delete(sessionID)
                 escalationPending.delete(sessionID)
                 escalationGuideShown.delete(sessionID)
+                sessionNotices.clear(sessionID)
+                assessmentReports.invalidateSession(sessionID)
                 for (const [child, parent] of permParent) {
                   if (parent === sessionID) permParent.delete(child)
                 }
@@ -3498,21 +4136,16 @@ const plugin: Plugin = {
     yield* Effect.addFinalizer(() =>
       Effect.sync(() => {
         sessions.clear()
-        dynamicAllowCache.clear()
-        dynamicDenyCache.clear()
         inflightReviews.clear()
         sessionDirectories.clear()
         bypassLeases.clear()
         bypassParent.clear()
-        announcedBypass.clear()
-        announcedAll.clear()
         sessionPerms.clear()
         permParent.clear()
         permStash.clear()
         permBoundChildren.clear()
         permKnownRoots.clear()
         permUnresolved.clear()
-        announcedPerm.clear()
         escalationFailures.clear()
         escalationPending.clear()
         escalationGuideShown.clear()

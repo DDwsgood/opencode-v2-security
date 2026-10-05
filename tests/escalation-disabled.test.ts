@@ -1,7 +1,8 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test"
 import { createServer, type Server } from "node:http"
 import type { AddressInfo } from "node:net"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp } from "node:fs/promises"
+import { cleanupTestArtifacts as rm } from "./artifacts"
 import path from "node:path"
 import { Cause, Effect, Exit, Option, Scope, Stream } from "effect"
 import plugin from "../src/index"
@@ -108,6 +109,9 @@ async function startPlugin(options: Record<string, unknown>): Promise<Harness> {
     command: { transform: () => Effect.void },
     permission: { hook: () => Effect.void },
     session: {
+      // Context hook registrar stub: attachSessionContextHook
+      // registers here; state notices are a no-op for these tests.
+      hook: () => Effect.void,
       get: () => Effect.succeed({ location: { directory } }),
       interrupt: () => Effect.void,
       context: () =>
@@ -178,7 +182,7 @@ describe("escalationEnabled: false removes the escalation channel entirely", () 
     // A statically denied command: the block must not mention escalation.
     const denied = await runBefore(h, "s1", { command: "rm -rf /" })
     expect(denied).toBeDefined()
-    expect(denied).toContain("/bypass")
+    expect(denied).toContain("session surface")
     expect(denied!.toLowerCase()).not.toContain("escalat")
     expect(denied).not.toContain("resubmit the command once")
     // A dynamically denied command: same guarantee — the policy block points
@@ -186,7 +190,7 @@ describe("escalationEnabled: false removes the escalation channel entirely", () 
     const blocked = await runBefore(h, "s1", { command: "cat /etc/shadow" })
     expect(blocked).toBeDefined()
     expect(blocked!.toLowerCase()).not.toContain("escalat")
-    expect(blocked).toContain("/bypass")
+    expect(blocked).toContain("session surface")
     expect(mock.requests).toHaveLength(0)
     expect(h.contextCalls()).toBe(0)
   })

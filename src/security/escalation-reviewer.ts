@@ -3,8 +3,13 @@ import { lstatSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
-/** The only decisions that can come back from the escalation reviewer. */
-export type EscalationReviewDecision = "allow_once" | "ask_user" | "deny"
+/** The only decisions that can come back from the escalation reviewer.
+ * Fully unattended: there is no ask_user branch — `collect_evidence` tells
+ * the host to gather bounded evidence itself (or re-review); `deny` covers
+ * fixed ceilings, request defects and real risk. A legacy `ask_user` word is
+ * still accepted on the wire and normalized to `collect_evidence` by the
+ * parser (it is never surfaced to a human). */
+export type EscalationReviewDecision = "allow_once" | "collect_evidence" | "deny"
 
 export type EscalationReviewPermissionScope = {
   r: boolean
@@ -21,7 +26,8 @@ export type PreviousFailedEscalation = {
   command: string
   categories: readonly string[]
   justification: string
-  decision: "ask_user" | "deny"
+  /** `ask_user` remains only in records produced by older versions. */
+  decision: "collect_evidence" | "deny" | "ask_user"
 }
 
 /** The denial an earlier classifier pass recorded for this same command.
@@ -47,6 +53,15 @@ export type EscalationReviewRequest = {
   permScope: EscalationReviewPermissionScope
   previousFailedEscalations?: readonly PreviousFailedEscalation[]
   previousDenial?: PreviousDenial
+  /** Bounded evidence attached by the host after a collect_evidence pass —
+   * small excerpts of previously uninspected subjects. Reviewers render it
+   * as untrusted data, never instructions. */
+  collectedEvidence?: readonly {
+    kind: string
+    subject: string
+    excerpt: string
+    truncated?: boolean
+  }[]
 }
 
 export interface EscalationReviewLimiter {
@@ -124,9 +139,15 @@ const ISOLATED_PYTHON_FLAGS = ["-I", "-B"]
 
 const ESCALATION_DECISIONS: readonly EscalationReviewDecision[] = [
   "allow_once",
-  "ask_user",
+  "collect_evidence",
   "deny",
 ]
+// Wire-level alias tolerated from pre-unattended reviewers: normalize it to
+// collect_evidence rather than failing the review (it must never wait for a
+// human either way).
+const LEGACY_DECISION_ALIAS: Record<string, EscalationReviewDecision> = {
+  ask_user: "collect_evidence",
+}
 
 function abortError(): EscalationReviewError {
   return new EscalationReviewError("The escalation review was aborted", "aborted")
@@ -406,32 +427,110 @@ function reviewerEnvironment(options: EscalationEnvironmentOptions): NodeJS.Proc
   return environment
 }
 
-/** Parse the only stdout protocol accepted from the Python reviewer. */
-export function parseEscalationReviewOutput(output: string): EscalationReviewDecision {
-  const content = output.trim()
-  if (ESCALATION_DECISIONS.includes(content as EscalationReviewDecision)) {
-    return content as EscalationReviewDecision
-  }
+/** Diagnostic detail a reviewer may append after the decision word
+ * (`detail:{...}` on the second line — the Jev engine's structured
+ * footprint/source report). Optional and additive: parsers ignore unknown
+ * fields, and the line is never part of the decision itself. */
+export type EscalationReviewDetail = {
+  /** Which layer produced the final word: "model" for the model mapping,
+   * "native_policy" for a deterministic gate (category names, coverage,
+   * permission ceiling, mechanism toggles), "legacy_ask_user" when a legacy
+   * ask_user word was normalized. */
+  source?: string
+  /** Intrinsic risk footprint of the escalated command (canonical names). */
+  categories?: string[]
+  /** Reviewer questions that could not be resolved from visible facts. */
+  needsEvidence?: string[]
+  policyVersion?: string
+}
 
-  if (content.startsWith("<think>")) {
+function parseDecisionWord(word: string): EscalationReviewDecision | null {
+  if (ESCALATION_DECISIONS.includes(word as EscalationReviewDecision)) {
+    return word as EscalationReviewDecision
+  }
+  return LEGACY_DECISION_ALIAS[word] ?? null
+}
+
+function parseDetailLine(line: string): EscalationReviewDetail | undefined {
+  if (!line.startsWith("detail:")) return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(line.slice("detail:".length))
+  } catch {
+    return undefined
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined
+  const obj = parsed as Record<string, unknown>
+  const detail: EscalationReviewDetail = {}
+  if (typeof obj.source === "string") detail.source = obj.source.slice(0, 80)
+  if (Array.isArray(obj.categories)) {
+    detail.categories = obj.categories.filter(
+      (item): item is string => typeof item === "string",
+    ).slice(0, 16)
+  }
+  if (Array.isArray(obj.needsEvidence)) {
+    detail.needsEvidence = obj.needsEvidence.filter(
+      (item): item is string => typeof item === "string",
+    ).slice(0, 16)
+  }
+  if (typeof obj.policyVersion === "string") {
+    detail.policyVersion = obj.policyVersion.slice(0, 80)
+  }
+  return detail
+}
+
+/** Parse the stdout protocol accepted from the Python reviewer: one decision
+ * word (optionally after a single think block) plus an optional trailing
+ * `detail:{...}` JSON line carrying the structured assessment. */
+export function parseEscalationReviewOutputDetailed(output: string): {
+  decision: EscalationReviewDecision
+  detail?: EscalationReviewDetail
+} {
+  const content = output.trim()
+  const [firstLine, ...rest] = content.split(/\r?\n/)
+  const decisionLine = firstLine.trim()
+  const direct = parseDecisionWord(decisionLine)
+  let decision: EscalationReviewDecision | null = null
+  let detail: EscalationReviewDetail | undefined
+  if (direct !== null) {
+    decision = direct
+    detail = rest.map(parseDetailLine).find((item) => item !== undefined)
+    if (decisionLine === "ask_user") {
+      detail = { ...detail, source: detail?.source ?? "legacy_ask_user" }
+    }
+  }
+  if (decision === null && content.startsWith("<think>")) {
     const close = content.indexOf("</think>", "<think>".length)
     if (close >= 0) {
       const thought = content.slice("<think>".length, close)
-      const tail = content.slice(close + "</think>".length).trim()
+      const tail = content.slice(close + "</think>".length)
+      const [tailLine, ...tailRest] = tail.trim().split(/\r?\n/)
+      const tailWord = tailLine.trim()
       // Only one complete leading block is compatible. A second block or a
       // nested marker is not a harmless formatting variation.
       if (!thought.includes("<think>") && !thought.includes("</think>")) {
-        if (ESCALATION_DECISIONS.includes(tail as EscalationReviewDecision)) {
-          return tail as EscalationReviewDecision
+        decision = parseDecisionWord(tailWord)
+        if (decision !== null) {
+          detail = tailRest.map(parseDetailLine).find((item) => item !== undefined)
+          if (tailWord === "ask_user") {
+            detail = { ...detail, source: detail?.source ?? "legacy_ask_user" }
+          }
         }
       }
     }
   }
+  if (decision === null) {
+    throw new EscalationReviewError(
+      "The escalation reviewer returned an invalid decision protocol",
+      "protocol",
+    )
+  }
+  return detail ? { decision, detail } : { decision }
+}
 
-  throw new EscalationReviewError(
-    "The escalation reviewer returned an invalid decision protocol",
-    "protocol",
-  )
+/** Parse the only stdout protocol accepted from the Python reviewer. */
+export function parseEscalationReviewOutput(output: string): EscalationReviewDecision {
+  return parseEscalationReviewOutputDetailed(output).decision
 }
 
 // These aliases make the protocol parser easy to use from small integrations.
@@ -489,8 +588,14 @@ type SpawnOptions = {
   options: EscalationReviewOptions
 }
 
-async function runPythonCandidate(config: SpawnOptions): Promise<EscalationReviewDecision> {
-  return await new Promise<EscalationReviewDecision>((resolve, reject) => {
+async function runPythonCandidate(config: SpawnOptions): Promise<{
+  decision: EscalationReviewDecision
+  detail?: EscalationReviewDetail
+}> {
+  return await new Promise<{
+    decision: EscalationReviewDecision
+    detail?: EscalationReviewDetail
+  }>((resolve, reject) => {
     let child: ChildProcessWithoutNullStreams
     try {
       child = spawn(config.executable, [...config.prefixArgs, config.auditorPath], {
@@ -599,7 +704,7 @@ async function runPythonCandidate(config: SpawnOptions): Promise<EscalationRevie
           return
         }
         try {
-          resolve(parseEscalationReviewOutput(stdout))
+          resolve(parseEscalationReviewOutputDetailed(stdout))
         } catch (error) {
           reject(
             error instanceof EscalationReviewError
@@ -643,10 +748,13 @@ async function runPythonCandidate(config: SpawnOptions): Promise<EscalationRevie
 }
 
 /** Verdict plus diagnostics for the caller's trace: which engine answered
- * and, for auto fallbacks, why Jev was skipped. */
+ * and, for auto fallbacks, why Jev was skipped. `detail` carries the
+ * reviewer's optional structured assessment (source, footprint,
+ * needsEvidence) when the child emitted the `detail:` line. */
 export type EscalationReviewResult = {
   decision: EscalationReviewDecision
   engine: EscalationReviewEngine
+  detail?: EscalationReviewDetail
   fallback_reason?: string
 }
 
@@ -695,7 +803,7 @@ export async function reviewEscalationDetailed(
     const failures: EscalationReviewError[] = []
     for (const candidate of pythonCandidates(options.python)) {
       try {
-        const decision = await runPythonCandidate({
+        const parsed = await runPythonCandidate({
           executable: candidate.executable,
           prefixArgs: candidate.prefixArgs,
           auditorPath: resolvedAuditorPath,
@@ -703,7 +811,7 @@ export async function reviewEscalationDetailed(
           timeoutMs,
           options: { ...options, engine },
         })
-        return { decision, engine }
+        return { decision: parsed.decision, detail: parsed.detail, engine }
       } catch (error) {
         const failure =
           error instanceof EscalationReviewError

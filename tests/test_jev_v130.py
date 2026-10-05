@@ -271,7 +271,7 @@ class TestNoopRefused(unittest.TestCase):
     def test_noop_override_clears_model_deny(self) -> None:
         answers = _allow_answers_like()
         answers["destructive"] = {"type": "noul", "noul": 0.95}
-        answers["decision"] = {"type": "choice",
+        answers["decision"] = {"type": "choice", "choice": "deny",
                                "probabilities": {"deny": 0.99,
                                                  "allow": 0.01}}
         answers["ap_appeal_decision"] = {
@@ -301,10 +301,10 @@ class TestAppealSoftSecretGate(unittest.TestCase):
 
     def test_soft_secret_blocks_appeal_lift(self) -> None:
         answers = _allow_answers_like()
-        answers["decision"] = {"type": "choice",
+        answers["decision"] = {"type": "choice", "choice": "deny",
                                "probabilities": {"deny": 0.8,
                                                  "allow": 0.2}}
-        answers["secret_exposure"] = {"type": "score", "score": 1.86}
+        answers["secret_exposure"] = {"type": "noul", "noul": 0.8}
         answers["ap_appeal_decision"] = {
             "type": "choice",
             "probabilities": {"deny": 0.2, "allow": 0.8}}
@@ -335,10 +335,10 @@ class TestAppealSoftSecretGate(unittest.TestCase):
 
     def test_soft_secret_own_service_still_lifts(self) -> None:
         answers = _allow_answers_like()
-        answers["decision"] = {"type": "choice",
+        answers["decision"] = {"type": "choice", "choice": "deny",
                                "probabilities": {"deny": 0.8,
                                                  "allow": 0.2}}
-        answers["secret_exposure"] = {"type": "score", "score": 1.2}
+        answers["secret_exposure"] = {"type": "noul", "noul": 0.4}
         answers["ap_appeal_decision"] = {
             "type": "choice",
             "probabilities": {"deny": 0.1, "allow": 0.9}}
@@ -364,11 +364,17 @@ class TestAppealSoftSecretGate(unittest.TestCase):
             jev.jev_call = orig
 
 
+_NEUTRAL_HEAD_CHOICES = {
+    "actor_context": "ordinary",
+    "floor": "no",
+}
+
+
 def _allow_answers_like() -> dict:
     """Fully valid answers for the current question set."""
     answers: dict = {}
     for name, q in jev.build_questions({}).items():
-        if not isinstance(name, str) or name.startswith(("ap_", "cat_")):
+        if not isinstance(name, str) or name.startswith("ap_"):
             continue
         if name == "bypassing":
             continue
@@ -378,7 +384,16 @@ def _allow_answers_like() -> dict:
         elif qtype == "score":
             answers[name] = {"type": "score", "score": 0}
         elif qtype == "choice":
-            answers[name] = {"type": "choice", "choice": "allow"}
+            labels = list(q.get("criteria", {}))
+            if name in _NEUTRAL_HEAD_CHOICES:
+                label = _NEUTRAL_HEAD_CHOICES[name]
+            else:
+                label = next(
+                    (k for k in ("none", "no", "allow", "allow_once")
+                     if k in labels),
+                    labels[0],
+                )
+            answers[name] = {"type": "choice", "choice": label}
     return answers
 
 

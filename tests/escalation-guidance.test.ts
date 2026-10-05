@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp } from "node:fs/promises"
+import { cleanupTestArtifacts as rm } from "./artifacts"
 import path from "node:path"
 import { Cause, Effect, Exit, Option, Scope, Stream } from "effect"
 import plugin from "../src/index"
@@ -107,6 +108,9 @@ async function startPlugin(extraOptions: Record<string, unknown> = {}): Promise<
       hook: () => Effect.void,
     },
     session: {
+      // Context hook registrar stub: attachSessionContextHook
+      // registers here; state notices are a no-op for these tests.
+      hook: () => Effect.void,
       get: () => Effect.succeed({ location: { directory } }),
       interrupt: () => Effect.void,
       synthetic: () => Effect.void,
@@ -263,7 +267,7 @@ describe("full escalation guidance: once per session per context cycle", () => {
     expect(first).toContain("resubmit the command once")
     expect(first).toContain("independent reviewer")
     expect(first).toContain("allow_once")
-    expect(first).toContain("/bypass")
+    expect(first).toContain("collect_evidence")
     // The guide explains an ask_user/deny outcome closes the category route:
     // a similar command must go to the user, not back to the reviewer.
     expect(first).toContain("cannot be escalated again in this session")
@@ -295,7 +299,7 @@ describe("permission.write hard refuse", () => {
     const denied = await runBefore(h, "s1", WRITE_SHAPED)
     expect(denied).toMatch(/Blocked by static classifier/)
     expect(denied).toContain("permission ceiling")
-    expect(denied).toContain("/perm +w or /perm rw")
+    expect(denied).toContain("permission surface changes")
     // Neither the escalation suffix nor the full guide is attached.
     expect(denied).not.toContain("ask for escalation")
     expect(denied).not.toContain(ESCALATION_MARKER)
@@ -328,7 +332,7 @@ describe("escalation request terminal endings", () => {
     expect(blocked).toContain("dynamic review unavailable or invalid review configuration")
     // Internal config field names are folded out of the agent-facing reason.
     expect(blocked).not.toContain("dynamicReview.")
-    expect(blocked).toContain("/bypass host")
+    expect(blocked).toContain("armed bypass for categories host")
     expect(blocked).not.toContain("ask for escalation")
   })
 })

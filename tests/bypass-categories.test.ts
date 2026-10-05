@@ -28,23 +28,27 @@ describe("canonical bypass categories", () => {
 })
 
 describe("conjunctive rule requirements", () => {
-  test("credential destruction needs filesystem and secret", () => {
-    expect(ruleRequiredCategories("data.critical-delete")).toEqual(["filesystem", "secret"])
-    expect(ruleBypassed("data.critical-delete", new Set(["secret"]))).toBe(false)
+  test("credential destruction is owned by secret alone (policyVersion 1.5)", () => {
+    // Deleting a credential object is a secret judgment: the object's own
+    // filesystem mechanics are not a second owner.
+    expect(ruleRequiredCategories("data.critical-delete")).toEqual(["secret"])
     expect(ruleBypassed("data.critical-delete", new Set(["filesystem"]))).toBe(false)
+    expect(ruleBypassed("data.critical-delete", new Set(["secret"]))).toBe(true)
     expect(ruleBypassed("data.critical-delete", new Set(["filesystem", "secret"]))).toBe(true)
   })
 
   test("credential exfiltration needs secret and network", () => {
+    // Genuinely independent exfiltration keeps both owners: a credential
+    // leaving the host is a secret loss AND a network egress.
     expect(ruleBypassed("exfiltration.dns", new Set(["secret"]))).toBe(false)
     expect(ruleBypassed("exfiltration.dns", new Set(["network"]))).toBe(false)
     expect(ruleBypassed("exfiltration.dns", new Set(["secret", "network"]))).toBe(true)
   })
 
-  test("remote pipe needs network and remote", () => {
+  test("remote pipe is owned by remote alone (fetch is its intrinsic channel)", () => {
+    expect(ruleRequiredCategories("execution.remote-pipe")).toEqual(["remote"])
     expect(ruleBypassed("execution.remote-pipe", new Set(["network"]))).toBe(false)
-    expect(ruleBypassed("execution.remote-pipe", new Set(["remote"]))).toBe(false)
-    expect(ruleBypassed("execution.remote-pipe", new Set(["network", "remote"]))).toBe(true)
+    expect(ruleBypassed("execution.remote-pipe", new Set(["remote"]))).toBe(true)
   })
 
   test("indirection is independent from filesystem", () => {

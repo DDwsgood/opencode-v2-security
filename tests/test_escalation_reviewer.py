@@ -115,8 +115,8 @@ class EscalationReviewerTests(unittest.TestCase):
         )
         # System prompt: aligned floor, allow_once ceiling, failed-decision scope.
         self.assertIn("never raises the session's read/write/execute permission ceiling", system)
-        self.assertIn("permScope.w is false, return ask_user", system)
-        self.assertIn("previousFailedEscalations lists only ask_user and deny outcomes", system)
+        self.assertIn("permScope.w is false, return deny", system)
+        self.assertIn("previousFailedEscalations lists only collect_evidence and deny outcomes", system)
         self.assertIn("reasonable task-related work, including implied steps", system)
         self.assertIn("last five user messages", system)
         self.assertNotIn("literal shell escape", system)
@@ -145,6 +145,14 @@ class EscalationReviewerTests(unittest.TestCase):
 
     def test_decision_parser_is_strict(self) -> None:
         self.assertEqual(reviewer.parse_decision("allow_once"), "allow_once")
+        self.assertEqual(reviewer.parse_decision("collect_evidence"), "collect_evidence")
+        # The legacy ask_user word normalizes to the unattended evidence
+        # route instead of failing the review.
+        self.assertEqual(reviewer.parse_decision("ask_user"), "collect_evidence")
+        self.assertEqual(
+            reviewer.parse_decision("<think>reason</think>\nask_user"),
+            "collect_evidence",
+        )
         self.assertEqual(reviewer.parse_decision(" <think>reason</think>\n deny "), "deny")
         for content in (
             "allow_once because",
@@ -225,11 +233,13 @@ class DeterministicGateTests(unittest.TestCase):
             review = reviewer.validate_request(req)
             self.assertEqual(reviewer.deterministic_decision(review), "deny")
 
-    def test_unknown_names_route_to_ask_user(self) -> None:
+    def test_unknown_names_deny(self) -> None:
+        # No human can resolve an unknown name: the request is defective and
+        # denied deterministically before the model is consulted.
         req = sample_request()
         req["categories"] = ["os", "secret"]
         review = reviewer.validate_request(req)
-        self.assertEqual(reviewer.deterministic_decision(review), "ask_user")
+        self.assertEqual(reviewer.deterministic_decision(review), "deny")
 
     def test_canonical_and_sandbox_names_still_reach_the_model(self) -> None:
         # sandbox stays a grantable layer category; its justification is judged
@@ -245,7 +255,7 @@ class DeterministicGateTests(unittest.TestCase):
         req["previousDenial"] = {"command": req["command"], "riskCategories": ["secret", "filesystem"]}
         review = reviewer.validate_request(req)
         self.assertTrue(reviewer.coverage_missing(review))
-        self.assertEqual(reviewer.deterministic_decision(review), "ask_user")
+        self.assertEqual(reviewer.deterministic_decision(review), "collect_evidence")
         covered = sample_request()
         covered["categories"] = ["privilege", "host", "sandbox", "secret", "filesystem"]
         covered["previousDenial"] = {"command": covered["command"], "riskCategories": ["secret", "filesystem"]}
@@ -263,9 +273,9 @@ class DeterministicGateTests(unittest.TestCase):
         req = sample_request()
         req["previousDenial"] = {"command": req["command"], "riskCategories": ["secret"]}
         review = reviewer.validate_request(req)
-        self.assertEqual(reviewer.finalize_decision(review, "allow_once"), "ask_user")
+        self.assertEqual(reviewer.finalize_decision(review, "allow_once"), "collect_evidence")
         self.assertEqual(reviewer.finalize_decision(review, "deny"), "deny")
-        self.assertEqual(reviewer.finalize_decision(review, "ask_user"), "ask_user")
+        self.assertEqual(reviewer.finalize_decision(review, "collect_evidence"), "collect_evidence")
 
     def test_main_skips_the_model_when_coverage_missing(self) -> None:
         req = sample_request()
@@ -281,7 +291,10 @@ class DeterministicGateTests(unittest.TestCase):
             redirect_stdout(io.StringIO()) as out,
         ):
             self.assertEqual(reviewer.main(), 0)
-        self.assertEqual(out.getvalue().strip(), "ask_user")
+        lines = out.getvalue().strip().splitlines()
+        self.assertEqual(lines[0], "collect_evidence")
+        self.assertTrue(lines[1].startswith("detail:"))
+        self.assertIn('"coverage_missing"', lines[1])
 
     def test_main_skips_the_model_for_mechanism_tampering(self) -> None:
         req = sample_request()
@@ -297,7 +310,9 @@ class DeterministicGateTests(unittest.TestCase):
             redirect_stdout(io.StringIO()) as out,
         ):
             self.assertEqual(reviewer.main(), 0)
-        self.assertEqual(out.getvalue().strip(), "deny")
+        lines = out.getvalue().strip().splitlines()
+        self.assertEqual(lines[0], "deny")
+        self.assertTrue(lines[1].startswith("detail:"))
 
 
 class PromptContentTests(unittest.TestCase):
@@ -312,7 +327,7 @@ class PromptContentTests(unittest.TestCase):
         system = reviewer.SYSTEM_PROMPT
         # Coverage rule.
         self.assertIn("requested categories to cover every riskCategory", system)
-        self.assertIn("prefer ask_user over allow_once", system)
+        self.assertIn("prefer collect_evidence over allow_once", system)
         # Write-vs-execute clause.
         self.assertIn("merely writing or printing fixtures", system)
         self.assertIn("command substitutions or subsequent execution", system)

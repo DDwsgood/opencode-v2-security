@@ -35,11 +35,11 @@ class PolicyTests(unittest.TestCase):
             self.assertNotIn('"reason"',prompt,(policy,bypass))
             if bypass:
                 self.assertTrue(prompt.startswith(a.ARMED_CATEGORY_REMINDER),(policy,bypass))
-                self.assertIn('cannot be selected as a risk category',prompt,(policy,bypass))
+                self.assertIn('checks are disabled for this review',prompt,(policy,bypass))
                 self.assertIn(', '.join(bypass),prompt,(policy,bypass))
             else:
                 self.assertNotIn(a.ARMED_CATEGORY_REMINDER,prompt,(policy,bypass))
-                self.assertNotIn('cannot be selected as a risk category',prompt,(policy,bypass))
+                self.assertNotIn('checks are disabled for this review',prompt,(policy,bypass))
             self.assertIn('Unconditional safety floor',prompt)
             self.assertIn('normal authentication, not credential exfiltration',prompt)
 
@@ -142,18 +142,21 @@ class PromptWordingTests(unittest.TestCase):
 
 class ResultContractTests(unittest.TestCase):
     # stdout contract: reason is gone; categories/secondary_categories carry
-    # the risk families. HARD keeps its bypassing boolean.
+    # the intrinsic footprint (ALLOW keeps them); `assessment` is synthesized
+    # and needs_evidence is an optional list. HARD keeps bypassing.
     def test_loose_result_schema(self):
         r=a._validated_result({'decision':'DENY','categories':['secret','network'],'secondary_categories':['remote']},'LOOSE')
-        self.assertEqual(set(r),{'decision','categories','secondary_categories'})
+        self.assertEqual(set(r),{'decision','categories','secondary_categories','assessment'})
         self.assertEqual(r['categories'],['secret','network'])
         self.assertEqual(r['secondary_categories'],['remote'])
+        self.assertEqual(r['assessment']['decisionSource'],'model')
+        self.assertEqual(r['assessment']['categories'],['secret','network'])
         with self.assertRaisesRegex(ValueError,'unexpected fields'):
             a._validated_result({'decision':'DENY','reason':'reads keys','categories':[],'secondary_categories':[]},'LOOSE')
 
     def test_hard_result_schema_keeps_bypassing(self):
         r=a._validated_result({'decision':'DENY','bypassing':True,'categories':['filesystem'],'secondary_categories':[]},'HARD')
-        self.assertEqual(set(r),{'decision','bypassing','categories','secondary_categories'})
+        self.assertEqual(set(r),{'decision','bypassing','categories','secondary_categories','assessment'})
         self.assertTrue(r['bypassing'])
         with self.assertRaisesRegex(ValueError,'unexpected fields'):
             a._validated_result({'decision':'DENY','bypassing':True,'categories':['filesystem']},'HARD')
@@ -173,14 +176,24 @@ class ResultContractTests(unittest.TestCase):
                 a._validated_result({'decision':'DENY','categories':[bad],'secondary_categories':[]},'LOOSE')
         with self.assertRaisesRegex(ValueError,'duplicate categories entry'):
             a._validated_result({'decision':'DENY','categories':['secret','secret'],'secondary_categories':[]},'LOOSE')
-        with self.assertRaisesRegex(ValueError,'too many categories'):
-            a._validated_result({'decision':'DENY','categories':['filesystem','host','privilege','secret'],'secondary_categories':[]},'LOOSE')
+        # The cap is the full canonical set: a complete footprint must fit.
+        r=a._validated_result({'decision':'DENY','categories':list(a.RISK_CATEGORY_VALUES),'secondary_categories':[]},'LOOSE')
+        self.assertEqual(len(r['categories']),len(a.RISK_CATEGORY_VALUES))
 
-    def test_allow_with_any_category_is_protocol_error(self):
-        with self.assertRaisesRegex(ValueError,'categories for ALLOW'):
-            a._validated_result({'decision':'ALLOW','categories':['network'],'secondary_categories':[]},'LOOSE')
-        with self.assertRaisesRegex(ValueError,'secondary_categories for ALLOW'):
-            a._validated_result({'decision':'ALLOW','categories':[],'secondary_categories':['host']},'LOOSE')
+    def test_allow_keeps_the_intrinsic_footprint(self):
+        # Categories on ALLOW are the intrinsic footprint — reported, not an
+        # error. needs_evidence rides along as optional evidence gaps.
+        r=a._validated_result({'decision':'ALLOW','categories':['network'],'secondary_categories':['host']},'LOOSE')
+        self.assertEqual(r['categories'],['network'])
+        self.assertEqual(r['secondary_categories'],['host'])
+        self.assertEqual(r['assessment']['categories'],['network'])
+        r=a._validated_result({'decision':'ALLOW','categories':[],'secondary_categories':[],
+                               'needs_evidence':['local_script_body']},'LOOSE')
+        self.assertEqual(r['assessment']['needsEvidence'],['local_script_body'])
+        self.assertEqual(r['needs_evidence'],['local_script_body'])
+        with self.assertRaisesRegex(ValueError,'needs_evidence'):
+            a._validated_result({'decision':'ALLOW','categories':[],'secondary_categories':[],
+                                 'needs_evidence':'script'},'LOOSE')
 
     def test_secondary_overlap_with_primary_is_normalized(self):
         r=a._validated_result({'decision':'DENY','categories':['secret'],'secondary_categories':['secret','host']},'LOOSE')
@@ -201,16 +214,16 @@ class CategoryPromptTests(unittest.TestCase):
     def test_schema_instruction_asks_for_families_not_reason(self):
         with patch.object(a,'POLICY','LOOSE'):
             prompt=a._build_system_prompt({})
-        self.assertIn('1-3 effect families',prompt)
-        self.assertIn('truly unclassifiable',prompt)
+        self.assertIn('effect families',prompt)
         self.assertIn('worth considering but not primary',prompt)
+        self.assertIn('needs_evidence',prompt)
         self.assertNotIn('"reason"',prompt)
 
     def test_armed_rule_names_the_armed_categories(self):
         with patch.object(a,'POLICY','LOOSE'):
             armed=a._build_system_prompt({'userBypass':['filesystem','secret']})
         self.assertIn('already armed these categories: filesystem, secret',armed)
-        self.assertIn('If the only categories you would choose are armed, output ALLOW',armed)
+        self.assertIn('If every risk family present is armed, output ALLOW',armed)
         self.assertIn('safety floor always remains DENY',armed)
 
 class WriteVsExecuteTests(unittest.TestCase):

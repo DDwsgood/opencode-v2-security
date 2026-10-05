@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { cleanupTestArtifacts as rm } from "./artifacts"
 import { classifyShellCommand, type Strictness } from "../src/security/classifier"
 
 // Regression tests for the post-audit taxonomy fixes (round 1: T1–T6,
@@ -23,7 +24,6 @@ beforeAll(async () => {
   await writeFile(path.join(tempArea, "id_rsa"), "PRIVATE KEY\n")
 })
 afterAll(async () => {
-  const { rm } = await import("node:fs/promises")
   await rm(root, { recursive: true, force: true })
   await rm(tempArea, { recursive: true, force: true })
 })

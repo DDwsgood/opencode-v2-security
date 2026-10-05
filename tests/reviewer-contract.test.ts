@@ -1,7 +1,8 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test"
 import { createServer, type Server } from "node:http"
 import type { AddressInfo } from "node:net"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, writeFile } from "node:fs/promises"
+import { cleanupTestArtifacts as rm } from "./artifacts"
 import path from "node:path"
 import { isValidReviewResult, rulesHintCategories } from "../src/index"
 import {

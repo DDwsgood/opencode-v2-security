@@ -7,16 +7,48 @@ import { STATIC_BYPASS_CATEGORIES } from "../categories"
 
 export type CloudReviewDecision = "ALLOW" | "DENY"
 
+/** One billed risk family in the structured assessment: which category, what
+ * semantic kind produced it (the reviewer's head/question id), the effect
+ * domain where one applies, and the evidence string the reviewer cited. */
+export type RiskReason = {
+  category: string
+  kind: string
+  domain?: string
+  evidence: string
+}
+
+/** The reviewer's full structured assessment, carried on every verdict —
+ * including ALLOW. `categories` is the intrinsic risk footprint: present
+ * risk families, independently of whether the command was authorized this
+ * time. `decisionSource` names the layer that produced the final verdict so
+ * a native floor/policy veto is never reported as model agreement:
+ * model_allow / model_rules / model_floor / native_floor / native_static /
+ * native_policy / appeal_override / noop_refused for Jev; "model" for the
+ * OpenAI auditor's single-word verdicts. */
+export type StructuredAssessment = {
+  categories: string[]
+  strongReasons: RiskReason[]
+  needsEvidence: string[]
+  rawDecision?: { choice?: string; p_deny?: number }
+  decisionSource: string
+  firedRules?: string[]
+  context?: { actor?: string; armed?: string[] }
+  floor?: string
+  policyVersion?: string
+  version?: string
+}
+
 /** Review engines understood by this module. "openai" is the OpenAI-compatible
  * tool-calling auditor (auditor.py); "jev" is the structured systemone
  * reviewer (jev-reviewer.py). */
 export type ReviewEngine = "jev" | "openai"
 
 export type CloudReviewResult = {
-  decision: CloudReviewDecision
-  /** Risk families the denial judged (canonical bypass-category names). A
-   * DENY carries at least one entry — parsers fall back to ["indirection"]
-   * when the reviewer reports none. */
+  decision: CloudReviewDecision | "collect_evidence"
+  /** Risk families the reviewer's footprint judged present (canonical
+   * bypass-category names). Denials keep their categories; an ALLOW also
+   * reports its intrinsic footprint — approval is a separate layer and
+   * never erases what the command does. */
   categories: string[]
   /** Lower-confidence risk families reported alongside `categories`. */
   secondary_categories?: string[]
@@ -25,6 +57,10 @@ export type CloudReviewResult = {
   reason?: string
   /** Present only for the strict policy, which performs bypass detection. */
   bypassing?: boolean
+  /** Full structured assessment (strong reasons, evidence gaps, decision
+   * provenance). Always populated — synthesized for engines that do not
+   * emit one natively. */
+  assessment: StructuredAssessment
   /** Internal: which engine produced this verdict. Diagnostics only — never
    * part of the wire contract or agent-facing text. */
   engine?: ReviewEngine
@@ -77,6 +113,15 @@ export type CloudReviewRequest = {
   /** Session rwx ceiling. When `w` is absent the session is read-only and the
    * auditor system prompt gains the SESSION PERMISSION NOTICE advisory. */
   permScope?: { r: boolean; w: boolean; x: boolean }
+  /** Bounded evidence attached by the host after a collect_evidence pass —
+   * small excerpts of previously uninspected subjects (script bodies,
+   * directory listings). Reviewers render it as untrusted data. */
+  collectedEvidence?: Array<{
+    kind: string
+    subject: string
+    excerpt: string
+    truncated?: boolean
+  }>
 }
 
 export type JevReviewConfig = {
@@ -381,15 +426,20 @@ function collectTopLevelJsonKeys(text: string): string[] | null {
   return keys
 }
 
-// The 1.1.0 reviewer output contract: {decision, categories,
-// secondary_categories?} (+bypassing under HARD). A legacy `reason` string is
-// tolerated but no longer required — a DENY's categories drive the hint.
+// The reviewer output contract: {decision, categories, secondary_categories?,
+// assessment?} (+bypassing under HARD). A legacy `reason` string is tolerated
+// but no longer required — a DENY's categories drive the hint. `assessment`
+// is the structured footprint/source report; `needs_evidence` is a tolerated
+// legacy alias whose entries are folded into assessment.needsEvidence.
 const ALLOWED_RESULT_KEYS = new Set([
   "decision",
   "categories",
   "secondary_categories",
   "bypassing",
   "reason",
+  "assessment",
+  "needs_evidence",
+  "evidence_requests",
 ])
 
 // Categories a reviewer may report: the seven static names plus the sandbox
@@ -409,6 +459,81 @@ function parseCategoryList(value: unknown): string[] | undefined {
   return out
 }
 
+const VALID_DECISION_SOURCES = new Set([
+  "model", "model_allow", "model_deny", "model_rules", "model_floor",
+  "native_floor", "native_static", "native_policy",
+  "appeal_override", "noop_refused", "legacy_ask_user",
+  "evidence_needed", "evidence_limited",
+])
+
+function parseStringList(value: unknown, max = 16, maxLen = 160): string[] {
+  if (!Array.isArray(value)) return []
+  const out: string[] = []
+  for (const item of value) {
+    if (typeof item === "string" && item.trim() && !out.includes(item)) {
+      out.push(item.slice(0, maxLen))
+    }
+    if (out.length >= max) break
+  }
+  return out
+}
+
+/** Sanitize a reviewer-emitted `assessment` object. Unknown/malformed fields
+ * degrade to empty/absent rather than failing the review — the assessment is
+ * a report, not a gate — but a present-but-corrupt object never fabricates
+ * evidence either. */
+function parseAssessment(value: unknown): StructuredAssessment | undefined {
+  if (value === undefined) return undefined
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  const obj = value as Record<string, unknown>
+  const strongReasons: RiskReason[] = []
+  if (Array.isArray(obj.strongReasons)) {
+    for (const entry of obj.strongReasons.slice(0, 32)) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue
+      const e = entry as Record<string, unknown>
+      if (typeof e.category !== "string" || typeof e.kind !== "string") continue
+      strongReasons.push({
+        category: e.category.slice(0, 80),
+        kind: e.kind.slice(0, 80),
+        domain: typeof e.domain === "string" ? e.domain.slice(0, 40) : undefined,
+        evidence: typeof e.evidence === "string" ? e.evidence.slice(0, 300) : "",
+      })
+    }
+  }
+  const raw = obj.rawDecision
+  const assessment: StructuredAssessment = {
+    categories: parseStringList(obj.categories),
+    strongReasons,
+    needsEvidence: parseStringList(obj.needsEvidence),
+    decisionSource:
+      typeof obj.decisionSource === "string" && VALID_DECISION_SOURCES.has(obj.decisionSource)
+        ? obj.decisionSource
+        : "model",
+  }
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const r = raw as Record<string, unknown>
+    assessment.rawDecision = {
+      choice: typeof r.choice === "string" ? r.choice.slice(0, 40) : undefined,
+      p_deny:
+        typeof r.p_deny === "number" && Number.isFinite(r.p_deny) ? r.p_deny : undefined,
+    }
+  }
+  if (Array.isArray(obj.firedRules)) {
+    assessment.firedRules = parseStringList(obj.firedRules, 16, 80)
+  }
+  if (obj.context && typeof obj.context === "object" && !Array.isArray(obj.context)) {
+    const c = obj.context as Record<string, unknown>
+    assessment.context = {
+      actor: typeof c.actor === "string" ? c.actor.slice(0, 40) : undefined,
+      armed: Array.isArray(c.armed) ? parseStringList(c.armed, 16, 40) : undefined,
+    }
+  }
+  if (typeof obj.floor === "string") assessment.floor = obj.floor.slice(0, 20)
+  if (typeof obj.policyVersion === "string") assessment.policyVersion = obj.policyVersion.slice(0, 80)
+  if (typeof obj.version === "string") assessment.version = obj.version.slice(0, 40)
+  return assessment
+}
+
 function parseReviewResult(stdout: string, policy: "LOOSE" | "HARD"): CloudReviewResult {
   if (policy !== "LOOSE" && policy !== "HARD") throw new Error("Invalid review policy")
   const trimmed = stdout.trim()
@@ -425,7 +550,11 @@ function parseReviewResult(stdout: string, policy: "LOOSE" | "HARD"): CloudRevie
       throw new Error("The auditor returned unexpected fields")
     }
   }
-  if (parsed.decision !== "ALLOW" && parsed.decision !== "DENY") {
+  if (
+    parsed.decision !== "ALLOW" &&
+    parsed.decision !== "DENY" &&
+    parsed.decision !== "collect_evidence"
+  ) {
     throw new Error("The auditor returned an invalid decision")
   }
   if (parsed.categories !== undefined && !Array.isArray(parsed.categories)) {
@@ -434,13 +563,21 @@ function parseReviewResult(stdout: string, policy: "LOOSE" | "HARD"): CloudRevie
   if (parsed.secondary_categories !== undefined && !Array.isArray(parsed.secondary_categories)) {
     throw new Error("The auditor returned a non-array secondary_categories")
   }
+  if (parsed.evidence_requests !== undefined && !Array.isArray(parsed.evidence_requests)) {
+    throw new Error("The auditor returned a non-array evidence_requests")
+  }
   if (parsed.reason !== undefined && typeof parsed.reason !== "string") {
     throw new Error("The auditor returned a non-string reason")
   }
   if (policy === "HARD" && typeof parsed.bypassing !== "boolean") {
     throw new Error("The auditor returned a non-boolean bypassing")
   }
-  const decision = parsed.decision as CloudReviewDecision
+  const assessment = parseAssessment(parsed.assessment)
+  const topLevelNeeds = parseStringList(parsed.needs_evidence)
+  if (assessment === undefined && parsed.assessment !== undefined) {
+    throw new Error("The auditor returned a non-object assessment")
+  }
+  const decision = parsed.decision as CloudReviewResult["decision"]
   // Invalid/unknown category names are stripped rather than failing the
   // review: the reviewer is an external model and a bad hint must degrade
   // to "no hint", not to a fail-closed protocol error.
@@ -451,8 +588,23 @@ function parseReviewResult(stdout: string, policy: "LOOSE" | "HARD"): CloudRevie
   // A DENY with no category signal still needs a hint family — indirection
   // is the conservative fallback (the reviewer did not trust what it saw).
   if (decision === "DENY" && categories.length === 0) categories = ["indirection"]
-  if (decision === "ALLOW") categories = []
-  const result: CloudReviewResult = { decision, categories }
+  // The footprint is intrinsic: an ALLOW keeps the categories it reported.
+  // Approval and presence are separate layers — never cleared here.
+  const result: CloudReviewResult = {
+    decision,
+    categories,
+    assessment: assessment ?? {
+      categories: [...categories],
+      strongReasons: [],
+      needsEvidence: [],
+      decisionSource: "model",
+    },
+  }
+  for (const item of topLevelNeeds) {
+    if (!result.assessment.needsEvidence.includes(item)) {
+      result.assessment.needsEvidence.push(item)
+    }
+  }
   if (secondary.length > 0) result.secondary_categories = secondary
   if (typeof parsed.reason === "string" && decision === "DENY") {
     const reason = parsed.reason.trim().replace(/\s+/g, " ").slice(0, 80)

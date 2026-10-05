@@ -30,11 +30,13 @@ describe("privilege/host taxonomy split", () => {
     expect(ruleBypassed("infrastructure.privileged-container", armed("privilege"))).toBe(true)
   })
 
-  test("sensitive-mode is conjunctive privilege+secret", () => {
-    expect(ruleRequiredCategories("permissions.sensitive-mode")).toEqual(["privilege", "secret"])
+  test("sensitive-mode is owned by secret alone (policyVersion 1.5)", () => {
+    // Weakening a credential's own protection is a secret judgment, not a
+    // privilege crossing — the object's mode bits are its own protection,
+    // not a second owner.
+    expect(ruleRequiredCategories("permissions.sensitive-mode")).toEqual(["secret"])
     expect(ruleBypassed("permissions.sensitive-mode", armed("privilege"))).toBe(false)
-    expect(ruleBypassed("permissions.sensitive-mode", armed("secret"))).toBe(false)
-    expect(ruleBypassed("permissions.sensitive-mode", armed("privilege", "secret"))).toBe(true)
+    expect(ruleBypassed("permissions.sensitive-mode", armed("secret"))).toBe(true)
   })
 
   test("the privilege context trigger follows the privilege category", () => {
@@ -140,10 +142,12 @@ describe("the floor is unchanged by the remap", () => {
     expect(TERMINAL_UNBYPASSABLE.has("system.shutdown")).toBe(false)
   })
 
-  test("conjunctive semantics survive on unchanged rules", () => {
-    expect(ruleRequiredCategories("data.critical-delete")).toEqual(["filesystem", "secret"])
+  test("owner semantics on remapped rules (policyVersion 1.5)", () => {
+    // Credential objects bill secret only; remote ops bill remote only;
+    // genuinely independent exfiltration keeps both owners.
+    expect(ruleRequiredCategories("data.critical-delete")).toEqual(["secret"])
     expect(ruleRequiredCategories("exfiltration.dns")).toEqual(["secret", "network"])
-    expect(ruleRequiredCategories("execution.remote-pipe")).toEqual(["network", "remote"])
-    expect(ruleRequiredCategories("network.destructive-api")).toEqual(["network", "remote"])
+    expect(ruleRequiredCategories("execution.remote-pipe")).toEqual(["remote"])
+    expect(ruleRequiredCategories("network.destructive-api")).toEqual(["remote"])
   })
 })

@@ -1,7 +1,8 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test"
 import { createServer, type Server } from "node:http"
 import type { AddressInfo } from "node:net"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp } from "node:fs/promises"
+import { cleanupTestArtifacts as rm } from "./artifacts"
 import path from "node:path"
 import { Cause, Effect, Exit, Option, Scope, Stream } from "effect"
 import plugin from "../src/index"
@@ -147,6 +148,9 @@ async function startPlugin(
     },
     permission: { hook: () => Effect.void },
     session: {
+      // Context hook registrar stub: attachSessionContextHook
+      // registers here; state notices are a no-op for these tests.
+      hook: () => Effect.void,
       get: () => Effect.succeed({ location: { directory } }),
       interrupt: () => Effect.void,
       context: () =>

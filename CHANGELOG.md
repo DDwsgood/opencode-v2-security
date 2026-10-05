@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.5.0 (2026-10-06)
+
+- Deploy the owner-based JEV classification strategy selected by development
+  experiments and an independent frozen validation set. Keep external bypass
+  category names and existing configuration compatible; remove same-owner
+  filesystem/privilege dependency double counting and weak-secondary coverage.
+- Make authorization unattended: `allow_once`, automatic evidence collection,
+  or refusal. Preserve the actual selected intent; an unselected option's
+  probability or a present-but-covered risk is not a new rejection vote.
+- Bind one-call approval to the command's assessment and relevant evidence.
+  Reuse that report after approval instead of making a fresh ordinary dynamic
+  review invent another category. Keep native ceilings, floors, routing and
+  genuine evidence changes distinct from the model's decision.
+- Fix `/perm` and `/bypass` reminders waking idle sessions. Inject current
+  state through the model context hook; permission changes and lease expiry
+  no longer admit synthetic session inputs or retain stale authorization text.
+- Extract assessment/notification responsibilities into focused modules and
+  retain targeted regressions. Accept legacy `fail_ask` JSON as `fail_close`
+  without exposing a human-confirmation mode or modifying user configuration.
+
 ## 1.4.1 (2026-10-03)
 
 - Fix the actual RPC contract regression behind missing `/bypass off` and

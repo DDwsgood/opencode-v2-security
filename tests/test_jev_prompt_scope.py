@@ -112,7 +112,18 @@ class TestQuestionScope(unittest.TestCase):
     def test_every_question_branch_receives_execution_scope(self):
         for request in ({}, {"userBypass": ["secret", "network"]}):
             questions = jev.build_questions(request)
-            self.assertEqual(len(questions), 23)
+            # v1.5.0 slim bank: decision + bypassing + 9 risk_heads = 11.
+            self.assertEqual(len(questions), 11)
+            self.assertEqual(
+                set(questions),
+                {"decision", "bypassing"} | set(jev.risk_heads.HEAD_NAMES))
+            # Retired wire judges and speculative appeals are absent: they
+            # never fed the verdict and only consumed tokens.
+            for retired in ("harm_score", "secret_exposure",
+                            "privilege_or_kernel", "destructive"):
+                self.assertNotIn(retired, questions)
+            self.assertFalse(
+                any(name.startswith("ap_") for name in questions))
             for name, question in questions.items():
                 if question["type"] == "noul":
                     branches = [question["instructions"]["criteria"]]
@@ -135,15 +146,26 @@ class TestQuestionScope(unittest.TestCase):
         self.assertIn("/v1/systemone", jev.EXECUTION_BOUNDARY)
         self.assertIn("/execute", jev.EXECUTION_BOUNDARY)
         self.assertIn("Function/field names", jev.EXECUTION_BOUNDARY)
-        self.assertIn("No authorization relaxes", jev.build_questions({
-            "userBypass": ["secret", "network"]
-        })["safety_floor"]["instructions"]["criteria"])
+        # The floor head is verbatim and never relax-exempted by armed grants;
+        # the armed appeal recheck carries the unconditional-floor wording.
+        armed = jev.build_questions({"userBypass": ["secret", "network"]})
+        unarmed = jev.build_questions({})
+        self.assertEqual(armed["floor"], unarmed["floor"])
+        # ap_* questions are off the wire (v1.5.0); the retired helper still
+        # builds the armed floor recheck with unconditional-floor wording.
+        recheck = jev.build_appeal_questions(
+            ["decision"], {"secret", "network"})["floor_recheck"]
+        self.assertIn("No authorization relaxes",
+                      recheck["instructions"]["criteria"])
 
     def test_inert_payload_does_not_exempt_actual_protected_overwrites(self):
+        # Retired wire questions still exist as constants; the write-scope
+        # contract text stays embedded in the decision question instead.
         questions = jev.build_questions({})
         self.assertIn(jev.ACTUAL_WRITE_SCOPE,
-                      questions["destructive"]["instructions"]["criteria"])
-        self.assertIn("fake or invalid", questions["secret_exposure"]["criteria"][2])
+                      questions["decision"]["criteria"]["deny"])
+        self.assertIn("fake or invalid",
+                      jev.V47_SECRET_EXPOSURE["instructions"]["criteria"])
         self.assertIn("directory evidence", jev.ACTUAL_WRITE_SCOPE)
 
     def test_stored_data_is_not_an_allow_shortcut(self):

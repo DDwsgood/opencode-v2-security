@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp } from "node:fs/promises"
+import { cleanupTestArtifacts as rm } from "./artifacts"
 import path from "node:path"
 import { Cause, Effect, Exit, Option, Scope, Stream } from "effect"
 import plugin from "../src/index"
@@ -111,6 +112,9 @@ async function startPlugin(parents: Record<string, string> = {}): Promise<Harnes
       hook: () => Effect.void,
     },
     session: {
+      // Context hook registrar stub: attachSessionContextHook
+      // registers here; state notices are a no-op for these tests.
+      hook: () => Effect.void,
       get: (input: { sessionID: string }) =>
         Effect.succeed({ location: { directory }, parentID: parents[input.sessionID] }),
       interrupt: () => Effect.void,

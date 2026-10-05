@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises"
+import { cleanupTestArtifacts as rm } from "./artifacts"
 import os from "node:os"
 import path from "node:path"
 import { classifyShellCommand, type Strictness } from "../src/security/classifier"

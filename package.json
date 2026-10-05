@@ -1,7 +1,7 @@
 {
   "name": "opencode-v2-security",
-  "version": "1.4.1",
-  "description": "Execution-boundary security plugin for OpenCode (v2 plugin API): static + dynamic shell-command classification, bypass leases, and a session read/write permission ceiling.",
+  "version": "1.5.0",
+  "description": "Autonomous execution-boundary security for OpenCode V2: scoped assessments, one-call authorization, bypass leases, and session read/write permission ceilings.",
   "type": "module",
   "repository": {
     "type": "git",
@@ -19,6 +19,7 @@
     }
   },
   "files": [
+    "RESEARCH-v1.5.0.md",
     "JEV-EXECUTION-SCOPE-PROMPT.md",
     "RESEARCH-JEV-PAYLOAD-20261003.md",
     "research/jev-payload-20261003",

@@ -195,7 +195,10 @@ function makeHarness() {
         return () => set.delete(handler)
       },
       session: {
-        get: (sessionID: string) => sessions.get(sessionID),
+        // Context hook registrar stub: attachSessionContextHook
+      // registers here; state notices are a no-op for these tests.
+      hook: () => Effect.void,
+      get: (sessionID: string) => sessions.get(sessionID),
         family: (sessionID: string) => families.get(sessionID) ?? [],
       },
     },

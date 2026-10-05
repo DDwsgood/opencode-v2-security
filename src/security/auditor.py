@@ -114,6 +114,7 @@ OPTIONAL_FIELDS = (
     "userBypass",
     "environment",
     "permScope",
+    "collectedEvidence",
 )
 ALLOWED_FIELDS = set(REQUIRED_FIELDS) | set(OPTIONAL_FIELDS)
 
@@ -133,8 +134,15 @@ USER_BYPASS_VALUES = ("filesystem", "host", "privilege", "secret", "network", "r
 # (`dynamic`, `sandbox`, `slow`) are static-side concepts; the model can never
 # emit them, and any attempt is a protocol error.
 RISK_CATEGORY_VALUES = USER_BYPASS_VALUES
-MAX_RESULT_CATEGORIES = 3
+# All seven risk families can legitimately co-occur in one footprint (e.g.
+# secret bytes copied then sent off host is secret+network); capping lower
+# silently drops families.
+MAX_RESULT_CATEGORIES = len(RISK_CATEGORY_VALUES)
 ENVIRONMENT_FIELD_LIMIT = 200
+# Optional needs_evidence entries the auditor may emit: short identifiers for
+# unresolved material facts (e.g. "local_script_body", "remote_body").
+MAX_NEEDS_EVIDENCE = 8
+MAX_NEEDS_EVIDENCE_LENGTH = 128
 
 # --- Prompts ----------------------------------------------------------------
 
@@ -215,24 +223,25 @@ def _policy_prompt(policy: str, bypass: list[str], read_only: bool = False) -> s
         parts.append(READ_ONLY_SESSION_PROMPT)
     parts.append(CATEGORY_DISAMBIGUATION_PROMPT)
     if bypass:
-        # Armed categories cannot be risk categories: their checks are already
-        # disabled, so a risk that would only name them is not covered by an
-        # active policy and must not produce a DENY.
+        # Armed categories' checks are disabled, so their effects can never
+        # justify a DENY — but the footprint they occupy still occurred and
+        # stays in `categories` so the host sees the command's real scope.
         parts.append(
             "The user has already armed these categories: "
             + ", ".join(bypass)
-            + ". An armed category cannot be selected as a risk category — its checks are disabled for this review. If the only categories you would choose are armed, output ALLOW: the remaining risk is not covered by an active policy. The unconditional safety floor always remains DENY."
+            + ". An armed category's checks are disabled for this review: effects inside armed categories never justify DENY, though you should still list them in `categories` when they actually occur (the footprint is intrinsic to the command). If every risk family present is armed, output ALLOW. The unconditional safety floor always remains DENY."
         )
     schema = (
         '{"decision":"ALLOW|DENY"'
         + (',"bypassing":boolean' if policy == "HARD" else '')
-        + ',"categories":["string"],"secondary_categories":["string"]}'
+        + ',"categories":["string"],"secondary_categories":["string"]'
+        + ',"needs_evidence":["string"] optional}'
     )
     parts.append(
-        'Return exactly ' + schema + '. For DENY, `categories` names the 1-3 effect families of the command\'s risk, chosen from '
+        'Return exactly ' + schema + '. `categories` names the effect families of the command\'s risk actually present (its intrinsic footprint — report them even on ALLOW: authorization does not erase what the command does), chosen from '
         + ", ".join(RISK_CATEGORY_VALUES)
-        + '; choose none only when a DENY risk is truly unclassifiable. `secondary_categories` (0-3, same names, no overlap with `categories`) names families worth considering but not primary. ALLOW requires empty `categories` and empty `secondary_categories`'
-        + (', and bypassing=false' if policy == "HARD" else '')
+        + '. `secondary_categories` (same names, no overlap with `categories`) names families worth considering but not primary. `needs_evidence` optionally lists short identifiers for material facts you could not resolve (for example "local_script_body", "remote_body", "target_directory"); leave it empty or omit it when nothing material is missing'
+        + (', and bypassing=false on ALLOW' if policy == "HARD" else '')
         + '. No Markdown or extra fields.'
     )
     return "\n\n".join(parts)
@@ -572,6 +581,22 @@ def _read_review_input() -> tuple[str, dict[str, Any]]:
             if not isinstance(bit, bool):
                 raise ValueError("review input contained an invalid permScope bit")
 
+    if "collectedEvidence" in value and value["collectedEvidence"] is not None:
+        evidence = value["collectedEvidence"]
+        if not isinstance(evidence, list) or len(evidence) > 8:
+            raise ValueError("review input contained invalid collectedEvidence")
+        for item in evidence:
+            if not isinstance(item, dict) or not set(item) <= {"kind", "subject", "excerpt", "truncated"}:
+                raise ValueError("review input contained an invalid collectedEvidence entry")
+            if not isinstance(item.get("kind"), str) or len(item["kind"]) > 20:
+                raise ValueError("review input contained an invalid collectedEvidence kind")
+            if not isinstance(item.get("subject"), str) or len(item["subject"]) > MAX_PATH_LENGTH:
+                raise ValueError("review input contained an invalid collectedEvidence subject")
+            if not isinstance(item.get("excerpt"), str) or len(item["excerpt"]) > 200000:
+                raise ValueError("review input contained an invalid collectedEvidence excerpt")
+            if "truncated" in item and not isinstance(item["truncated"], bool):
+                raise ValueError("review input contained an invalid collectedEvidence truncation flag")
+
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")), value
 
 
@@ -717,6 +742,17 @@ def _build_user_message(review: dict[str, Any]) -> str:
             marked[field] = {
                 k: _mark_untrusted(v) if isinstance(v, str) else v for k, v in record.items()
             }
+    evidence = marked.get("collectedEvidence")
+    if isinstance(evidence, list):
+        marked_evidence = []
+        for item in evidence:
+            if isinstance(item, dict):
+                new_item = dict(item)
+                for key in ("kind", "subject", "excerpt"):
+                    if isinstance(new_item.get(key), str):
+                        new_item[key] = _mark_untrusted(new_item[key])
+                marked_evidence.append(new_item)
+        marked["collectedEvidence"] = marked_evidence
     context_json = json.dumps(marked, ensure_ascii=False, separators=(",", ":"))
 
     parts = [
@@ -1393,17 +1429,37 @@ def _validated_categories(value: Any, field: str) -> list[str]:
     return result
 
 
+def _validated_needs_evidence(value: Any) -> list[str]:
+    """Validate the optional needs_evidence list: a bounded array of short
+    identifier strings naming material facts the reviewer could not resolve."""
+    if not isinstance(value, list):
+        raise ValueError("reviewer returned a non-list needs_evidence")
+    if len(value) > MAX_NEEDS_EVIDENCE:
+        raise ValueError("reviewer returned too many needs_evidence entries")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("reviewer returned an invalid needs_evidence entry")
+        if len(item) > MAX_NEEDS_EVIDENCE_LENGTH:
+            raise ValueError("reviewer returned an overlong needs_evidence entry")
+        if item not in result:
+            result.append(item)
+    return result
+
+
 def _validated_result(value: Any, policy: str) -> dict[str, Any]:
     if policy not in {"LOOSE", "HARD"}:
         raise ValueError("invalid review policy")
     if not isinstance(value, dict):
         raise ValueError("reviewer returned a non-object result")
-    expected = (
+    required = (
         {"decision", "bypassing", "categories", "secondary_categories"}
         if policy == "HARD"
         else {"decision", "categories", "secondary_categories"}
     )
-    if set(value) != expected:
+    allowed = required | {"needs_evidence"}
+    keys = set(value)
+    if not keys <= allowed or not required <= keys:
         raise ValueError("reviewer returned unexpected fields")
 
     decision = str(value.get("decision", "")).upper()
@@ -1412,6 +1468,7 @@ def _validated_result(value: Any, policy: str) -> dict[str, Any]:
 
     categories = _validated_categories(value.get("categories"), "categories")
     secondary = _validated_categories(value.get("secondary_categories"), "secondary_categories")
+    needs_evidence = _validated_needs_evidence(value.get("needs_evidence", []))
 
     bypassing = value.get("bypassing") if policy == "HARD" else None
     if policy == "HARD" and not isinstance(bypassing, bool):
@@ -1425,18 +1482,40 @@ def _validated_result(value: Any, policy: str) -> dict[str, Any]:
     secondary = [category for category in secondary if category not in categories]
 
     if decision == "ALLOW":
-        if categories:
-            raise ValueError("reviewer returned categories for ALLOW")
-        if secondary:
-            raise ValueError("reviewer returned secondary_categories for ALLOW")
+        # `categories` on ALLOW is the intrinsic footprint — present risk
+        # families are reported even when the command is authorized; it is
+        # no longer a protocol error. bypassing stays strictly a DENY flag.
         if policy == "HARD" and bypassing:
             raise ValueError("reviewer returned bypassing=true for ALLOW")
+
+    # The structured assessment: the OpenAI channel reports categories and
+    # needs_evidence directly, so strong reasons cite the reviewer's own
+    # listing as their provenance.
+    assessment: dict[str, Any] = {
+        "categories": categories,
+        "strongReasons": [
+            {
+                "category": category,
+                "kind": "model_categories",
+                "evidence": "reviewer-listed risk family",
+            }
+            for category in categories
+        ],
+        "needsEvidence": needs_evidence,
+        "rawDecision": {"choice": decision},
+        "decisionSource": "model",
+        "policyVersion": "openai-auditor-direct",
+        "version": "assessment-1",
+    }
 
     result: dict[str, Any] = {
         "decision": decision,
         "categories": categories,
         "secondary_categories": secondary,
+        "assessment": assessment,
     }
+    if needs_evidence:
+        result["needs_evidence"] = needs_evidence
     if policy == "HARD":
         result["bypassing"] = bypassing
     return result

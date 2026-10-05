@@ -1,7 +1,8 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test"
 import { createServer, type Server } from "node:http"
 import type { AddressInfo } from "node:net"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, writeFile } from "node:fs/promises"
+import { cleanupTestArtifacts as rm } from "./artifacts"
 import { homedir } from "node:os"
 import path from "node:path"
 import { Cause, Effect, Exit, Option, Scope, Stream } from "effect"
@@ -115,6 +116,9 @@ async function startPlugin(options: Record<string, unknown> = {}): Promise<Harne
       hook: () => Effect.void,
     },
     session: {
+      // Context hook registrar stub: attachSessionContextHook
+      // registers here; state notices are a no-op for these tests.
+      hook: () => Effect.void,
       get: () => Effect.succeed({ location: { directory } }),
       context: () => Effect.succeed([{ type: "user", text: "Please fix the service ownership" }]),
       interrupt: () => Effect.void,
@@ -440,7 +444,7 @@ describe("privilege in the effective bypass set routes the call host-direct", ()
     const plain: Record<string, unknown> = { command }
     const refusedPlain = await runBefore(h, "s2", plain)
     expect(refusedPlain).toContain("privilege category is not")
-    expect(refusedPlain).toContain("/bypass privilege")
+    expect(refusedPlain).toContain("privilege bypass category must be armed")
     expect(String(plain.command)).toBe(command)
   })
 
@@ -494,9 +498,9 @@ describe("privilege in the effective bypass set routes the call host-direct", ()
     expect(await runBefore(h, "s1", input)).toBeUndefined()
     // The escalation reviewer was consulted exactly once and allowed once.
     expect(mock.requests).toHaveLength(1)
-    // The per-call grant ({host, privilege}) reached the dynamic reviewer.
-    expect(h.dynamicCalls).toHaveLength(1)
-    expect(h.dynamicCalls[0].userBypass).toContain("privilege")
+    // allow_once is the admission report for this call: the dynamic
+    // reviewer does not re-judge it.
+    expect(h.dynamicCalls).toHaveLength(0)
 
     expect(String(input.command)).toMatch(MARKER_RE)
     const ev = await spawnMarked(h, String(input.command))
@@ -509,7 +513,7 @@ describe("privilege in the effective bypass set routes the call host-direct", ()
     const bare: Record<string, unknown> = { command }
     const refusedBare = await runBefore(h, "s1", bare)
     expect(refusedBare).toContain("privilege category is not")
-    expect(`${refusedBare}`).toContain("/bypass privilege")
+    expect(`${refusedBare}`).toContain("privilege bypass category must be armed")
     expect(String(bare.command)).toBe(command)
   })
 })
@@ -532,9 +536,9 @@ describe("privilege routing fails loudly when the call cannot leave the sandbox"
     expect(blocked).toContain("Blocked by policy classifier")
     expect(blocked).toContain("cannot run it host-direct")
     expect(blocked).toContain("fail silently at runtime")
-    // The message names every user-side remedy.
-    expect(blocked).toContain("/bypass sandbox")
-    expect(blocked).toContain("include the sandbox category when escalating privileged commands")
+    // The message names every remedy.
+    expect(blocked).toContain("sandbox bypass category must be armed")
+    expect(blocked).toContain("sandbox category can be included when escalating privileged commands")
     expect(blocked).toContain("sandbox.allowSudo")
     // Fail-loud happens before any wrap: the command text is untouched.
     expect(String(input.command)).toBe(command)
@@ -547,7 +551,7 @@ describe("privilege routing fails loudly when the call cannot leave the sandbox"
     await invoke(h, "bypass", "s2", "host")
     const missing = await runBefore(h, "s2", { command })
     expect(missing).toContain("privilege category is not")
-    expect(missing).toContain("/bypass privilege")
+    expect(missing).toContain("privilege bypass category must be armed")
     expect(missing).not.toContain("cannot run it host-direct")
   })
 })
@@ -577,7 +581,7 @@ describe("a privilege-needing command is refused when privilege is not armed", (
       const blocked = await runBefore(h, sessionID, input)
       expect(blocked).toContain("needs OS privilege")
       expect(blocked).toContain("privilege category is not")
-      expect(blocked).toContain("/bypass privilege")
+      expect(blocked).toContain("privilege bypass category must be armed")
       // Refused before the dynamic reviewer: its ALLOW could never help.
       expect(h.dynamicCalls).toHaveLength(0)
       // No wrap, no marker — the command text is untouched.

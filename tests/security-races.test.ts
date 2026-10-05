@@ -33,6 +33,9 @@ async function harness(options: Record<string, unknown> = {}, parents: Record<st
     permission: { hook: (_: string, cb: Hook) => { hooks.evaluate = cb; return Effect.void } },
     command: { transform: (cb: any) => Effect.sync(() => cb({ add: (d: any) => { commands[d.name] = d.execute } })) },
     session: {
+      // Context hook registrar stub: attachSessionContextHook
+      // registers here; state notices are a no-op for these tests.
+      hook: () => Effect.void,
       get: ({ sessionID }: { sessionID: string }) => Effect.suspend(() => {
         getCalls++
         return getFails ? Effect.fail(new Error("lookup failed")) : Effect.succeed({
@@ -155,8 +158,8 @@ test("concurrent similar escalation cannot obtain a second allow_once review", a
   } finally { release() }
   const denied = await first
   expect(denied).toContain('denied this one-time request')
-  // A reviewer verdict is terminal: /bypass the requested category or skip.
-  expect(denied).toContain("/bypass filesystem")
+  // A reviewer verdict is terminal: session-surface authorization or skip.
+  expect(denied).toContain("armed bypass for categories filesystem")
   expect(denied).not.toContain("ask for escalation")
   expect(mock.calls()).toBe(1)
 })
@@ -173,7 +176,7 @@ test("eight failures saturate the session without evicting its first rejection",
     const saturated = await h.before("s", "shell", escalation(cmd))
     expect(saturated).toContain("capacity")
     // Terminal ending: saturation cannot be fixed by re-requesting.
-    expect(saturated).toContain("/bypass filesystem")
+    expect(saturated).toContain("armed bypass for categories filesystem")
     expect(saturated).not.toContain("ask for escalation")
   }
   await h.command("s", "bypass", "filesystem")

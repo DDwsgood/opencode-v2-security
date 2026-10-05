@@ -34,16 +34,16 @@ def answers(decision: str = "allow_once", p_deny: float = 0.05,
             unsafe: float = 0.05, necessity: float = 0.9,
             retry: float | None = None, p_allow: float | None = None,
             p_ask: float | None = None, harm: float = 0.1,
-            mismatch: float = 0.0) -> dict:
+            mismatch: float = 0.0, heads: dict | None = None) -> dict:
     allow = p_allow if p_allow is not None else 1.0 - p_deny - (p_ask if p_ask is not None else 0.02)
-    ask = p_ask if p_ask is not None else max(0.0, 1.0 - p_deny - allow)
+    collect = p_ask if p_ask is not None else max(0.0, 1.0 - p_deny - allow)
     result = {
         "decision": {
             "type": "choice",
             "choice": decision,
             "probabilities": {
                 "allow_once": allow,
-                "ask_user": ask,
+                "collect_evidence": collect,
                 "deny": p_deny,
             },
         },
@@ -54,7 +54,22 @@ def answers(decision: str = "allow_once", p_deny: float = 0.05,
     }
     if retry is not None:
         result["retry_similarity"] = {"type": "noul", "noul": retry}
+    # Neutral footprint: heads are required by decide()'s fail-closed
+    # validation, so helpers must answer them.
+    neutral = {"actor_context": "ordinary", "floor": "no"}
+    for name in reviewer.risk_heads.HEAD_ORDER:
+        result[name] = {
+            "type": "choice",
+            "choice": neutral.get(name, "none"),
+        }
+    if heads:
+        for name, choice in heads.items():
+            result[name] = {"type": "choice", "choice": choice}
     return result
+
+
+def decision_of(review, answers_map, thresholds=None) -> str:
+    return reviewer.decide(review, answers_map, thresholds)["decision"]
 
 
 class ValidationTests(unittest.TestCase):
@@ -104,19 +119,23 @@ class DeterministicGateTests(unittest.TestCase):
             request["categories"] = [category]
             self.assertEqual(reviewer.deterministic_decision(request), "deny")
 
-    def test_unknown_category_asks_user(self) -> None:
+    def test_unknown_category_denies(self) -> None:
+        # No human to route the unknown to: an unclassified request is a
+        # request defect, denied deterministically.
         request = sample_request()
         request["categories"] = ["totally_made_up"]
-        self.assertEqual(reviewer.deterministic_decision(request), "ask_user")
+        self.assertEqual(reviewer.deterministic_decision(request), "deny")
 
-    def test_uncovered_previous_denial_asks_user(self) -> None:
+    def test_uncovered_previous_denial_collects_evidence(self) -> None:
         request = sample_request()
         request["categories"] = ["indirection"]
         request["previousDenial"] = {
             "command": request["command"],
             "riskCategories": ["secret"],
         }
-        self.assertEqual(reviewer.deterministic_decision(request), "ask_user")
+        # The recorded risk is fixable by re-requesting with covering
+        # categories — the host collects, a human is never asked.
+        self.assertEqual(reviewer.deterministic_decision(request), "collect_evidence")
         # Same command text but covered -> model is consulted.
         request["categories"] = ["secret", "indirection"]
         self.assertIsNone(reviewer.deterministic_decision(request))
@@ -132,22 +151,23 @@ class DeterministicGateTests(unittest.TestCase):
         request["permScope"] = {"r": True, "w": False, "x": True}
         request["categories"] = ["filesystem"]
         self.assertIsNone(reviewer.deterministic_decision(request))
+        # The write ceiling is fixed: deny (evidence cannot widen it).
         self.assertEqual(
-            reviewer._post_decision_checks(request, "allow_once", reviewer.DEFAULT_THRESHOLDS, 0.9),
-            "ask_user",
+            reviewer._post_decision_checks(request, "allow_once"),
+            ("deny", "native_perm_ceiling"),
         )
         # deny stays deny.
         self.assertEqual(
-            reviewer._post_decision_checks(request, "deny", reviewer.DEFAULT_THRESHOLDS, 0.9),
-            "deny",
+            reviewer._post_decision_checks(request, "deny"),
+            ("deny", None),
         )
         # w=true: no ceiling issue (categories now cover the command-position
         # effects sudo + apt-get, so the mismatch guard also stays quiet).
         request["permScope"]["w"] = True
         request["categories"] = ["privilege", "host", "filesystem"]
         self.assertEqual(
-            reviewer._post_decision_checks(request, "allow_once", reviewer.DEFAULT_THRESHOLDS, 0.9),
-            "allow_once",
+            reviewer._post_decision_checks(request, "allow_once"),
+            ("allow_once", None),
         )
 
     def test_finalize_decision_keeps_coverage_gate(self) -> None:
@@ -158,7 +178,7 @@ class DeterministicGateTests(unittest.TestCase):
         }
         request["categories"] = ["indirection"]
         self.assertEqual(
-            reviewer.finalize_decision(request, "allow_once"), "ask_user"
+            reviewer.finalize_decision(request, "allow_once"), "collect_evidence"
         )
         self.assertEqual(reviewer.finalize_decision(request, "deny"), "deny")
 
@@ -173,12 +193,10 @@ class ImpliedCategoryGateTests(unittest.TestCase):
         request = sample_request()
         request["command"] = command
         request["categories"] = categories
-        self.assertEqual(
-            reviewer._post_decision_checks(
-                request, "allow_once", reviewer.DEFAULT_THRESHOLDS, 0.9
-            ),
-            expected,
+        decision, _source = reviewer._post_decision_checks(
+            request, "allow_once"
         )
+        self.assertEqual(decision, expected)
 
     def test_literal_payloads_and_interpreters_imply_nothing(self) -> None:
         # An interpreter in command position has opaque effects, not a
@@ -218,14 +236,14 @@ class ImpliedCategoryGateTests(unittest.TestCase):
 
     def test_real_effects_still_imply_categories(self) -> None:
         # rm executed in command position with filesystem undeclared asks.
-        self._check("rm -rf /", ["network"], "ask_user")
+        self._check("rm -rf /", ["network"], "collect_evidence")
         # Command substitutions execute even inside quotes; /dev/null
         # discards are not file writes.
         self.assertEqual(
             reviewer._implied_categories('echo "$(rm -rf /data)" > /dev/null'),
             {"filesystem"},
         )
-        self._check('echo "$(rm -rf /data)" > /dev/null', ["network"], "ask_user")
+        self._check('echo "$(rm -rf /data)" > /dev/null', ["network"], "collect_evidence")
         # A privilege prefix keeps the inner command in command position.
         self.assertEqual(
             reviewer._implied_categories("sudo systemctl restart svc"),
@@ -233,103 +251,132 @@ class ImpliedCategoryGateTests(unittest.TestCase):
         )
         # A fixture write whose filesystem effect is undeclared still asks.
         self._check(
-            "cat > tests/fixture.sh <<'EOF'\nrm -rf /\nEOF", ["network"], "ask_user"
+            "cat > tests/fixture.sh <<'EOF'\nrm -rf /\nEOF", ["network"], "collect_evidence"
         )
 
 
 class DecideMappingTests(unittest.TestCase):
     def test_allow_once_when_clean(self) -> None:
         self.assertEqual(
-            reviewer.decide(sample_request(), answers()), "allow_once"
+            decision_of(sample_request(), answers()), "allow_once"
         )
 
-    def test_deny_on_corroborated_deny_band(self) -> None:
-        # The band corroborates model opposition with actual risk evidence:
-        # either concrete harm potential or strong unsafe evidence.
+    def test_deny_needs_the_verbatim_choice(self) -> None:
+        # Only the selected "deny" choice denies — never a probability band
+        # corroborated by scores. The band is diagnostic data.
         self.assertEqual(
-            reviewer.decide(
+            decision_of(
                 sample_request(), answers(decision="deny", p_deny=0.9, unsafe=0.3, harm=0.6)
             ),
             "deny",
         )
-        # The empty-variable wipe shape: risk shows in unsafe, not harm.
         self.assertEqual(
-            reviewer.decide(
+            decision_of(
                 sample_request(), answers(decision="deny", p_deny=0.9, unsafe=0.5, harm=0.2)
             ),
             "deny",
         )
-        # Strong deny WITHOUT either corroboration stays allowed — alarm at
-        # inert payload text or policy disagreement does not hard-block work.
+        # High deny probability WITHOUT the selected deny must not overturn
+        # the verbatim allow — this is the intent-misidentification fix.
         self.assertEqual(
-            reviewer.decide(
-                sample_request(), answers(decision="deny", p_deny=0.9, unsafe=0.3, harm=0.2)
+            decision_of(
+                sample_request(), answers(decision="allow_once", p_deny=0.9, unsafe=0.3, harm=0.2)
             ),
             "allow_once",
         )
-        # Below the deny floor, risk evidence alone never denies.
+        # Risk evidence alone (noul diagnostics) never denies either.
         self.assertEqual(
-            reviewer.decide(
+            decision_of(
                 sample_request(), answers(decision="allow_once", p_deny=0.3, harm=0.7)
             ),
             "allow_once",
         )
 
-    def test_unsafe_veto(self) -> None:
+    def test_score_nouls_are_diagnostics_not_vetoes(self) -> None:
+        # unsafe / harmful_mismatch / retry similarity cannot veto a
+        # verbatim allow_once — they ride along as diagnostics.
         self.assertEqual(
-            reviewer.decide(sample_request(), answers(unsafe=0.9)), "deny"
+            decision_of(sample_request(), answers(unsafe=0.9)), "allow_once"
         )
+        self.assertEqual(
+            decision_of(sample_request(), answers(mismatch=0.85)), "allow_once"
+        )
+        self.assertEqual(
+            decision_of(sample_request(), answers(retry=0.8)), "allow_once"
+        )
+        verdict = reviewer.decide(
+            sample_request(), answers(unsafe=0.9, harm=0.9, retry=0.8))
+        self.assertEqual(verdict["diagnostics"]["unsafe"], 0.9)
+        self.assertEqual(verdict["diagnostics"]["retry_similarity"], 0.8)
+        self.assertEqual(verdict["source"], "model")
 
-    def test_harmful_mismatch_veto(self) -> None:
-        # A clear harmful cover story denies even with deny probability low.
+    def test_collect_evidence_paths(self) -> None:
+        # A verbatim collect_evidence choice maps to collect_evidence —
+        # no harm floor, no co-max band required.
         self.assertEqual(
-            reviewer.decide(sample_request(), answers(mismatch=0.85)), "deny"
-        )
-        # Concerning-but-ambiguous discrepancy does not veto on its own.
-        self.assertEqual(
-            reviewer.decide(sample_request(), answers(mismatch=0.5)), "allow_once"
-        )
-
-    def test_retry_similarity_veto(self) -> None:
-        self.assertEqual(
-            reviewer.decide(sample_request(), answers(retry=0.8)), "deny"
-        )
-        self.assertEqual(
-            reviewer.decide(sample_request(), answers(retry=0.4)), "allow_once"
-        )
-
-    def test_ask_user_paths(self) -> None:
-        # ask_user fires only when the model prefers clarification AND the
-        # harm floor is met.
-        self.assertEqual(
-            reviewer.decide(
-                sample_request(), answers(decision="ask_user", p_deny=0.2, p_allow=0.2, harm=0.5)
+            decision_of(
+                sample_request(), answers(decision="collect_evidence", p_deny=0.2, p_allow=0.2, harm=0.5)
             ),
-            "ask_user",
+            "collect_evidence",
         )
-        # Model prefers ask but harm is low: benign prior resolves to allow.
+        # Same verbatim choice under low harm: still collect_evidence —
+        # the selected word is the intent, not a gated fallback.
         self.assertEqual(
-            reviewer.decide(
-                sample_request(), answers(decision="ask_user", p_deny=0.2, p_allow=0.2, harm=0.3)
+            decision_of(
+                sample_request(), answers(decision="collect_evidence", p_deny=0.2, p_allow=0.2, harm=0.3)
             ),
-            "allow_once",
+            "collect_evidence",
         )
-        # High harm but allow is the model's top pick: still allow.
+        # allow stays allow under any probability spread.
         self.assertEqual(
-            reviewer.decide(
+            decision_of(
                 sample_request(), answers(decision="allow_once", p_deny=0.2, p_ask=0.3, harm=0.6)
             ),
             "allow_once",
         )
-        # Deny-vs-ask tie at the deny floor denies (deny checked first).
+        # A verbatim deny denies — even beside high collect probability.
         self.assertEqual(
-            reviewer.decide(
+            decision_of(
                 sample_request(),
                 answers(decision="deny", p_deny=0.48, p_ask=0.48, p_allow=0.04,
                         unsafe=0.5, harm=0.5),
             ),
             "deny",
         )
+        # Deny with tiny deny probability also denies: the choice is the vote.
+        self.assertEqual(
+            decision_of(
+                sample_request(), answers(decision="deny", p_deny=0.01, p_allow=0.9)
+            ),
+            "deny",
+        )
+
+    def test_head_projection_drives_footprint_and_evidence(self) -> None:
+        # Unresolved heads are reported, never an implicit evidence route:
+        # only an exact collect_evidence choice triggers a resubmit.
+        verdict = reviewer.decide(
+            sample_request(),
+            answers(harm=0.6, heads={"cat_execution": "unclear"}))
+        self.assertEqual(verdict["decision"], "allow_once")
+        self.assertIn("cat_execution", verdict["needsEvidence"])
+        # A verbatim floor=yes denies from the model's own floor judgment.
+        floor_verdict = reviewer.decide(
+            sample_request(), answers(heads={"floor": "yes"}))
+        self.assertEqual(floor_verdict["decision"], "deny")
+        self.assertEqual(floor_verdict["source"], "model_floor")
+        # floor choice "no" with an unused .9 p_yes is NOT a floor verdict.
+        no_floor = answers(heads={"floor": "no"})
+        no_floor["floor"]["probabilities"] = {"yes": 0.9, "no": 0.1}
+        verdict = reviewer.decide(sample_request(), no_floor)
+        self.assertEqual(verdict["decision"], "allow_once")
+        self.assertEqual(verdict["source"], "model")
+        # Footprint categories project from selected choices even on allow.
+        verdict = reviewer.decide(
+            sample_request(), answers(heads={"cat_credential": "off_host"}))
+        self.assertEqual(verdict["decision"], "allow_once")
+        self.assertEqual(verdict["categories"], ["network", "secret"])
+        self.assertEqual(verdict["source"], "model")
+        self.assertIn("policyVersion", verdict)
 
 
 class ProtocolTests(unittest.TestCase):
@@ -355,7 +402,12 @@ class ProtocolTests(unittest.TestCase):
     def test_clean_allow_once(self) -> None:
         code, out = self._run_main(sample_request(), {"answers": answers()})
         self.assertEqual(code, 0)
-        self.assertEqual(out.strip(), "allow_once")
+        lines = out.strip().splitlines()
+        # Line 1 is the decision word; the optional detail line follows.
+        self.assertEqual(lines[0], "allow_once")
+        self.assertTrue(lines[1].startswith("detail:"))
+        detail = json.loads(lines[1][len("detail:"):])
+        self.assertEqual(detail["source"], "model")
 
     def test_missing_answers_is_protocol_error(self) -> None:
         for bad in (
@@ -363,7 +415,7 @@ class ProtocolTests(unittest.TestCase):
             {"answers": None},
             {"answers": {}},
             {"answers": {"decision": {"type": "choice", "choice": "allow_once",
-                                      "probabilities": {"allow_once": 1.0, "ask_user": 0.0, "deny": 0.0}}}},
+                                      "probabilities": {"allow_once": 1.0, "collect_evidence": 0.0, "deny": 0.0}}}},
             {"answers": {"decision": {"type": "choice", "choice": "allow_once",
                                       "probabilities": {"deny": 0.0}},
                          "necessity": {"type": "noul", "noul": 0.5},
@@ -375,14 +427,27 @@ class ProtocolTests(unittest.TestCase):
             # Harm/mismatch scores are mandatory — a response from an older
             # question set fails closed rather than silently allowing.
             {"answers": {"decision": {"type": "choice", "choice": "allow_once",
-                                      "probabilities": {"allow_once": 0.9, "ask_user": 0.1, "deny": 0.0}},
+                                      "probabilities": {"allow_once": 0.9, "collect_evidence": 0.1, "deny": 0.0}},
                          "necessity": {"type": "noul", "noul": 0.9},
                          "unsafe": {"type": "noul", "noul": 0.1}}},
             {"answers": {"decision": {"type": "choice", "choice": "allow_once",
-                                      "probabilities": {"allow_once": 0.9, "ask_user": 0.1, "deny": 0.0}},
+                                      "probabilities": {"allow_once": 0.9, "collect_evidence": 0.1, "deny": 0.0}},
                          "necessity": {"type": "noul", "noul": 0.9},
                          "unsafe": {"type": "noul", "noul": 0.1},
                          "harm": {"type": "noul", "noul": 0.1}}},
+            # A complete legacy answer set without the risk heads fails
+            # closed too — the heads carry the footprint and are mandatory.
+            {"answers": {"decision": {"type": "choice", "choice": "allow_once",
+                                      "probabilities": {"allow_once": 0.9, "collect_evidence": 0.1, "deny": 0.0}},
+                         "necessity": {"type": "noul", "noul": 0.9},
+                         "unsafe": {"type": "noul", "noul": 0.1},
+                         "harm": {"type": "noul", "noul": 0.1},
+                         "harmful_mismatch": {"type": "noul", "noul": 0.0}}},
+            # A malformed head answer is a protocol error, not an empty
+            # footprint.
+            {"answers": {**answers(), "floor": {"type": "noul", "noul": 0.1}}},
+            {"answers": {**answers(), "cat_data": {"type": "choice",
+                                                  "choice": "bogus"}}},
         ):
             code, out = self._run_main(sample_request(), bad)
             self.assertEqual(code, 6, f"{bad!r} -> stdout {out!r}")
@@ -393,7 +458,10 @@ class ProtocolTests(unittest.TestCase):
         request["categories"] = ["dynamic"]
         code, out = self._run_main(request, {"answers": answers()})
         self.assertEqual(code, 0)
-        self.assertEqual(out.strip(), "deny")
+        lines = out.strip().splitlines()
+        self.assertEqual(lines[0], "deny")
+        self.assertEqual(json.loads(lines[1][len("detail:"):])["source"],
+                         "native_policy")
 
 
 class StateTests(unittest.TestCase):
@@ -422,6 +490,15 @@ class StateTests(unittest.TestCase):
     def test_retry_question_only_with_history(self) -> None:
         request = sample_request()
         self.assertIsNone(reviewer._most_similar_failure(request))
+        questions = reviewer.build_questions(request, None)
+        # v1.5.0 slim bank: decision + 9 risk_heads = 10; the four
+        # diagnostic nouls are off the wire.
+        self.assertEqual(len(questions), 10)
+        self.assertEqual(
+            set(questions),
+            {"decision"} | set(reviewer.risk_heads.HEAD_NAMES))
+        for retired in ("necessity", "unsafe", "harm", "harmful_mismatch"):
+            self.assertNotIn(retired, questions)
         self.assertNotIn(
             "retry_similarity",
             reviewer.build_questions(request, reviewer._most_similar_failure(request)),
