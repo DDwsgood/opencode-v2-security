@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.6.1 (2026-10-11)
+
+- Widen the `@opentui/solid` peer range to `>=0.5.8`; `@opentui/solid` 0.6.0
+  made npm installs of 1.6.0 fail with an unresolvable dependency tree.
+
 ## 1.6.0 (2026-10-11)
 
 - Treat failed path/process inspection as unavailable evidence, never an opaque

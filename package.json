@@ -1,6 +1,6 @@
 {
   "name": "opencode-v2-security",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "Autonomous execution-boundary security for OpenCode V2: scoped assessments, one-call authorization, bypass leases, and session read/write permission ceilings.",
   "type": "module",
   "repository": {
@@ -60,7 +60,7 @@
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "next",
-    "@opentui/solid": ">=0.5.8 <0.6.0",
+    "@opentui/solid": ">=0.5.8",
     "solid-js": ">=1.9.12 <2.0.0",
     "effect": ">=4.0.0-beta.83 <4.0.0"
   }
