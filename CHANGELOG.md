@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.6.2 (2026-10-11)
+
+- Ship `bin/opencode-boundary-watch` as executable. 1.6.0 and 1.6.1 packed it
+  without the execute bit, so every shell command was refused with "the
+  runtime boundary observer is unavailable".
+
 ## 1.6.1 (2026-10-11)
 
 - Widen the `@opentui/solid` peer range to `>=0.5.8`; `@opentui/solid` 0.6.0
