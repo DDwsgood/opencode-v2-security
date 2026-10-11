@@ -82,7 +82,7 @@ interface Instance {
 async function startInstance(
   sessionInfo: Record<string, { parentID?: string; directory?: string }>,
   retained: Array<Record<string, string>>,
-  options: { directory?: string; defaultPerm?: string; permanentBypass?: string[]; propagateBypass?: boolean; events?: Iterable<unknown> } = {},
+  options: { directory?: string; defaultPerm?: string; permanentBypass?: string[]; propagateBypass?: boolean; events?: Iterable<unknown>; mutateScope?: (scope: Scope.Closeable) => void } = {},
 ): Promise<Instance> {
   const hooks = new Map<string, Hook>()
   const commands = new Map<string, (input: any) => Effect.Effect<unknown, unknown>>()
@@ -159,6 +159,7 @@ async function startInstance(
   }
   const scope = await Effect.runPromise(Scope.make())
   scopes.push(scope)
+  options.mutateScope?.(scope)
   await Effect.runPromise((plugin as any).effect(ctx).pipe(Scope.provide(scope)))
   return {
     scope,
@@ -190,6 +191,30 @@ async function twoInstances() {
 }
 
 describe("shared security state across plugin instances", () => {
+  test("loads under a host scope that keeps its first finalizer in single-entry form", async () => {
+    resetSharedSecurityStateForTests()
+    const instance = await startInstance(
+      { parent: { directory: workspace } },
+      [{ type: "user", text: "work on the fixtures" }],
+      {
+        mutateScope: (scope) => {
+          // Older effect builds store a scope's first finalizer as
+          // {finalizerKey, finalizer} and only promote to a `finalizers`
+          // Map on the second add; this build dereferences `.finalizers`
+          // unconditionally, so the plugin must normalize the ambient scope
+          // before registering its own finalizers.
+          ;(scope as { state: unknown }).state = {
+            _tag: "Open", finalizerKey: {}, finalizer: () => Effect.void,
+          }
+        },
+      },
+    )
+    // The single-finalizer entry is promoted to the Map shape; loading must
+    // not die inside scopeAddFinalizerUnsafe.
+    expect((instance.scope.state as { finalizers?: unknown }).finalizers).toBeInstanceOf(Map)
+    await instance.close()
+  })
+
   test("different location policies derive identical session snapshots without oscillating epochs", async () => {
     resetSharedSecurityStateForTests()
     const records = { parent: { directory: workspace }, child: { parentID: "parent", directory: outside } }

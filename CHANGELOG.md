@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.7.1 (2026-10-11)
+
+- Fix plugin load crash in `scope.state.finalizers.set`: the ambient Scope
+  may come from a different effect build that keeps a scope's first
+  finalizer in single-entry (`finalizerKey`/`finalizer`) form. Normalize it
+  to the shared `finalizers` Map shape once at effect start so every
+  finalizer/fork/registration below works on either build.
+
 ## 1.7.0 (2026-10-11)
 
 - Release-review fixes: bind network L1 entries to observed numeric endpoints

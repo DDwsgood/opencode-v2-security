@@ -711,6 +711,22 @@ const plugin: Plugin = {
     const run = <A>(effect: Effect.Effect<A, unknown>, signal?: AbortSignal): Promise<A> =>
       Effect.runPromiseWith(context)(effect as Effect.Effect<A, unknown, never>, signal ? { signal } : undefined)
 
+    // The ambient Scope may belong to a different effect build than the one
+    // bundled here (the host ships its own): some builds keep a scope's first
+    // finalizer as `{finalizerKey, finalizer}` and only promote to a
+    // `finalizers` Map on the second add, while this build dereferences
+    // `state.finalizers` unconditionally. Normalize once up front so every
+    // addFinalizer/forkScoped/acquireRelease below (and inside the plugin SDK
+    // helpers we yield*) sees the Map shape both builds understand.
+    const ambientScope = yield* Effect.serviceOption(Effect.scope)
+    if (ambientScope._tag === "Some") {
+      const state = (ambientScope.value as Scope.Scope & { state?: Record<string, unknown> }).state
+      if (state && state._tag === "Open" && !(state.finalizers instanceof Map)) {
+        state.finalizers = state.finalizer !== undefined ? new Map([[state.finalizerKey, state.finalizer]]) : new Map()
+        state.finalizerKey = state.finalizer = undefined
+      }
+    }
+
     const {
       resolved,
       configuredShell,
