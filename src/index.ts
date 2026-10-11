@@ -53,6 +53,7 @@ import { Effect, Latch, Stream } from "effect"
 import type { Plugin } from "@opencode-ai/plugin/effect/plugin"
 import type { Scope } from "effect"
 import { resolveClassifierShell } from "./shell-dialect"
+import { failureOrPass, SecurityCheckFailure } from "./failure-policy"
 import { BypassRpc } from "./bypass-rpc"
 import {
   BoundaryPreparationError,
@@ -116,9 +117,20 @@ import {
   type SandboxProbeResult,
 } from "./sandbox"
 import { createSessionStateNotices } from "./session-notifications"
+import {
+  getSharedSecurityState,
+  securityLocationKey,
+  type LocationSecurityPolicy,
+  type BypassLease,
+  type PermStashEntry,
+  type SharedStateEvent,
+} from "./security/shared-state"
+import { linkedWorktreePrivateDir } from "./security/worktree-roots"
 import { globalTempWriteRoots, incidentalWriteRoots, isIncidentalToolWrite, standardCacheWriteRoots } from "./security/automatic-write-roots"
 import { checkPathSensitivity, credentialStoreReadPaths } from "./security/paths"
-import { createApprovalCache, type ApprovalCacheFacts, type ApprovalCacheScope, type ApprovalCacheTarget } from "./security/approval-cache"
+import { writeRootRejection, writeTargetExempt, type WriteRootPolicy } from "./security/write-root-policy"
+import { createRootWidening, reviewRootWidening, L3_POLICY_VERSION, type L3Trace, type RootWideningContext, type RootWideningInput, type RootWideningScope } from "./security/root-widening"
+import { boundaryCoreDigest, observedNetworkEndpoint, type ApprovalCacheFacts, type ApprovalCacheScope, type ApprovalCacheTarget } from "./security/approval-cache"
 import { createRuntimeBoundaryBroker, currentCacheTargets, targetIdentitiesMatch, runtimeWriteEffect, staticCrossingReview, type RuntimeBoundaryBroker, type RuntimeBoundaryEvent } from "./runtime-boundary"
 import { inspectRegularTextFileSync, inspectionErrorCode } from "./security/inspection"
 import { createSingleFlight } from "./security/single-flight"
@@ -228,6 +240,7 @@ function blockedRejection(reason: string, advice?: string): Error & { readonly _
 // blocked" envelope so the host's `catchTag("Tool.Error")` still routes it to
 // a tool-call error instead of a step-killing defect.
 function toRejection(error: unknown): Error & { readonly _tag: "Tool.Error" } {
+  if (error instanceof SecurityCheckFailure) return blockedRejection(error.reason)
   if (error instanceof Error && (error as { _tag?: string })._tag === "Tool.Error") {
     return error as Error & { readonly _tag: "Tool.Error" }
   }
@@ -650,6 +663,12 @@ async function resolveStartup(rawOptions: unknown) {
   for (const warning of resolved.dynamicReviewWarnings) {
     console.warn(`[opencode-v2-security] ${warning}`)
   }
+  for (const warning of resolved.sandbox.allowWriteWarnings) {
+    console.warn(`[opencode-v2-security] ${warning}`)
+  }
+  if (resolved.failPolicy === "fail_open" && resolved.sandbox.onUnavailable === "fail_close") {
+    console.warn('[opencode-v2-security] failPolicy=fail_open overrides sandbox.onUnavailable=fail_close: unavailable checks run without the observer/sandbox (degrade).')
+  }
   const configuredShell = resolved.shell
   // P4: Linux sandbox probe. Skipped entirely when the sandbox is disabled or
   // forced "full" (no helper exec needed); a missing/failed helper reports
@@ -661,7 +680,7 @@ async function resolveStartup(rawOptions: unknown) {
     if (!sandboxProbe.available) {
       console.warn(
         `[opencode-v2-security] OS sandbox unavailable (${sandboxProbe.reason ?? "unknown reason"}) — ` +
-          (resolved.sandbox.onUnavailable === "degrade"
+          (resolved.failPolicy === "fail_open" || resolved.sandbox.onUnavailable === "degrade"
             ? "onUnavailable=degrade: calls that still use the sandbox run classifier-only"
             : "onUnavailable=fail_close: read-only calls that still require the OS sandbox " +
               "will be denied; reviewed read-write calls run host-direct " +
@@ -698,12 +717,53 @@ const plugin: Plugin = {
       sandboxProbe,
     } = yield* Effect.promise(() => resolveStartup(ctx.options))
 
+    // --- process-wide shared security state ----------------------------------
+    // The host loads one plugin instance per session location, all inside the
+    // SAME server process. Every piece of USER-AUTHORITY / SESSION-SECURITY
+    // state lives in one registry on globalThis (see security/shared-state.ts)
+    // so a bypass armed in the main session reaches subagents served by other
+    // instances, and a location re-boot reloads into the existing state.
+    // Only genuinely instance-bound resources (ctx handles, brokers, RPC,
+    // timers, in-flight review single-flights) stay in this closure.
+    const shared = getSharedSecurityState()
+    const instanceToken = Symbol("opencode-v2-security.instance")
+    const instancePolicy: LocationSecurityPolicy = {
+      defaultPerm: resolved.permission.defaultPerm,
+      permanentBypass: [...resolved.bypassClassifier],
+      propagateBypass: resolved.bypassPropagateToSubagents,
+      failPolicy: resolved.failPolicy,
+      sandboxEnabled: resolved.sandbox.enabled,
+      sandboxFull: resolved.sandbox.mode === "full",
+    }
+    const instanceLocation = ctx.location
+    const registerPolicy = (location: { directory: string; workspaceID?: unknown }) => {
+      shared.registerLocationPolicy(securityLocationKey(location), instanceToken, instancePolicy, () => {
+        console.warn("[opencode-v2-security] conflicting security policies for one location; the restrictive intersection is retained")
+      })
+    }
+    if (instanceLocation?.directory) registerPolicy(instanceLocation)
+    function policyForSession(sessionID: string): LocationSecurityPolicy {
+      const home = shared.sessionLocations.get(sessionID)
+      return home === undefined ? instancePolicy : shared.policyForLocation(home)
+    }
+    function bindSessionHome(sessionID: string, info: { location?: { directory?: unknown; workspaceID?: unknown } }) {
+      if (typeof info.location?.directory !== "string") return
+      const location = { directory: info.location.directory, workspaceID: info.location.workspaceID }
+      shared.sessionLocations.set(sessionID, securityLocationKey(location))
+      // Injected hosts may expose their location only on session records.
+      if (!instanceLocation?.directory) registerPolicy(location)
+    }
+    yield* Effect.addFinalizer(() => Effect.sync(() => shared.unregisterLocationPolicy(instanceToken)))
+
     // --- append-only user-role state notices --------------------------------
     // No session.context hook and no system/history mutation. A mode change
     // is only recorded; it becomes a durable transcript item right before the
     // next real user prompt, so it never starts a model request of its own.
+    // The snapshot store is shared across instances: whichever instance
+    // handles the session's prompt hook / tool result delivers it once.
     const sessionNotices = createSessionStateNotices(
       (notice) => run(ctx.session.synthetic(notice)),
+      shared.notices,
     )
     if (ctx.session.hook) {
       // Re-verify the ancestry first: an earlier lookup may have failed
@@ -725,22 +785,10 @@ const plugin: Plugin = {
     // Subagent children inherit the armed categories so a bypass armed on
     // the root session covers its spawned subagents doing the actual shell
     // work.
-    type BypassLease = {
-      categories: Set<BypassCategory>
-      expiresAt: number
-      /** Bypass mode (kill switch): all plugin checks skipped for the call. */
-      all?: boolean
-      custom?: string[]
-      /** Baseline this session had before Bypass mode lifted it to r/w;
-       *  restored verbatim (intersected with any concurrent tighten) when
-       *  the lease ends — so a TTL expiry can never permanently widen a
-       *  previously read-only baseline. */
-      restoreBaseline?: Perm
-    }
-    const bypassLeases = new Map<string, BypassLease>()
+    const bypassLeases = shared.bypassLeases
     // child → parent links (session lifetime, NOT lease lifetime): written on
     // session.created, cleared on session.deleted only.
-    const bypassParent = new Map<string, string>()
+    const bypassParent = shared.bypassParent
     // Assigned once the RPC in section 8b is registered.
     let bypassRpc:
       | { readonly events: { readonly emit: (...args: unknown[]) => Effect.Effect<void, unknown> } }
@@ -752,22 +800,22 @@ const plugin: Plugin = {
     // mutation paths except the user-side /perm clamp the new
     // baseline to the session's effective set, so sessions can only lose
     // capability. State is server-memory only; nothing enters model context.
-    const sessionPerms = new Map<string, Perm>()
+    const sessionPerms = shared.sessionPerms
     // Immutable ancestry, hydrated at execution boundaries or via events.
-    const permParent = new Map<string, string>()
+    const permParent = shared.permParent
     // Declared permission waiting for an authoritative execute.after childID.
     // `declared` marks a real agent-supplied ceiling (vs. the default
     // PERM_FULL bookkeeping entry) — a declared child may not inherit an
     // ancestor's Bypass mode.
-    const permStash = new Map<string, { parentSessionID: string; perm: Perm; at: number; declared?: boolean }>()
+    const permStash = shared.permStash
     // session.created observation times: a pending stash entry can only
     // belong to a child created after it was recorded (entry.at <=
     // createdAt). An unknown creation time applies every entry
     // (conservative tightening).
-    const permCreatedAt = new Map<string, number>()
-    const permBoundChildren = new Set<string>()
-    const permKnownRoots = new Set<string>()
-    const permUnresolved = new Set<string>()
+    const permCreatedAt = shared.permCreatedAt
+    const permBoundChildren = shared.permBoundChildren
+    const permKnownRoots = shared.permKnownRoots
+    const permUnresolved = shared.permUnresolved
     /** Per-level inheritance barrier against Bypass mode: sessions whose
      *  non-Bypass surface was explicitly asserted — by an agent declaration
      *  (subagent `permission`, set_permission) OR by the user's own
@@ -777,7 +825,32 @@ const plugin: Plugin = {
      *  The user's own armed lease on the barriered session still wins (own
      *  lease is checked first) — the barrier is never deleted, so expiry
      *  falls back to the declared mode, never to an ancestor's Bypass. */
-    const explicitNoBypass = new Set<string>()
+    const explicitNoBypass = shared.explicitNoBypass
+
+    // --- cross-instance change propagation -----------------------------------
+    // Every instance in this process shares the registry above. When ANY
+    // instance changes a session's state, the others must react exactly as
+    // the mutating instance does for its own descendants: refresh the merged
+    // notice (which also revokes this instance's running monitored calls and
+    // clears the shared approval cache when the security basis moved),
+    // re-sync descendants, and re-emit the TUI snapshots through this
+    // instance's own RPC channel. Reactions are idempotent — duplicated
+    // events only re-derive the same state.
+    const unsubscribeSharedState = shared.subscribe((event: SharedStateEvent) => {
+      if (event.kind !== "session-state-changed" || event.origin === instanceToken) return
+      syncSecurityNotice(event.sessionID)
+      syncBypassDescendants(event.sessionID)
+      syncPermDescendants(event.sessionID)
+      emitBypassChanged(event.sessionID, "updated")
+      emitPermChanged(event.sessionID, "updated")
+    })
+
+    /** Tell every other instance that this instance changed `sessionID`'s
+     *  security state. Called AFTER the local sync, so the mutating
+     *  instance's own transition is never reordered behind the bus. */
+    function publishSharedStateChange(sessionID: string) {
+      shared.publish({ kind: "session-state-changed", sessionID, origin: instanceToken })
+    }
 
     // Session.get reads the durable record, unlike the asynchronous event
     // consumer. Cache immutable ancestry only; failed reads are retried on the
@@ -789,9 +862,9 @@ const plugin: Plugin = {
         while (cursor) {
           if (seen.has(cursor) || seen.size >= 64) throw new Error("Invalid session ancestry")
           seen.add(cursor)
-          if (permKnownRoots.has(cursor)) break
+          if (permKnownRoots.has(cursor) && shared.sessionLocations.has(cursor)) break
           let parent = permParent.get(cursor)
-          if (!parent) {
+          if (!parent || !shared.sessionLocations.has(cursor)) {
             const lookup = cursor
             const info = await run(ctx.session.get({ sessionID: lookup }).pipe(Effect.timeout("2 seconds"))).catch((error) => {
               // The TUI creates sessions optimistically and pulls their status
@@ -804,18 +877,20 @@ const plugin: Plugin = {
             })
             if (info === notYetCreated) return
             if (!info || typeof info !== "object") throw new Error("Missing session record")
+            bindSessionHome(cursor, info)
             const value = (info as { parentID?: unknown }).parentID
             if (value != null && (typeof value !== "string" || !value)) throw new Error("Invalid parentID")
             parent = typeof value === "string" ? value : undefined
             if (parent) permParent.set(cursor, parent)
             else permKnownRoots.add(cursor)
           }
-          if (parent && resolved.bypassPropagateToSubagents) bypassParent.set(cursor, parent)
+          if (parent) bypassParent.set(cursor, parent)
           cursor = parent
         }
         for (const id of seen) permUnresolved.delete(id)
       } catch {
         permUnresolved.add(sessionID)
+        failureOrPass(resolved.failPolicy, "session_ancestry", writeReviewerTrace)
       }
       // Discovering inheritance (or resolving a previously unknown chain) is
       // itself a state transition. Append its notice, never edit model context.
@@ -830,11 +905,13 @@ const plugin: Plugin = {
      * describes one instant. */
     function effectivePerm(sessionID: string, now: number = Date.now()): Perm {
       pruneExpiredLeases(sessionID, now)
-      let perm = { ...resolved.permission.defaultPerm }
+      let perm = { ...PERM_FULL }
       const seen = new Set<string>()
       let cursor: string | undefined = sessionID
       while (cursor && !seen.has(cursor)) {
         seen.add(cursor)
+        const policy = policyForSession(cursor)
+        perm = permIntersect(perm, policy.defaultPerm)
         // Expire leases along the PERMISSION chain too, not only the bypass
         // chain: with bypassPropagateToSubagents=false the two chains can
         // differ, and a dead ancestor lease's lifted baseline must be
@@ -843,7 +920,7 @@ const plugin: Plugin = {
         if (lease && lease.expiresAt <= now) expireLease(cursor, lease, now)
         const baseline = sessionPerms.get(cursor)
         if (baseline) perm = permIntersect(perm, baseline)
-        if (permUnresolved.has(cursor)) perm.w = false
+        if (permUnresolved.has(cursor) && policy.failPolicy === "fail_close") perm.w = false
         const parent = permParent.get(cursor)
         // Do not guess which concurrent spawn produced this child. These
         // temporary ceilings disappear when its own call binds
@@ -894,6 +971,8 @@ const plugin: Plugin = {
       let cursor: string | undefined = sessionID
       while (cursor && !seen.has(cursor)) {
         if (permUnresolved.has(cursor)) return true
+        const home = shared.sessionLocations.get(cursor)
+        if (home !== undefined && !shared.locationPolicies.get(home)?.owners.size) return true
         seen.add(cursor)
         cursor = permParent.get(cursor)
       }
@@ -968,6 +1047,7 @@ const plugin: Plugin = {
       syncPermReminder(target)
       syncPermDescendants(target)
       emitPermChanged(target, "set")
+      publishSharedStateChange(target)
       return { ok: true }
     }
 
@@ -978,11 +1058,11 @@ const plugin: Plugin = {
     function bypassAncestors(sessionID: string): string[] {
       const chain: string[] = []
       const seen = new Set<string>([sessionID])
-      let cursor = resolved.bypassPropagateToSubagents ? bypassParent.get(sessionID) : undefined
+      let cursor = policyForSession(sessionID).propagateBypass ? bypassParent.get(sessionID) : undefined
       while (cursor && !seen.has(cursor)) {
         seen.add(cursor)
         chain.push(cursor)
-        cursor = bypassParent.get(cursor)
+        cursor = policyForSession(cursor).propagateBypass ? bypassParent.get(cursor) : undefined
       }
       return chain
     }
@@ -1052,7 +1132,7 @@ const plugin: Plugin = {
      * instant; the RPC status/emit paths share one capture across all lease
      * reads in a payload. */
     function activeBypass(sessionID: string, now: number = Date.now()): Set<BypassCategory> {
-      const active = new Set<BypassCategory>(resolved.bypassClassifier)
+      const active = new Set<BypassCategory>(policyForSession(sessionID).permanentBypass)
       for (const target of [sessionID, ...bypassAncestors(sessionID)]) {
         const lease = bypassLeases.get(target)
         if (lease && lease.expiresAt > now) for (const category of lease.categories) active.add(category)
@@ -1122,9 +1202,9 @@ const plugin: Plugin = {
       // could claim "armed with no lease" — the TUI trusts the snapshot and
       // would show a stale badge until the next event.
       const now = Date.now()
-      const permanent = [...resolved.bypassClassifier].sort()
+      const permanent = [...policyForSession(sessionID).permanentBypass].sort()
       const active = activeForRpc(sessionID, now)
-      const temporary = active.filter((category) => !resolved.bypassClassifier.has(category as BypassCategory))
+      const temporary = active.filter((category) => !permanent.includes(category as BypassCategory))
       // expiresAt is optional on the wire: absent = no live lease, null =
       // armed without a natural expiry. Emitting the key with `undefined`
       // fails the host schema's optional-presence check, and the host then
@@ -1161,6 +1241,7 @@ const plugin: Plugin = {
      *  worth announcing (and under an RO cap it is not removed at all);
      *  `slow` never reaches the agent channel. */
     function securityNotice(sessionID: string, now: number = Date.now(), includeDefault = false): string | undefined {
+      const policy = policyForSession(sessionID)
       const effective = effectivePerm(sessionID, now)
       const all = allBypassed(sessionID, now)
       const mode = securityModeFor(effective, all)
@@ -1232,12 +1313,12 @@ const plugin: Plugin = {
       // nothing bypassed). The default check compares r/w only — x is a
       // display bit no action maps to.
       const isDefault =
-        effective.r === resolved.permission.defaultPerm.r &&
-        effective.w === resolved.permission.defaultPerm.w
+        effective.r === policy.defaultPerm.r &&
+        effective.w === policy.defaultPerm.w
       if (isDefault && authorizationLines.length === 0 && !includeDefault) return undefined
       const parts = [
         `Security mode: ${securityModeLabel("auto", categories, custom.length > 0)}.`,
-        !resolved.sandbox.enabled || resolved.sandbox.mode === "full"
+        !policy.sandboxEnabled || policy.sandboxFull
           ? "Shell commands run directly on the host."
           : dynamic
             ? "Shell commands run under a runtime observer; the automatic safety review is skipped."
@@ -1263,14 +1344,16 @@ const plugin: Plugin = {
       sessionNotices.setPerm(sessionID, securityNotice(sessionID, now, includeDefault))
       sessionNotices.setBypass(sessionID, undefined)
       const currentSnapshot = securitySnapshotFor(sessionID, now)
-      // A mode/lease change must revoke already-running monitored calls too,
-      // not just future permissions. Observer EOF stops its process tree.
+      // A mode/lease change revokes running calls, not only future permission
+      // assertions. The broker sends explicit cancellation; unobserved
+      // foreground calls use the original executor's interruption path.
       for (const authorization of boundaryCalls.values()) {
-        if (authorization.sessionID !== sessionID || !authorization.runtimeBroker) continue
+        if (authorization.sessionID !== sessionID) continue
         if (authorization.securitySnapshot === currentSnapshot) continue
         authorization.runtimeBlocked = "the session's security mode or authorization changed while the command was running"
         authorization.runtimeBlockedPhase ??= "unknown" // revoked mid-run: never "not performed"
-        void authorization.runtimeBroker.close()
+        if (authorization.runtimeBroker) void authorization.runtimeBroker.close()
+        else authorization.cancelExecution?.()
       }
     }
 
@@ -1297,6 +1380,7 @@ const plugin: Plugin = {
         if (activeBypass(sessionID).size === 0 && activeCustomBypass(sessionID).length === 0 && !allBypassed(sessionID))
           emitBypassChanged(sessionID, "expired")
         else emitBypassChanged(sessionID, "updated")
+        publishSharedStateChange(sessionID)
       }
     }
 
@@ -1353,7 +1437,7 @@ const plugin: Plugin = {
     function restoreStashedBaseline(sessionID: string, lease: BypassLease | undefined) {
       const stashed = lease?.restoreBaseline
       if (!stashed) return
-      const current = sessionPerms.get(sessionID) ?? { ...resolved.permission.defaultPerm }
+      const current = sessionPerms.get(sessionID) ?? { ...policyForSession(sessionID).defaultPerm }
       const restored = permIntersect(current, stashed)
       sessionPerms.set(sessionID, restored)
       if (!permEqual(restored, current)) emitPermChanged(sessionID, "restored")
@@ -1361,8 +1445,14 @@ const plugin: Plugin = {
 
     /** End a lease: delete it and restore the stashed pre-bypass baseline
      *  (if the Bypass transition raised it). The stash is consumed either way
-     *  so a later expiry can never resurrect an earlier ceiling. */
+     *  so a later expiry can never resurrect an earlier ceiling.
+     *  Idempotency claim: the lease map is shared by every plugin instance in
+     *  this process and several of them may sweep or lazily prune the same
+     *  deadline — only the call holding the exact lease object still in the
+     *  map ends it, so double sweeps are harmless and a re-armed replacement
+     *  lease is never expired by a stale sweep snapshot. */
     function expireLease(sessionID: string, lease: BypassLease, now?: number) {
+      if (bypassLeases.get(sessionID) !== lease) return
       bypassLeases.delete(sessionID)
       restoreStashedBaseline(sessionID, lease)
       // Lazy expiry can happen on a status/permission read before the timer.
@@ -1373,6 +1463,7 @@ const plugin: Plugin = {
         syncSecurityNotice(sessionID, now)
         syncBypassDescendants(sessionID)
         syncPermDescendants(sessionID)
+        publishSharedStateChange(sessionID)
       })
     }
 
@@ -1392,7 +1483,7 @@ const plugin: Plugin = {
           // belongs to the first transition, not to the latest re-arm.
           restoreBaseline: existing?.all === true
             ? existing.restoreBaseline
-            : sessionPerms.get(sessionID) ?? { ...resolved.permission.defaultPerm },
+            : sessionPerms.get(sessionID) ?? { ...policyForSession(sessionID).defaultPerm },
         })
         // Every arm channel (/perm bypass too, not only /bypass) must wake
         // the sweep so the new deadline is observed.
@@ -1439,6 +1530,7 @@ const plugin: Plugin = {
       syncPermDescendants(sessionID)
       emitBypassChanged(sessionID, bypassReason)
       emitPermChanged(sessionID, permReason)
+      publishSharedStateChange(sessionID)
     }
 
     /** The single user-side security-mode transition shared by /perm mode
@@ -1625,15 +1717,27 @@ const plugin: Plugin = {
     // final outcome are separate events, NOT separate JEV calls. Appended to
     // ~/.opencode/reviewer-trace.jsonl. Fire-and-forget — a logging failure
     // must never alter the review outcome or block a command.
+    // Failure passes always have an audit sink. With verbose tracing disabled,
+    // keep this minimal code-only trace in the configured scratch directory.
     const reviewerTraceFile = resolved.logReviewerTrace
       ? path.join(homedir(), ".opencode", "reviewer-trace.jsonl")
-      : undefined
+      : path.join(resolved.sandbox.scratch, "reviewer-trace.jsonl")
     function writeReviewerTrace(entry: Record<string, unknown>) {
-      if (!reviewerTraceFile) return
+      if (!resolved.logReviewerTrace && entry.kind !== "fail_open_pass") return
       const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n"
       void mkdir(path.dirname(reviewerTraceFile), { recursive: true })
         .then(() => appendFile(reviewerTraceFile, line, "utf8"))
         .catch(() => {})
+    }
+
+    function passFailure(code: string, call?: Pick<BoundaryInvocation, "sessionID" | "id">, authorization?: BoundaryAuthorization): boolean {
+      return failureOrPass(resolved.failPolicy, code, (entry) => {
+        writeReviewerTrace({ ...entry, ...(call ? { sessionID: call.sessionID, callID: call.id } : {}) })
+        if (authorization) {
+          authorization.failOpenPasses ??= []
+          authorization.failOpenPasses.push(code)
+        }
+      })
     }
 
 
@@ -1698,8 +1802,10 @@ const plugin: Plugin = {
        *  (read-only sessions still using a kernel profile). */
       executionRoute?: "host_direct_reviewed" | "readonly_sandbox" | "kernel_sandbox" | "runtime_boundary_watch"
       runtimeBroker?: RuntimeBoundaryBroker
+      cancelExecution?: () => void
       cacheUpdates?: Array<{ scope: ApprovalCacheScope; facts: ApprovalCacheFacts }>
       runtimeBlocked?: string
+      failOpenPasses?: string[]
       /** Phase of the refused crossing. Only "entry" (the helper emitted
        *  atExit:false — the syscall was still held before execution) may
        *  claim the boundary operation was not performed. "exit" (recvmsg
@@ -1716,9 +1822,14 @@ const plugin: Plugin = {
       asserted?: boolean
     }
     const boundaryCalls = new Map<string, BoundaryAuthorization>()
-    const securityBases = new Map<string, string>()
-    const securityEpochs = new Map<string, number>()
-    const approvalCache = createApprovalCache()
+    // Security-snapshot bases/epochs, the approval cache and the L3 grants are
+    // shared process-wide: a snapshot computed by one instance must be
+    // byte-identical for every other instance (admissions re-verify against
+    // it, and the approval cache keys on it), and a session's cached
+    // approvals/grants must not split by which instance serves the call.
+    const securityBases = shared.securityBases
+    const securityEpochs = shared.securityEpochs
+    const approvalCache = shared.approvalCache
     const sharedReviews = createSingleFlight<EffectReviewResult>()
     const digest = (value: string) => createHash("sha256").update(value).digest("hex")
     let boundaryWatchFingerprint: string | undefined
@@ -1729,6 +1840,30 @@ const plugin: Plugin = {
       typeof (ctx.options as { reviewCommand?: unknown }).reviewCommand === "function"
         ? (ctx.options as { reviewCommand: (request: EffectReviewRequest, options: { signal: AbortSignal }) => Promise<EffectReviewResult> }).reviewCommand
         : undefined
+
+    const injectedRootReview = (injectedEffectsReview as typeof injectedEffectsReview & {
+      rootWidening?: ((request: RootWideningInput) => Promise<unknown>) & { trace?: (entry: L3Trace) => void }
+    })?.rootWidening
+    const rootWidening = createRootWidening({
+      state: shared.l3,
+      trace: (entry) => {
+        writeReviewerTrace({ ...entry })
+        injectedRootReview?.trace?.(entry)
+      },
+      review: async (request) => {
+        if (injectedRootReview) return injectedRootReview(request)
+        const jev = resolved.dynamicReview.jev
+        if (!jev?.available) throw new Error("L3 reviewer unavailable")
+        return reviewRootWidening(request, { endpoint: jev.endpoint, apiKey: jev.apiKey ?? "", timeoutMs: resolved.dynamicReview.timeoutMs })
+      },
+    })
+    async function rootWideningContext(sessionID: string): Promise<RootWideningContext> {
+      if (!ctx.session.context) throw new Error("L3 context unavailable")
+      const retained = boundarySessionContext(await run(ctx.session.context({ sessionID })))
+      return { scope: { sessionID, canWrite: effectivePerm(sessionID).w,
+        userMessageDigest: digest(retained.userRequest), securitySnapshot: securitySnapshotFor(sessionID) },
+      user_request: retained.userRequest, session_context: retained.context }
+    }
 
     async function callEffectsReviewer(request: EffectReviewRequest, signal: AbortSignal, readonly = false): Promise<EffectReviewResult> {
       if (signal.aborted) throw new EffectsReviewError("Effects review was cancelled", "aborted")
@@ -1902,10 +2037,12 @@ const plugin: Plugin = {
     async function recordCallCacheOutcome(authorization: BoundaryAuthorization, exit: number | undefined): Promise<void> {
       // A non-zero exit still finished under the approval (`grep` without a
       // match, `cmd; false`): the objects it wrote are the approved ones.
-      if (exit === undefined || authorization.runtimeBlocked || !authorization.cacheUpdates?.length || !ctx.session.context) return
-      const latest = boundarySessionContext(await run(ctx.session.context({ sessionID: authorization.sessionID })))
+      if (exit === undefined || authorization.runtimeBlocked || !authorization.cacheUpdates?.length) return
       for (const update of authorization.cacheUpdates) {
-        if (securitySnapshotFor(authorization.sessionID) !== update.scope.securitySnapshot || digest(latest.userRequest) !== update.scope.userAuthorizationDigest) continue
+        // Only the security epoch gates recording: positive entries are not
+        // bound to the user message, so a newer message does not stop this
+        // call's outcome from advancing its grants.
+        if (securitySnapshotFor(authorization.sessionID) !== update.scope.securitySnapshot) continue
         approvalCache.recordTargets(update.scope, update.facts, await currentCacheTargets(update.facts.targets).catch(() => []))
       }
     }
@@ -1914,25 +2051,45 @@ const plugin: Plugin = {
       command: string, raw: Record<string, unknown>, call: BoundaryInvocation,
       authorization: BoundaryAuthorization, cwd: string, roots: string[], preparationSignal: AbortSignal,
       additionalDenyWrite: readonly string[] = [], readOnlyDenyRead: readonly string[] = [],
+      temporaryWriteRoots: readonly string[] = [],
+      observedWriteRoots: readonly string[] = [],
     ): Promise<void> {
-      // Missing observer is a pre-launch block, never permission to silently
-      // run an unreviewed program on the host.
       await access(DEFAULT_BOUNDARY_WATCH_HELPER, 1).catch(() => {
-        throw blockedRejection("the runtime boundary observer is unavailable, so this shell command cannot start")
+        throw new SecurityCheckFailure("observer_unavailable", "the runtime boundary observer is unavailable, so this shell command cannot start")
       })
       // A helper image replaced after this process started must not be
       // silently executed under old approvals — require a plugin restart.
       const helperInfo = await lstat(DEFAULT_BOUNDARY_WATCH_HELPER, { bigint: true }).catch(() => undefined)
-      if (!helperInfo) throw blockedRejection("the runtime boundary observer is unavailable, so this shell command cannot start")
+      if (!helperInfo?.isFile()) throw new SecurityCheckFailure("observer_unavailable", "the runtime boundary observer is unavailable, so this shell command cannot start")
       const helperFingerprint = `${helperInfo.dev}:${helperInfo.ino}:${helperInfo.size}:${helperInfo.mtimeNs}`
       if (boundaryWatchFingerprint === undefined) boundaryWatchFingerprint = helperFingerprint
       else if (boundaryWatchFingerprint !== helperFingerprint)
-        throw blockedRejection("the runtime boundary observer binary changed on disk; restart the session before running more commands")
+        throw new SecurityCheckFailure("observer_changed", "the runtime boundary observer binary changed on disk; restart the session before running more commands")
       const runtimeCwd = await canonicalBoundaryPath(typeof raw.workdir === "string" ? nativeAbsolutePath(cwd, raw.workdir) : cwd)
       if (typeof raw.workdir === "string") raw.workdir = runtimeCwd
       const deniedWritePaths = await Promise.all([...resolved.sandbox.denyWrite, ...additionalDenyWrite]
         .map((target) => canonicalBoundaryPath(target)))
-      const incidentalRoots = incidentalWriteRoots()
+      const incidentalRoots = [...incidentalWriteRoots(), ...observedWriteRoots]
+      const currentWriteRoots = (scope: RootWideningScope) => [
+        ...roots.filter((root) => !temporaryWriteRoots.includes(root)), ...rootWidening.activeRoots(scope),
+      ]
+      const writePolicy = (): WriteRootPolicy => ({
+        home: homedir(), cwd: runtimeCwd, credentialPaths: credentialStoreReadPaths(homedir()),
+        denyWrite: deniedWritePaths,
+        protect: [DEFAULT_BOUNDARY_WATCH_HELPER, PACKAGE_ROOT, path.dirname(broker.socketPath)],
+        brokerBase: "/tmp/opencode",
+      })
+      const rememberAllowedWrite = (event: RuntimeBoundaryEvent) => {
+        if (event.kind !== "write" || !effectivePerm(call.sessionID).w) return
+        void rootWideningContext(call.sessionID).then((retained) => {
+          if (retained.scope.securitySnapshot !== authorization.securitySnapshot) return
+          rootWidening.recordAllowedWrite({ scope: retained.scope, callID: boundaryKey(call), command, event,
+            policy: writePolicy(), workspace: cwd, currentRoots: currentWriteRoots(retained.scope),
+            context: () => rootWideningContext(call.sessionID) })
+        }).catch(() => {
+          writeReviewerTrace({ kind: "l3_root_error", sessionID: call.sessionID, commandSha256: digest(command), policyVersion: L3_POLICY_VERSION })
+        })
+      }
       let eventPhase: "entry" | "exit" | "unknown" = "unknown"
       // The whole-command static proof is computed at most once per call and
       // only when a crossing can use it. It never refuses: the two-state
@@ -1951,7 +2108,7 @@ const plugin: Plugin = {
       }).then((decision) => {
         proofRules = decision.rules
         return { verdict: decision.verdict, rules: decision.rules }
-      }, () => ({ verdict: "ASK" as const, rules: ["static.unavailable"] }))
+      })
       const commandProofRules = () => proofRules
       const blocked = (reason: string) => {
         // First refusal reason wins: a downstream broker EOF/cancel must not
@@ -1959,6 +2116,12 @@ const plugin: Plugin = {
         authorization.runtimeBlocked ??= reason
         authorization.runtimeBlockedPhase ??= eventPhase
         return { action: "deny" as const, reason }
+      }
+      const failed = (code: string, reason: string) => {
+        if (authorization.runtimeBlocked) return blocked(authorization.runtimeBlocked)
+        if (preparationSignal.aborted) return blocked("the command was cancelled at its sandbox boundary")
+        if (securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot) return blocked("the session's security mode or authorization changed")
+        return passFailure(code, call, authorization) ? { action: "allow" as const } : blocked(reason)
       }
       // Name-matched incidental writes (any `__pycache__`/`.pytest_cache`
       // component) bypass the boundary in EVERY mode — but never inside a
@@ -1968,20 +2131,14 @@ const plugin: Plugin = {
       // target path is already canonicalized by the observer.
       const incidentalWriteExempt = (target: string): boolean => {
         if (!isIncidentalToolWrite(target) && !incidentalRoots.some((root) => containsPath(root, target))) return false
-        for (const root of [...deniedWritePaths, path.dirname(broker.socketPath)]) {
-          if (containsPath(root, target)) return false
-        }
-        for (const root of [DEFAULT_BOUNDARY_WATCH_HELPER, PACKAGE_ROOT]) {
-          // protect semantics gate an ancestor write too — a rename/unlink
-          // on a parent swaps the whole subtree.
-          if (containsPath(root, target) || containsPath(target, root)) return false
-        }
-        const sensitivity = checkPathSensitivity(target, { cwd: runtimeCwd, worktree: runtimeCwd })
-        return sensitivity.parseable && !sensitivity.sensitive
+        return writeTargetExempt(target, writePolicy())
       }
       const broker = await createRuntimeBoundaryBroker({
         directory: "/tmp/opencode",
-        onError: (reason) => { blocked(reason) },
+        failPolicy: resolved.failPolicy,
+        onError: (reason) => { failed("broker_unavailable", reason) },
+        onFailure: (code) => { failed(code, "the runtime boundary observer could not complete its check") },
+        onCancelFailure: () => authorization.cancelExecution?.(),
         onBoundary: async (event: RuntimeBoundaryEvent, signal) => {
           try {
           authorization.runtimeStats!.crossings++
@@ -1990,7 +2147,8 @@ const plugin: Plugin = {
           eventPhase = event.details.atExit === true ? "exit"
             : event.details.atExit === false ? "entry" : "unknown"
           await hydratePermAncestry(call.sessionID)
-          if (signal.aborted) return blocked("the command was cancelled at its sandbox boundary")
+          if (preparationSignal.aborted) return blocked("the command was cancelled at its sandbox boundary")
+          if (signal.aborted) return failed("broker_unavailable", "the runtime boundary observer connection failed")
           if (securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot) {
             return blocked("the session's security mode or authorization changed")
           }
@@ -1999,6 +2157,14 @@ const plugin: Plugin = {
           if (event.kind === "write" && event.targets.length > 0 &&
             event.targets.every((target) => incidentalWriteExempt(target.path))) {
             return { action: "continue" }
+          }
+          if (canWrite && event.kind === "write" && rootWidening.hasGrants(call.sessionID)) {
+            try {
+              const retained = await rootWideningContext(call.sessionID)
+              if (rootWidening.targetsExempt(retained.scope, event.targets.map((target) => target.path), writePolicy())) return { action: "continue" }
+            } catch {
+              writeReviewerTrace({ kind: "l3_root_error", sessionID: call.sessionID, commandSha256: digest(command), policyVersion: L3_POLICY_VERSION })
+            }
           }
           // Read-only hard denies: a non-exempt write or a privilege
           // crossing is an obvious write — refused without a reviewer.
@@ -2009,6 +2175,12 @@ const plugin: Plugin = {
               : "this session is in [Read only] mode: the observed operation exceeds its read-only limit")
           }
           if (event.kind === "read" && !permission.r) return blocked("this session does not allow file reads")
+          if (event.kind === "write" && event.targets.some((target) =>
+            deniedWritePaths.some((root) => containsPath(root, target.path)) ||
+            [path.dirname(broker.socketPath), DEFAULT_BOUNDARY_WATCH_HELPER, PACKAGE_ROOT]
+              .some((root) => containsPath(root, target.path) || containsPath(target.path, root)))) {
+            return blocked("the observed write hits a protected or denied path")
+          }
           const bypass = activeBypass(call.sessionID)
           // Disabling review layers cannot waive the independent RO
           // conformance check, especially before a full-tree detach.
@@ -2049,6 +2221,7 @@ const plugin: Plugin = {
             commandVerdict: async () => (await commandProof()).verdict,
           })
           if (staticVerdict === "ALLOW") {
+            rememberAllowedWrite(event)
             authorization.runtimeStats!.staticAllows++
             authorization.source = "runtime_static_allow"
             writeReviewerTrace({ kind: "effects_static_allow", sessionID: call.sessionID, callID: call.id,
@@ -2057,10 +2230,13 @@ const plugin: Plugin = {
                 ...(executable ? { executable: path.basename(executable) } : {}) } })
             return { action: "continue" }
           }
-          if (!ctx.session.context) return blocked("the safety review could not read the session's user authorization")
+          if (!ctx.session.context) return failed("session_context", "the safety review could not read the session's user authorization")
           const retained = boundarySessionContext(await run(ctx.session.context({ sessionID: call.sessionID }), signal))
           const observed = await currentCacheTargets(event.targets)
-          if (!targetIdentitiesMatch(event.targets, observed)) return blocked("a boundary target changed before it could be checked")
+          if (!targetIdentitiesMatch(event.targets, observed)) return failed("target_changed", "a boundary target changed before it could be checked")
+          if (observed.some((target) => target.inspectionError) && resolved.failPolicy === "fail_open") {
+            return failed("target_inspection", "the boundary target evidence could not be inspected")
+          }
           const metadata = await Promise.all(observed.map(async (target) => {
             let inspectionError: string | undefined
             const info = await lstat(target.path, { bigint: true }).catch((error: unknown) => {
@@ -2084,7 +2260,9 @@ const plugin: Plugin = {
                 "Session security mode: [Read only]",
                 `Read-only session: writes are permitted only inside these roots and the exempt tool cache/history effects (any __pycache__ or .pytest_cache path component): ${JSON.stringify(roots)}`,
               ]),
-              `Current allowed write roots: ${JSON.stringify(roots)}`,
+              `Current allowed write roots: ${JSON.stringify(currentWriteRoots({
+                sessionID: call.sessionID, canWrite, securitySnapshot: authorization.securitySnapshot, userMessageDigest: digest(retained.userRequest),
+              }))}`,
               `Current boundary object metadata: ${JSON.stringify(metadata)}`,
               `Executing image identity (dev:ino:size:mtimeNs): ${JSON.stringify(executableIdentity ?? null)}`,
               `Independent session read/write ceiling: ${permLabel(permission)}`,
@@ -2095,29 +2273,51 @@ const plugin: Plugin = {
           }
           const scope: ApprovalCacheScope = { sessionID: call.sessionID, securitySnapshot: authorization.securitySnapshot, userAuthorizationDigest: digest(retained.userRequest) }
           const reviewPolicyVersion = canWrite ? EFFECTS_POLICY_VERSION : EFFECTS_POLICY_VERSION_READONLY
-          // Assistant progress and tool output are not new authorization, and
-          // must not destroy an otherwise stable exact approval on every call.
+          const writeEffect = runtimeWriteEffect(event)
+          const networkEndpoint = event.kind === "network" ? observedNetworkEndpoint(event.details) : undefined
+          const requiresFullApproval = event.details.requiresFullApproval === true || event.kind === "network" && !networkEndpoint
+          // L1 keys on the boundary core — crossing kind/syscall/operation/
+          // effect, target identities, image identity and (non-shell) argv,
+          // cwd, review policy and bypass surface — never the command text,
+          // user_request or volatile metadata. A pipeline suffix or an
+          // appended `; echo x` replays the same crossing's adjudication.
           const facts: ApprovalCacheFacts = {
-            exactDigest: digest(JSON.stringify({ ...request, session_context: [], policyVersion: reviewPolicyVersion })),
+            coreDigest: boundaryCoreDigest({
+              kind: event.kind, syscall: event.syscall, operation: event.operation, effect: writeEffect,
+              targets: observed, executable, executableIdentity,
+              network: event.kind === "network" ? event.details : undefined,
+              argv: Array.isArray(rawArgv) ? rawArgv : undefined, argvDigest,
+              cwd: runtimeCwd, policyVersion: reviewPolicyVersion,
+              bypassCategories: request.bypass.categories, customBypass: custom,
+              requiresFullApproval,
+            }),
             kind: event.kind, operation: event.operation, targets: observed,
-            requiresFullApproval: event.details.requiresFullApproval === true,
-            effect: runtimeWriteEffect(event),
+            requiresFullApproval,
+            networkEndpoint,
+            effect: writeEffect,
           }
           const hit = approvalCache.lookup(scope, facts)
           let result: EffectReviewResult
           if (hit) {
             authorization.runtimeStats!.cacheHits++
-            const latest = boundarySessionContext(await run(ctx.session.context({ sessionID: call.sessionID }), signal))
+            // The exact negative verdict has already been selected. A later
+            // context/cache inspection failure must not turn it into a pass.
+            if (hit.decision === "deny") return blocked(hit.result ? reviewRefusal(hit.result).reason : "a previous safety review denied the same operation")
             const currentTargets = await currentCacheTargets(observed)
-            if (signal.aborted || securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot || digest(latest.userRequest) !== scope.userAuthorizationDigest ||
-              currentTargets.some((target) => target.inspectionError) || !targetIdentitiesMatch(observed, currentTargets)) {
+            // Positive cache reuse is not bound to the user message: a new
+            // message does not revoke an allowed verdict. (Deny hits already
+            // returned above, still bound to their message by the lookup.)
+            if (preparationSignal.aborted || securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot) {
               return blocked("the boundary authorization or target changed before its cached approval could be used")
+            }
+            if (currentTargets.some((target) => target.inspectionError) || !targetIdentitiesMatch(observed, currentTargets)) {
+              return failed("target_changed", "the boundary authorization or target changed before its cached approval could be used")
             }
             authorization.source = `cache:${hit.layer}`
             writeReviewerTrace({ kind: "effects_cache_hit", sessionID: call.sessionID, callID: call.id,
               commandSha256: digest(command), eventID: event.eventID, layer: hit.layer, decision: hit.decision })
-            if (hit.decision === "deny") return blocked(hit.result ? reviewRefusal(hit.result).reason : "a previous safety review denied the same operation")
             if (hit.layer === "L2" || !event.details.requiresFullApproval) {
+              rememberAllowedWrite(event)
               authorization.cacheUpdates ??= []
               authorization.cacheUpdates.push({ scope, facts })
               return { action: "continue" }
@@ -2125,7 +2325,7 @@ const plugin: Plugin = {
             result = hit.result!
           } else {
             try {
-              result = await sharedReviews.run(digest(JSON.stringify([scope, facts.exactDigest])), signal,
+              result = await sharedReviews.run(digest(JSON.stringify([scope, facts.coreDigest])), signal,
                 (sharedSignal) => reviewBoundaryRequest(request, observed.map((target) => target.path), sharedSignal, cwd, {
                   sessionID: call.sessionID, callID: call.id, commandSha256: digest(command), tool: "shell",
                   staticRules: commandProofRules(), eventID: event.eventID,
@@ -2134,20 +2334,35 @@ const plugin: Plugin = {
                   stats: authorization.runtimeStats,
                 }, !canWrite))
             } catch (error) {
-              return blocked(reviewUnavailableReason(error instanceof EffectsReviewError ? error.kind : "infrastructure"))
+              if (preparationSignal.aborted) return blocked("the command was cancelled at its sandbox boundary")
+              if (error instanceof EffectsReviewError && error.kind === "aborted" && !signal.aborted) return blocked("the command was cancelled at its sandbox boundary")
+              return failed(error instanceof EffectsReviewError ? `review_${error.kind}` : "review_unavailable", reviewUnavailableReason(error instanceof EffectsReviewError ? error.kind : "infrastructure"))
             }
             writeReviewerTrace({ kind: "effects_boundary_outcome", sessionID: call.sessionID, callID: call.id,
               commandSha256: digest(command), eventID: event.eventID, decision: result.decision, source: result.source,
               floor: result.floor, reviewer: injectedEffectsReview ? "test_injection" : "jev", policyVersion: reviewPolicyVersion })
           }
-          const latest = boundarySessionContext(await run(ctx.session.context({ sessionID: call.sessionID }), signal))
-          if (signal.aborted || securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot || digest(latest.userRequest) !== scope.userAuthorizationDigest) {
+          // A completed deny remains final even if subsequent cache or
+          // identity bookkeeping fails.
+          if (result.decision !== "allow") {
+            const refusal = blocked(reviewRefusal(result).reason)
+            // Bookkeeping is best-effort after a real deny; its exception
+            // must never erase or turn that completed decision into a pass.
+            try { if (!hit) approvalCache.store(scope, facts, result) } catch {
+              passFailure("cache_store", call, authorization)
+            }
+            return refusal
+          }
+          // A positive verdict stands on its own: it is stored unbound to
+          // the user message, so a newer message mid-review does not block
+          // it. (Denials returned above, still bound to their message.)
+          if (preparationSignal.aborted || securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot) {
             return blocked("the session's user authorization changed during the boundary check")
           }
           const reviewedTargets = await currentCacheTargets(observed)
-          if (!targetIdentitiesMatch(observed, reviewedTargets)) return blocked("a boundary target changed during the safety review")
+          if (!targetIdentitiesMatch(observed, reviewedTargets)) return failed("target_changed", "a boundary target changed during the safety review")
           if (reviewedTargets.some((target, index) => target.inspectionError && !observed[index]?.inspectionError)) {
-            return blocked("the reviewed target identity is now unavailable; it must be checked again with that evidence gap")
+            return failed("target_inspection", "the reviewed target identity is now unavailable; it must be checked again with that evidence gap")
           }
           // requiresFullApproval (opaque/exec-domain/capability) events never
           // get a positive cache entry: executable identity + argv still does
@@ -2160,6 +2375,7 @@ const plugin: Plugin = {
             !(facts.requiresFullApproval ?? false)
           if (!hit && storable) approvalCache.store(scope, facts, result)
           if (result.decision !== "allow") return blocked(reviewRefusal(result).reason)
+          rememberAllowedWrite(event)
           authorization.source = hit ? `cache:${hit.layer}` : result.source
           authorization.cacheUpdates ??= []
           authorization.cacheUpdates.push({ scope, facts })
@@ -2174,7 +2390,7 @@ const plugin: Plugin = {
             // to record the refusal: the broker replies 'deny', and without
             // runtimeBlocked the command would die with a bare 126 and no
             // reason anywhere (foreground notice AND metadata depend on it).
-            return blocked(`the runtime boundary evidence could not be collected (${inspectionErrorCode(error)})`)
+            return failed("boundary_inspection", `the runtime boundary evidence could not be collected (${inspectionErrorCode(error)})`)
           }
         },
       })
@@ -2195,11 +2411,15 @@ const plugin: Plugin = {
         // the control plane mid-command. This holds even when the session
         // workspace IS this repository. Not content review: integrity.
         protect: [path.dirname(broker.socketPath), DEFAULT_BOUNDARY_WATCH_HELPER,
-          PACKAGE_ROOT],
+          PACKAGE_ROOT, ...temporaryWriteRoots, ...observedWriteRoots],
+        // Explicit/worktree roots stay observed for per-target exclusions;
+        // L3 roots also re-check expiry/revocation on every write. Safe local
+        // continuations do not need another static/JEV review.
         // Read only passes only the global temp roots (see runBoundaryBefore),
         // so writes there run and every other write is a boundary event the
         // broker refuses; the helper's all-writes switch would block temp too.
         readonly: false,
+        failOpen: resolved.failPolicy === "fail_open",
         // The helper waits at most this long for one decision; the review
         // path can spend up to two model rounds plus bounded evidence
         // collection. Cancellation still fails closed (deny), not pass.
@@ -2216,8 +2436,9 @@ const plugin: Plugin = {
     ): Promise<{ input: unknown; authorization: BoundaryAuthorization }> {
       await hydratePermAncestry(call.sessionID)
       const info = await run(ctx.session.get({ sessionID: call.sessionID }), signal) as { location?: { directory?: unknown } }
+      bindSessionHome(call.sessionID, info)
       if (typeof info?.location?.directory !== "string" || !info.location.directory) {
-        throw blockedRejection("the plugin could not get this session's workspace directory from the host")
+        throw new SecurityCheckFailure("session_workspace", "the plugin could not get this session's workspace directory from the host")
       }
       const directory = info.location.directory
       // The admission snapshot binds EVERYTHING a granted call relies on —
@@ -2268,20 +2489,20 @@ const plugin: Plugin = {
       const absoluteWorkspace = nativeAbsolutePath(directory, ".")
       const cwd = await canonicalBoundaryPath(absoluteWorkspace)
       if (cwd !== absoluteWorkspace) {
-        throw blockedRejection("the session's workspace path is not canonical (for example, it goes through a symbolic link), so paths cannot be checked reliably")
+        throw new SecurityCheckFailure("workspace_noncanonical", "the session's workspace path is not canonical (for example, it goes through a symbolic link), so paths cannot be checked reliably")
       }
       if (cwd === path.parse(cwd).root) {
-        throw blockedRejection("the session's workspace is the filesystem root, which this plugin does not support for native tools")
+        throw new SecurityCheckFailure("workspace_unsupported", "the session's workspace is the filesystem root, which this plugin does not support for native tools")
       }
       const workspaceIdentity = await lstat(cwd).catch((error: unknown) => {
         throw new BoundaryPreparationError("Workspace inspection is unavailable", `the session workspace metadata could not be inspected (${inspectionErrorCode(error)})`)
       })
-      if (!workspaceIdentity.isDirectory()) throw blockedRejection("the session's workspace is not a local directory")
+      if (!workspaceIdentity.isDirectory()) throw new SecurityCheckFailure("workspace_unsupported", "the session's workspace is not a local directory")
       const bypass = activeBypass(call.sessionID)
       const custom = activeCustomBypass(call.sessionID)
       const scratchRoot = await canonicalBoundaryPath(resolved.sandbox.scratch)
       if (scratchRoot !== resolved.sandbox.scratch) {
-        throw blockedRejection("the plugin's configured temporary directory is not a canonical path; this is a configuration problem")
+        throw new SecurityCheckFailure("scratch_noncanonical", "the plugin's configured temporary directory is not a canonical path; this is a configuration problem")
       }
       // Auto and ReadOnly share the incidental tool cache/history roots
       // (~/.cache, *.sqlite_history-style files): a read-oriented command's
@@ -2294,16 +2515,54 @@ const plugin: Plugin = {
       const incidental = incidentalWriteRoots().filter((root) =>
         !credentialPaths.some((credential) => containsPath(credential, root)) &&
         !checkPathSensitivity(root, { cwd, worktree: cwd }).sensitive)
+      const configuredRoots = resolved.sandbox.allowWrite.filter((root) => !writeRootRejection(root, {
+        home: homedir(), cwd, credentialPaths, denyWrite: resolved.sandbox.denyWrite,
+        protect: [PACKAGE_ROOT, DEFAULT_BOUNDARY_WATCH_HELPER], brokerBase: "/tmp/opencode",
+      }))
+      // A linked git worktree's private metadata directory (resolved from the
+      // cwd/.git pointer and fully verified — see linkedWorktreePrivateDir)
+      // is part of the session's writable surface for SHELL commands in
+      // Auto/write sessions: git's routine bookkeeping there (index, HEAD,
+      // reflogs) must not cost a boundary review. Read-only sessions stay
+      // unchanged, native file tools keep their normal plan, and the root
+      // passes the same exclusions as configured incidental roots
+      // (denyWrite/protect/credential/sensitivity/canonicality) — any
+      // verification or exclusion failure simply yields no extra root.
+      let worktreePrivateRoots: string[] = []
+      if (tool === "shell" && !readOnly) {
+        const candidate = await linkedWorktreePrivateDir(cwd)
+        if (candidate && !writeRootRejection(candidate, {
+          home: homedir(), cwd, credentialPaths, denyWrite: resolved.sandbox.denyWrite,
+          protect: [PACKAGE_ROOT, DEFAULT_BOUNDARY_WATCH_HELPER], brokerBase: "/tmp/opencode",
+        })) worktreePrivateRoots = [candidate]
+      }
+      let temporaryRoots: string[] = []
+      if (tool === "shell" && rootWidening.hasGrants(call.sessionID)) {
+        try { temporaryRoots = rootWidening.activeRoots((await rootWideningContext(call.sessionID)).scope) } catch {
+          writeReviewerTrace({ kind: "l3_root_error", sessionID: call.sessionID, policyVersion: L3_POLICY_VERSION })
+        }
+      }
       const tempRoots = readOnly
-        ? [...new Set([...(await globalTempWriteRoots([scratchRoot])), ...incidental])]
+        ? [...new Set([...(await globalTempWriteRoots([scratchRoot])), ...incidental, ...configuredRoots])]
         : []
-      const baseRoots = [cwd, scratchRoot, ...(readOnly ? tempRoots : [...new Set([...standardCacheWriteRoots(), ...incidental])])]
+      const baseRoots = [cwd, scratchRoot, ...(readOnly ? tempRoots : [...new Set([...standardCacheWriteRoots(), ...incidental, ...configuredRoots, ...temporaryRoots, ...worktreePrivateRoots])])]
       const beyondReadOnlyTemp = (writes: readonly string[]) => readOnly
         ? writes.filter((target) => containsPath(cwd, target) || !tempRoots.some((root) => containsPath(root, target)))
         : writes
       if (tool === "shell") {
         const command = commandFromArgs(raw)
         if (typeof command !== "string" || !command.trim()) throw blockedRejection("the shell command is empty")
+        if (!readOnly) {
+          const floorCheck = await classifyShellCommand({
+            script: command, cwd, worktree: cwd, shell: resolveClassifierShell(configuredShell),
+            strictness: resolved.strictness, bypassedCategories: bypass,
+            permScope: effectivePerm(call.sessionID), roWritableRoots: baseRoots,
+            sandboxDenyWrite: resolved.sandbox.denyWrite, trustedCommands: resolved.trustedCommands,
+          })
+          if (floorCheck.verdict === "DENY" && floorCheck.rules.some(isFloorRule)) {
+            throw blockedRejection(floorCheck.reason, WITHIN_MODE)
+          }
+        }
         if (readOnly) {
           const launchCwd = await canonicalBoundaryPath(typeof raw.workdir === "string" ? nativeAbsolutePath(cwd, raw.workdir) : cwd)
           const plan = await planShellBoundary(command, { cwd: launchCwd, shell: resolveClassifierShell(configuredShell), writableRoots: baseRoots })
@@ -2343,7 +2602,7 @@ const plugin: Plugin = {
           // of running silently.
           await prepareRuntimeShell(command, raw, call, authorization, cwd,
             readOnly ? tempRoots : baseRoots, signal, [...credentialPaths, ...(readOnly ? [cwd] : [])],
-            readOnly ? credentialPaths : [])
+            readOnly ? credentialPaths : [], temporaryRoots, [...configuredRoots, ...worktreePrivateRoots])
         }
         boundaryCalls.set(boundaryKey(call), authorization)
         return { input: raw, authorization }
@@ -2360,10 +2619,18 @@ const plugin: Plugin = {
       const needsReview = filePlan.verdict !== "ALLOW"
       const tempOnly = readOnly && filePlan.resolvedWrites.length > 0 && beyondReadOnlyTemp(filePlan.resolvedWrites).length === 0
       assertNativeCeiling(tool, call.sessionID, filePlan.resolvedWrites, tempOnly)
+      if (filePlan.targets.some((target) => target.mode !== "read" &&
+        [...resolved.sandbox.denyWrite, ...credentialPaths, DEFAULT_BOUNDARY_WATCH_HELPER, PACKAGE_ROOT]
+          .some((root) => containsPath(root, target.resolved)))) {
+        throw blockedRejection("the native write hits a protected or denied path")
+      }
+      if (filePlan.targets.some((target) => target.inspectionError) && resolved.failPolicy === "fail_open") {
+        throw new SecurityCheckFailure("target_inspection", "the native target evidence could not be inspected")
+      }
       if (tempOnly) authorization.tempOnlyWrite = true
       // RO conformance remains independent of dynamic-review switches.
       if (needsReview && (readOnly || (resolved.securityEnabled && !bypass.has("dynamic")))) {
-        if (!ctx.session.context) throw blockedRejection("the safety review could not read this session's context, so the command could not be approved")
+        if (!ctx.session.context) throw new SecurityCheckFailure("session_context", "the safety review could not read this session's context, so the command could not be approved")
         const retained = boundarySessionContext(await run(ctx.session.context({ sessionID: call.sessionID }), signal))
         const request: EffectReviewRequest = {
           command: operation,
@@ -2397,23 +2664,34 @@ const plugin: Plugin = {
         }
         const cacheScope: ApprovalCacheScope = { sessionID: call.sessionID, securitySnapshot,
           userAuthorizationDigest: digest(retained.userRequest) }
+        const fileReviewPolicyVersion = readOnly ? EFFECTS_POLICY_VERSION_READONLY : EFFECTS_POLICY_VERSION
+        const cacheTargets = await currentCacheTargets(filePlan.targets.map((target) => ({ path: target.resolved,
+          domain: /^\/mnt\/[a-z](?:\/|$)/i.test(target.resolved) ? "drvfs" : "linux", exists: target.identity !== undefined,
+          ...(target.inspectionError ? { inspectionError: target.inspectionError } : {}) }))).then((targets) => targets.map((target, index) => ({
+            ...target, ...(filePlan.targets[index]?.inspectionError ? { inspectionError: filePlan.targets[index]!.inspectionError } : {}),
+          })))
+        const cacheOperation = filePlan.targets.some((target) => target.mode === "delete") ? "delete"
+          : tool === "patch" && /^\*\*\* Move to:/m.test(String(raw.patchText)) ? "rename" : "modify"
+        // Same core rule as runtime crossings: resolved targets + identities
+        // + tool + mode, never the raw tool input text or user_request — a
+        // rewritten file body replays the same adjudication.
         const cacheFacts: ApprovalCacheFacts = {
-          exactDigest: "",
+          coreDigest: boundaryCoreDigest({
+            kind: filePlan.resolvedWrites.length ? "write" : "read",
+            operation: cacheOperation,
+            effect: filePlan.resolvedWrites.length ? "replace" : undefined,
+            targets: cacheTargets, tool, cwd,
+            policyVersion: fileReviewPolicyVersion,
+            bypassCategories: request.bypass.categories, customBypass: custom,
+            requiresFullApproval: filePlan.resolvedWrites.length > 0 && filePlan.targets.some((target) => target.mode === "read"),
+          }),
           kind: filePlan.resolvedWrites.length ? "write" : "read",
-          operation: filePlan.targets.some((target) => target.mode === "delete") ? "delete"
-            : tool === "patch" && /^\*\*\* Move to:/m.test(String(raw.patchText)) ? "rename" : "modify",
-          targets: await currentCacheTargets(filePlan.targets.map((target) => ({ path: target.resolved,
-            domain: /^\/mnt\/[a-z](?:\/|$)/i.test(target.resolved) ? "drvfs" : "linux", exists: target.identity !== undefined,
-            ...(target.inspectionError ? { inspectionError: target.inspectionError } : {}) }))).then((targets) => targets.map((target, index) => ({
-              ...target, ...(filePlan.targets[index]?.inspectionError ? { inspectionError: filePlan.targets[index]!.inspectionError } : {}),
-            }))),
+          operation: cacheOperation,
+          targets: cacheTargets,
           requiresFullApproval: filePlan.resolvedWrites.length > 0 && filePlan.targets.some((target) => target.mode === "read"),
           // write/edit/patch rewrite the whole file content.
           ...(filePlan.resolvedWrites.length ? { effect: "replace" as const } : {}),
         }
-        const fileReviewPolicyVersion = readOnly ? EFFECTS_POLICY_VERSION_READONLY : EFFECTS_POLICY_VERSION
-        cacheFacts.exactDigest = digest(JSON.stringify({ ...request, session_context: [],
-          targetIdentities: cacheFacts.targets, policyVersion: fileReviewPolicyVersion }))
         const cacheHit = approvalCache.lookup(cacheScope, cacheFacts)
         let result: EffectReviewResult
         try {
@@ -2422,7 +2700,7 @@ const plugin: Plugin = {
             writeReviewerTrace({ kind: "effects_cache_hit", sessionID: call.sessionID, callID: call.id,
               commandSha256: audit.commandSha256, layer: cacheHit.layer, decision: cacheHit.decision })
           } else {
-            result = await sharedReviews.run(digest(JSON.stringify([cacheScope, cacheFacts.exactDigest])), signal,
+            result = await sharedReviews.run(digest(JSON.stringify([cacheScope, cacheFacts.coreDigest])), signal,
               (sharedSignal) => reviewBoundaryRequest(request, subjects, sharedSignal, cwd, audit, readOnly))
           }
         } catch (error) {
@@ -2430,10 +2708,19 @@ const plugin: Plugin = {
           if (source === "aborted") {
             throw new EffectsReviewError("the call was cancelled before it started", "aborted")
           }
-          throw blockedRejection(reviewUnavailableReason(source), RETRY_LATER)
+          throw new EffectsReviewError(reviewUnavailableReason(source), source)
+        }
+        if (result.decision !== "allow") {
+          try { if (!cacheHit) approvalCache.store(cacheScope, cacheFacts, result) } catch {
+            passFailure("cache_store", call, authorization)
+          }
+          assertBoundaryDecision(result)
         }
         const latest = boundarySessionContext(await run(ctx.session.context({ sessionID: call.sessionID }), signal))
-        if (securitySnapshotFor(call.sessionID) !== securitySnapshot || digest(latest.userRequest) !== cacheScope.userAuthorizationDigest) {
+        if (securitySnapshotFor(call.sessionID) !== securitySnapshot ||
+          // Positive reuse (cached or freshly reviewed) is not bound to the
+          // user message; a refusal is — a newer message re-checks it.
+          (result.decision !== "allow" && digest(latest.userRequest) !== cacheScope.userAuthorizationDigest)) {
           throw blockedRejection("the session's authorization changed during the boundary check", RECHECK)
         }
         await verifyFileBoundaryPlan(filePlan)
@@ -2477,13 +2764,55 @@ const plugin: Plugin = {
       return { input: raw, authorization }
     }
 
+    async function prepareBoundary(
+      tool: NativeBoundaryTool, input: unknown, call: BoundaryInvocation, token: object, signal: AbortSignal,
+    ): Promise<{ input: unknown; authorization: BoundaryAuthorization }> {
+      const snapshot = securitySnapshotFor(call.sessionID)
+      try {
+        return await runBoundaryBefore(tool, input, call, token, signal)
+      } catch (error) {
+        if (signal.aborted || error instanceof EffectsReviewError && error.kind === "aborted") {
+          throw new EffectsReviewError("the call was cancelled before it started", "aborted")
+        }
+        if ((error as { _tag?: string })?._tag === "Tool.Error") throw error
+        if (resolved.failPolicy === "fail_close") throw error
+        if (securitySnapshotFor(call.sessionID) !== snapshot) {
+          throw blockedRejection("the session's security mode changed while this command was being checked", RECHECK)
+        }
+        // Preserve the known ceiling even when another part of checking failed.
+        assertNativeCeiling(tool, call.sessionID, [])
+        const authorization: BoundaryAuthorization = {
+          token, sessionID: call.sessionID, tool, cwd: process.cwd(),
+          source: "fail_open_pass", securitySnapshot: snapshot, executionRoute: "host_direct_reviewed",
+        }
+        let code = "check_unavailable"
+        if (error instanceof SecurityCheckFailure) code = error.code
+        else if (error instanceof EffectsReviewError) code = `review_${error.kind}`
+        else if (error instanceof BoundaryPreparationError) code = error.changed ? "target_changed" : "boundary_preparation"
+        if (!passFailure(code, call, authorization)) throw error
+        boundaryCalls.set(boundaryKey(call), authorization)
+        // No marker: if the observer cannot be prepared, the original executor
+        // receives the exact original input and runs unobserved, once.
+        return { input, authorization }
+      }
+    }
+
     // The nonce is the authority for Linux wrapping. Marker-less user shells
     // and host-internal spawns remain untouched; Windows is outside this chain.
     yield* ctx.shell.hook("create.before", (ev: ShellCreateBeforeEvent) =>
       Effect.sync(() => {
         if (process.platform !== "linux") return
         const marked = extractSandboxMarker(sandboxMarkers, ev.command)
-        applySandboxCreateBefore(ev, marked, resolved.sandbox, sandboxProbe)
+        const original = { command: marked.command, shell: ev.shell, env: { ...ev.env } }
+        try {
+          applySandboxCreateBefore(ev, marked, resolved.sandbox, sandboxProbe, undefined, resolved.failPolicy,
+            (code) => { passFailure(code) })
+        } catch (error) {
+          if (!passFailure("sandbox_prepare")) throw error
+          ev.command = original.command
+          ev.shell = original.shell
+          ev.env = original.env
+        }
       }),
     )
 
@@ -2515,6 +2844,10 @@ const plugin: Plugin = {
         const perm = permForMode(mode)
         if (typeof input.sessionID === "string") {
           await hydratePermAncestry(input.sessionID)
+          if (ancestryUnresolved(input.sessionID) && passFailure("session_ancestry", { sessionID: ev.sessionID, id: ev.id })) {
+            delete input.permission
+            return
+          }
           if (permParent.get(input.sessionID) !== ev.sessionID) {
             throw rejectionError(subagentBlockedText("sessionID must name a direct child session"))
           }
@@ -2539,9 +2872,12 @@ const plugin: Plugin = {
     // Wrap only the captured executable definitions. No hook-name heuristic
     // can accidentally pull a codemode/MCP/custom/Windows tool into this chain.
     if (process.platform === "linux") {
-      if (!ctx.tool.transform) return yield* Effect.die(new Error("Native Linux boundaries require tool.transform"))
-      yield* ctx.tool.transform((editor) => {
-        if (!editor.list) throw new Error("Native Linux boundaries require ToolEditor.list")
+      if (!ctx.tool.transform && !passFailure("boundary_transform")) return yield* Effect.die(new Error("Native Linux boundaries require tool.transform"))
+      if (ctx.tool.transform) yield* ctx.tool.transform((editor) => {
+        if (!editor.list) {
+          if (passFailure("boundary_transform")) return
+          throw new Error("Native Linux boundaries require ToolEditor.list")
+        }
         const entries = editor.list()
         directSubagent = entries.some((entry) => entry.id === "subagent" && entry.name === "subagent" &&
           entry.options?.codemode === false && entry.options.namespace === undefined)
@@ -2549,17 +2885,24 @@ const plugin: Plugin = {
           if (!isBoundaryTool(entry)) continue
           editor.update(entry.id!, (tool) => {
             const original = tool.execute
-            if (!original) throw new Error("Native Linux tool is missing its executor")
+            if (!original) {
+              if (passFailure("boundary_executor")) return
+              throw new Error("Native Linux tool is missing its executor")
+            }
             const name = entry.name as NativeBoundaryTool
             tool.execute = (input, call) => {
               const token = {}
               const key = boundaryKey(call)
               return Effect.gen(function* () {
                 const prepared = yield* Effect.tryPromise({
-                  try: (signal) => runBoundaryBefore(name, input, call, token, signal),
+                  try: (signal) => prepareBoundary(name, input, call, token, signal),
                   catch: toRejection,
                 })
-                const result = yield* original(prepared.input, call)
+                const result = yield* Effect.withFiber((fiber) => {
+                  prepared.authorization.cancelExecution = () => fiber.interruptUnsafe()
+                  return original(prepared.input, call)
+                })
+                prepared.authorization.cancelExecution = undefined
                 const shellResult = result && typeof result === "object" ? (result as { output?: { exit?: number; status?: string } }).output : undefined
                 // Only a runtime-watched shell may keep its authorization +
                 // broker past the tool return: for every other route the
@@ -2571,12 +2914,12 @@ const plugin: Plugin = {
                   prepared.authorization.runtimeBroker !== undefined
                 if (!prepared.authorization.background) {
                   yield* Effect.promise(() => recordCallCacheOutcome(prepared.authorization,
-                    name === "shell" ? shellResult?.exit : 0).catch(() => {}))
+                     name === "shell" ? shellResult?.exit : 0).catch(() => { passFailure("cache_outcome", call, prepared.authorization) }))
                 } else {
                   // A completed Promise also handles very short jobs whose
                   // terminal notification preceded this background result.
                   void prepared.authorization.runtimeBroker?.finished.then(async ({ exit }) => {
-                    await recordCallCacheOutcome(prepared.authorization, exit).catch(() => {})
+                    await recordCallCacheOutcome(prepared.authorization, exit).catch(() => { passFailure("cache_outcome", call, prepared.authorization) })
                     if (boundaryCalls.get(key)?.token === token) boundaryCalls.delete(key)
                     await prepared.authorization.runtimeBroker?.close()
                   }).catch(() => {})
@@ -2616,6 +2959,7 @@ const plugin: Plugin = {
                         : {}),
                        ...(accessError ? { runtimeAccessError: true } : {}),
                        ...(runtimeRefusal ? { runtimeBlocked: true } : {}),
+                       ...(prepared.authorization.failOpenPasses ? { failOpenPasses: [...prepared.authorization.failOpenPasses] } : {}),
                        // Copy by value + mark finality: for a background
                        // command the counters keep mutating under the live
                        // broker; the host must not stamp mid-flight stats as
@@ -2643,7 +2987,11 @@ const plugin: Plugin = {
       // executor (runBoundaryBefore); this hook only carries the optional
       // subagent `permission` ceiling bookkeeping.
       process.platform === "linux" && directSubagent && ev.tool === "subagent"
-        ? Effect.tryPromise({ try: () => runBefore(ev), catch: toRejection })
+        ? Effect.tryPromise({ try: async () => {
+            try { await runBefore(ev) } catch (error) {
+              if ((error as { _tag?: string })?._tag === "Tool.Error" || !passFailure("tool_preflight", { sessionID: ev.sessionID, id: ev.id })) throw error
+            }
+          }, catch: toRejection })
         : Effect.void,
     )
 
@@ -2694,6 +3042,10 @@ const plugin: Plugin = {
             emitPermChanged(child, "updated")
             emitBypassChanged(child, "updated")
           }
+          // The bound child published itself (notifySecurityState); the
+          // consumed-stash transition above is parent-scoped, so publish the
+          // parent — every instance's reaction re-syncs the parent's subtree.
+          publishSharedStateChange(stash.parentSessionID)
         }
       }
       // Legacy shell failure caches/HARD interrupts do not participate in the
@@ -2739,10 +3091,12 @@ const plugin: Plugin = {
                 permKnownRoots.delete(sessionID)
                 permUnresolved.delete(sessionID)
                 explicitNoBypass.delete(sessionID)
-                 sessionNotices.clear(sessionID)
-                 approvalCache.clear(sessionID)
-                 securityBases.delete(sessionID)
-                 securityEpochs.delete(sessionID)
+                sessionNotices.clear(sessionID)
+                approvalCache.clear(sessionID)
+                securityBases.delete(sessionID)
+                securityEpochs.delete(sessionID)
+                shared.sessionLocations.delete(sessionID)
+                rootWidening.clearSession(sessionID)
                 for (const [child, parent] of permParent) {
                   if (parent === sessionID) permParent.delete(child)
                 }
@@ -2766,7 +3120,7 @@ const plugin: Plugin = {
                 permCreatedAt.set(sessionID, Date.now())
                 if (typeof parentID === "string" && parentID) {
                   permParent.set(sessionID, parentID)
-                  if (resolved.bypassPropagateToSubagents) bypassParent.set(sessionID, parentID)
+                  bypassParent.set(sessionID, parentID)
                 }
                 // A fresh session has no notice yet — publish its effective
                 // state (inherited lease, pending declared cap, or a clean
@@ -2803,8 +3157,8 @@ const plugin: Plugin = {
               permission: permLabel(effectivePerm(input.sessionID, now)),
               mode: effectiveMode(input.sessionID, now),
               active,
-              temporary: active.filter((category) => !resolved.bypassClassifier.has(category as BypassCategory)),
-              permanent: [...resolved.bypassClassifier].sort(),
+              temporary: active.filter((category) => !policyForSession(input.sessionID).permanentBypass.includes(category as BypassCategory)),
+              permanent: [...policyForSession(input.sessionID).permanentBypass].sort(),
             }
             const custom = activeCustomBypass(input.sessionID, now)
             if (custom.length > 0) result.custom = custom
@@ -2825,6 +3179,7 @@ const plugin: Plugin = {
     yield* Effect.forever(
       Effect.gen(function* () {
         sweepExpiredBypass()
+        rootWidening.sweep()
         Latch.closeUnsafe(bypassSweepWake)
         yield* Effect.race(Effect.sleep(nextBypassSweepDelay()), Latch.await(bypassSweepWake))
       }),
@@ -2846,6 +3201,7 @@ const plugin: Plugin = {
           if (process.platform !== "linux" || !ev.source) return
           const authorization = boundaryCalls.get(boundaryKey({ sessionID: ev.sessionID, ...ev.source }))
           if (!authorization || ev.effect === "deny") return
+          try {
           await hydratePermAncestry(ev.sessionID)
           // A real tool may assert several times in one call
           // (external_directory + edit, multi-file patches). Once the first
@@ -2906,6 +3262,11 @@ const plugin: Plugin = {
               return
             }
             try { await verifyFileBoundaryPlan(plan) } catch (error) {
+              if (passFailure(error instanceof BoundaryPreparationError && error.changed ? "target_changed" : "target_inspection", { sessionID: ev.sessionID, id: ev.source.id }, authorization)) {
+                authorization.asserted = true
+                ev.effect = "allow"
+                return
+              }
               deny(
                 error instanceof BoundaryPreparationError
                   ? error.agentReason
@@ -2919,6 +3280,19 @@ const plugin: Plugin = {
           // later denies of the same call use the action-level wording.
           authorization.asserted = true
           ev.effect = "allow"
+          } catch (error) {
+            if (securitySnapshotFor(ev.sessionID) !== authorization.securitySnapshot) {
+              ev.effect = "deny"
+              ev.message = actionBlockedText("the session's security mode changed while this command was being checked")
+              return
+            }
+            if (passFailure("permission_check", { sessionID: ev.sessionID, id: ev.source.id }, authorization)) {
+              ev.effect = "allow"
+              return
+            }
+            ev.effect = "deny"
+            ev.message = toRejection(error).message
+          }
         }),
       )
     }
@@ -2989,6 +3363,12 @@ const plugin: Plugin = {
                   try: () => run(ctx.session.get({ sessionID: targetID })),
                   catch: () => undefined,
                 }).pipe(Effect.orElseSucceed(() => undefined))
+                if (!info && passFailure("session_lookup", { sessionID: callerID, id: "set_permission" })) {
+                  return {
+                    content: [{ type: "text", text: "Permission update skipped because session verification is unavailable; existing permissions are unchanged." }],
+                    metadata: { failOpenPasses: ["session_lookup"] },
+                  }
+                }
                 const parentID =
                   info && typeof info === "object" && typeof (info as { parentID?: unknown }).parentID === "string"
                     ? (info as { parentID: string }).parentID
@@ -3109,7 +3489,7 @@ const plugin: Plugin = {
                     new Error("x cannot be set; it is always on and only shown in the label."),
                   )
                 }
-                if (working === undefined) working = { ...(sessionPerms.get(target) ?? resolved.permission.defaultPerm) }
+                if (working === undefined) working = { ...(sessionPerms.get(target) ?? policyForSession(target).defaultPerm) }
                 const set = lower[0] === "+"
                 if (lower.includes("r")) working.r = set
                 if (lower.includes("w")) working.w = set
@@ -3289,31 +3669,25 @@ const plugin: Plugin = {
               emitBypassChanged(sessionID, reason)
               if (baselineTouched) emitPermChanged(sessionID, "set")
             }
+            publishSharedStateChange(sessionID)
           }).pipe(Effect.ensuring(Effect.promise(() => sessionNotices.flush()))),
       })
     })
 
-    // Clear in-memory state when the plugin scope finalizes (unload). The
-    // forked event fiber is interrupted by the same scope close.
+    // Instance-bound cleanup when the plugin scope finalizes (unload). The
+    // forked event fiber is interrupted by the same scope close, and the
+    // shared-state listener is removed so a reloaded instance cannot leak a
+    // dead one. Shared security state is deliberately NOT cleared: other
+    // instances in this process still serve sessions keyed by it, and a
+    // location re-boot must reload into the existing state (leases stay
+    // memory-only and end with the process or their own deadline).
     yield* Effect.addFinalizer(() =>
       Effect.promise(async () => {
         await Promise.all([...boundaryCalls.values()].map((authorization) => authorization.runtimeBroker?.close()))
         sharedReviews.clear()
-        approvalCache.clearAll()
-        securityBases.clear()
-        securityEpochs.clear()
-        bypassLeases.clear()
-        bypassParent.clear()
-        sessionPerms.clear()
-        permParent.clear()
-        permStash.clear()
-        permBoundChildren.clear()
-        permKnownRoots.clear()
-        permUnresolved.clear()
-        permCreatedAt.clear()
-        explicitNoBypass.clear()
         sandboxMarkers.clear()
         boundaryCalls.clear()
+        unsubscribeSharedState()
         bypassRpc = undefined
       }),
     )
@@ -3321,6 +3695,12 @@ const plugin: Plugin = {
 }
 
 export default plugin
+// Test-only helper: replace the process-wide shared security-state registry
+// (see src/security/shared-state.ts). Existing harnesses call this before
+// instantiating the plugin so each simulated instance set starts isolated.
+export { resetSharedSecurityStateForTests } from "./security/shared-state"
+export type { BypassLease, PermStashEntry, SharedSecurityState } from "./security/shared-state"
+export { linkedWorktreePrivateDir } from "./security/worktree-roots"
 export { classifyShellCommand, verifyScriptFingerprints } from "./security/classifier"
 export { isFloorRule, ruleRequiredCategories, rulesHintCategories } from "./security/bypass"
 export { reviewCommandWithAuditor, reviewCommandWithAuditor as reviewCommandWithDeepSeek } from "./security/reviewer"

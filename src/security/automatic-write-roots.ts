@@ -11,7 +11,7 @@ function contains(root: string, target: string): boolean {
 
 /** Resolve an existing ancestor without creating anything. Dangling symlinks
  *  and non-missing-path failures are not grants. */
-function canonicalCandidate(target: string): string | undefined {
+export function canonicalCandidate(target: string): string | undefined {
   try {
     return realpathSync(target)
   } catch (error) {

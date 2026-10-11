@@ -1,11 +1,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
-import { createHash } from "node:crypto"
 import { lstat, mkdir, mkdtemp } from "node:fs/promises"
 import { connect } from "node:net"
 import path from "node:path"
 import { Effect, Scope, Stream } from "effect"
 import plugin from "../src/index"
 import frozen from "../src/security/v10-8-pipeexec.json"
+import { resetSharedSecurityStateForTests } from "../src/security/shared-state"
 import {
   adjudicateEffectAnswers,
   buildEffectReviewBody,
@@ -15,7 +15,7 @@ import {
   reviewEffects,
   type EffectReviewRequest,
 } from "../src/security/effects-reviewer"
-import { createApprovalCache } from "../src/security/approval-cache"
+import { boundaryCoreDigest, createApprovalCache } from "../src/security/approval-cache"
 import { classifyShellCommand } from "../src/security/classifier"
 import { isFloorRule } from "../src/security/bypass"
 import type { RuntimeBoundaryEvent } from "../src/runtime-boundary"
@@ -113,19 +113,23 @@ describe("frozen write-mode body and read-only variant", () => {
     expect(() => parseEffectAnswers(answers("read_only"))).toThrow()
   })
 
-  test("policy versions and exact cache digests cannot mix", () => {
-    const digest = (policyVersion: string) => createHash("sha256")
-      .update(JSON.stringify({ ...request, session_context: [], policyVersion })).digest("hex")
-    const writableDigest = digest(EFFECTS_POLICY_VERSION)
-    const readonlyDigest = digest(EFFECTS_POLICY_VERSION_READONLY)
+  test("policy versions and cache core digests cannot mix", () => {
+    const network = { family: "AF_INET", target: "127.0.0.1:443" }
+    const writableDigest = boundaryCoreDigest({
+      kind: "network", operation: "connect", targets: [], network, policyVersion: EFFECTS_POLICY_VERSION,
+    })
+    const readonlyDigest = boundaryCoreDigest({
+      kind: "network", operation: "connect", targets: [], network, policyVersion: EFFECTS_POLICY_VERSION_READONLY,
+    })
     expect(readonlyDigest).not.toBe(writableDigest)
     expect(EFFECTS_POLICY_VERSION_READONLY).not.toBe(EFFECTS_POLICY_VERSION)
     const cache = createApprovalCache()
     const scope = { sessionID: "fixture", securitySnapshot: "same", userAuthorizationDigest: "same" }
-    const facts = { exactDigest: writableDigest, kind: "network" as const, operation: "connect", targets: [] }
+    const facts = { coreDigest: writableDigest, kind: "network" as const, operation: "connect", targets: [],
+      networkEndpoint: { family: "AF_INET" as const, host: "127.0.0.1", port: 443 } }
     cache.store(scope, facts, adjudicateEffectAnswers(answers()))
     expect(cache.lookup(scope, facts)?.decision).toBe("allow")
-    expect(cache.lookup(scope, { ...facts, exactDigest: readonlyDigest })).toBeUndefined()
+    expect(cache.lookup(scope, { ...facts, coreDigest: readonlyDigest })).toBeUndefined()
   })
 
   test("RO transport sends and parses the variant without contacting a network", async () => {
@@ -166,7 +170,10 @@ afterAll(async () => {
 type HostOptions = {
   mode?: "ro" | "auto"
   conformance?: "read_only" | "writes" | "unclear" | "missing"
+  failPolicy?: "fail_open" | "fail_close"
   denyWrite?: string[]
+  allowWrite?: string[]
+  rootReview?: (request: import("../src/security/root-widening").RootWideningInput) => Promise<unknown>
   workspaceNetwork?: "on" | "off"
   securityEnabled?: boolean
 }
@@ -174,10 +181,14 @@ type HostOptions = {
 // The real plugin wrappers and broker are used, but no sample shell command
 // executes. The synthetic host sends authenticated observer events instead.
 async function harness(options: HostOptions = {}) {
+  // Security state is shared process-wide between plugin instances; each
+  // simulated instance here must start from a clean registry.
+  resetSharedSecurityStateForTests()
   const hooks = new Map<string, (event: any) => Effect.Effect<any, any>>()
   const tools = new Map<string, any>()
   const commands = new Map<string, any>()
   const calls: EffectReviewRequest[] = []
+  const retained = [{ type: "user", text: "Inspect the synthetic fixtures." }]
   let serial = 0
   let executed = 0
   tools.set("shell", {
@@ -230,14 +241,15 @@ async function harness(options: HostOptions = {}) {
   const ctx: any = {
     options: {
       securityEnabled: options.securityEnabled ?? true,
-      sandbox: { enabled: true, mode: "auto", scratch, denyWrite: options.denyWrite ?? [], workspaceNetwork: options.workspaceNetwork ?? "on" },
+      failPolicy: options.failPolicy ?? "fail_open",
+      sandbox: { enabled: true, mode: "auto", scratch, denyWrite: options.denyWrite ?? [], allowWrite: options.allowWrite ?? [], workspaceNetwork: options.workspaceNetwork ?? "on" },
       slowCommands: false, logReviewerTrace: false, dynamicReview: { jev: { enabled: false } }, permission: { registerTool: false },
-      reviewCommand: async (payload: EffectReviewRequest) => {
+      reviewCommand: Object.assign(async (payload: EffectReviewRequest) => {
         calls.push(structuredClone(payload))
         const readonly = payload.input_facts.includes("Session security mode: [Read only]")
         const conformance = options.conformance === "missing" ? undefined : options.conformance ?? "read_only"
         return { answers: answers(readonly ? conformance : undefined) }
-      },
+      }, { rootWidening: options.rootReview }),
     },
     tool: {
       hook: (name: string, callback: any) => Effect.sync(() => { hooks.set(`tool.${name}`, callback) }),
@@ -252,7 +264,7 @@ async function harness(options: HostOptions = {}) {
     command: { transform: (callback: any) => Effect.sync(() => callback({ add: (command: any) => commands.set(command.name, command.execute) })) },
     session: {
       get: () => Effect.succeed({ location: { directory: workspace } }),
-      context: () => Effect.succeed([{ type: "user", text: "Inspect the synthetic fixtures." }]),
+      context: () => Effect.succeed(retained),
       synthetic: () => Effect.void,
     },
     event: { subscribe: () => Stream.fromIterable([]) },
@@ -264,6 +276,7 @@ async function harness(options: HostOptions = {}) {
   if (options.mode !== "auto") await mode("ro")
   return {
     calls, mode, get executed() { return executed },
+    newUserMessage: (text: string) => { retained.push({ type: "user", text }) },
     run: (command: string, event?: { kind: RuntimeBoundaryEvent["kind"]; full?: boolean; paths?: string[] }, workdir?: string) =>
       Effect.runPromise(tools.get("shell").execute({ command, event, workdir }, { sessionID: "readonly-fixture", messageID: "m", id: `call-${++serial}`, agent: "build" })) as Promise<any>,
     file: (name: string, input: unknown) => Effect.runPromise(tools.get(name).execute(input, {
@@ -355,6 +368,73 @@ describe("RO launch gate", () => {
 })
 
 describe("RO observer routing through the plugin", () => {
+  test("allowWrite becomes an observer root and exempts safe writes in Auto and Read only", async () => {
+    const allowed = path.join(home, "configured-logs")
+    await mkdir(allowed)
+    for (const mode of ["auto", "ro"] as const) {
+      const host = await harness({ mode, allowWrite: [allowed] })
+      const result = await host.run("python3 -c 'import json'", { kind: "write", paths: [`${allowed}/plain.log`] })
+      expect(result.output.spawn.command).toContain(`'--root' '${allowed}'`)
+      expect(result.output.response.action).toBe("continue")
+      expect(host.calls).toHaveLength(0)
+      const sensitive = await host.run("python3 -c 'import json'", { kind: "write", paths: [`${allowed}/private.key`] })
+      expect(sensitive.output.response.action).toBe(mode === "ro" ? "deny" : "allow")
+      expect(host.calls).toHaveLength(mode === "ro" ? 0 : 1)
+    }
+  })
+
+  test("three allowed crossings (including L2) start a background grant used by new calls and the broker", async () => {
+    const allowed = path.join(home, "l3-logs")
+    await mkdir(allowed)
+    const requests: import("../src/security/root-widening").RootWideningInput[] = []
+    let requested!: () => void
+    const started = new Promise<void>((resolve) => { requested = resolve })
+    let granted!: () => void
+    const completed = new Promise<void>((resolve) => { granted = resolve })
+    const rootReview = Object.assign(async (input: import("../src/security/root-widening").RootWideningInput) => {
+      requests.push(input)
+      requested()
+      return { answers: { widen_root: { choice: "root_1" } } }
+    }, { trace: (entry: import("../src/security/root-widening").L3Trace) => { if (entry.kind === "l3_root_granted") granted() } })
+    const host = await harness({ mode: "auto", rootReview })
+    for (let index = 0; index < 3; index++) {
+      const result = await host.run("python3 -c 'import json'", { kind: "write", paths: [`${allowed}/plain.log`] })
+      expect(result.output.response.action).not.toBe("deny")
+    }
+    await started
+    expect(host.calls).toHaveLength(1)
+    expect(requests).toHaveLength(1)
+    expect(requests[0].repeated_directory).toBe(allowed)
+    await completed
+    const result = await host.run("python3 -c 'import json'", { kind: "write", paths: [`${allowed}/new.log`] })
+    expect(result.output.spawn.command).toContain(`'--root' '${allowed}'`)
+    expect(result.output.response.action).toBe("continue")
+    expect(host.calls).toHaveLength(1)
+    host.newUserMessage("A different inspection task.")
+    const expired = await host.run("python3 -c 'import json'", { kind: "write", paths: [`${allowed}/after-message.log`] })
+    expect(expired.output.spawn.command).not.toContain(`'--root' '${allowed}'`)
+    expect(host.calls).toHaveLength(2)
+  })
+
+  test("L3 failure leaves allowed commands runnable and Read only never invokes L3", async () => {
+    const allowed = path.join(home, "l3-errors")
+    await mkdir(allowed)
+    let calls = 0
+    let requested!: () => void
+    const started = new Promise<void>((resolve) => { requested = resolve })
+    const host = await harness({ mode: "auto", rootReview: async () => { calls++; requested(); throw new Error("fake provider failure") } })
+    for (let index = 0; index < 3; index++) {
+      const result = await host.run("python3 -c 'import json'", { kind: "write", paths: [`${allowed}/file-${index}.log`] })
+      expect(result.output.response.action).toBe("allow")
+    }
+    await started
+    expect(calls).toBe(1)
+    await host.mode("ro")
+    const refused = await host.run("python3 -c 'import json'", { kind: "write", paths: [`${allowed}/readonly.log`] })
+    expect(refused.output.response.action).toBe("deny")
+    expect(calls).toBe(1)
+  })
+
   test("non-exempt writes and privilege events refuse without review", async () => {
     for (const kind of ["write", "privilege"] as const) {
       const host = await harness()
@@ -386,11 +466,19 @@ describe("RO observer routing through the plugin", () => {
 
   test("writes, unclear and missing conformance answers fail closed in the host", async () => {
     for (const conformance of ["writes", "unclear", "missing"] as const) {
-      const host = await harness({ conformance })
+      const host = await harness({ conformance, failPolicy: "fail_close" })
       const result = await host.run("python3 -c 'import json'", { kind: "network" })
       expect(result.output.response.action).toBe("deny")
       expect(host.calls).toHaveLength(1)
     }
+  })
+  test("fail_open passes a missing RO answer, not an adjudicated RO denial", async () => {
+    const host = await harness({ conformance: "missing", failPolicy: "fail_open" })
+    const result = await host.run("python3 -c 'import json'", { kind: "network" })
+    expect(result.output.response.action).toBe("allow")
+    expect(result.output.response.reason).toBeUndefined()
+    expect(result.content).not.toMatch(/blocked|cannot|could not/i)
+    expect(result.metadata.boundary.runtimeBlocked).toBeUndefined()
   })
 
   test("mode changes cannot reuse the write-mode approval for RO", async () => {
@@ -431,7 +519,9 @@ describe("RO observer routing through the plugin", () => {
   test("denyWrite, control-plane protect and credentials override incidental exemptions", async () => {
     for (const mode of ["auto", "ro"] as const) {
       const deniedRoot = path.join(root, "denied")
-      const host = await harness({ mode, denyWrite: [deniedRoot] })
+      // Missing synthetic parent directories are intentional evidence gaps;
+      // keep the review strict here to distinguish them from exemptions.
+      const host = await harness({ mode, denyWrite: [deniedRoot], failPolicy: "fail_close" })
       for (const target of [
         path.join(deniedRoot, ".pytest_cache/state"),
         path.resolve(import.meta.dir, "../.pytest_cache/state"),
@@ -440,7 +530,11 @@ describe("RO observer routing through the plugin", () => {
       ]) {
         const before = host.calls.length
         const result = await host.run("python3 -c 'import json'", { kind: "write", paths: [target] })
-        if (mode === "ro") {
+        // Configured/protected roots are actual refusals in either mode.
+        // Synthetic credential paths outside the real configured stores
+        // still need review rather than incidental-write exemption.
+        const configuredOrProtected = target.startsWith(`${deniedRoot}/`) || target === path.resolve(import.meta.dir, "../.pytest_cache/state")
+        if (mode === "ro" || configuredOrProtected) {
           expect(result.output.response.action).toBe("deny")
           expect(host.calls.length).toBe(before)
         } else {

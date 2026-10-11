@@ -37,7 +37,7 @@ describe("inspection failures are unavailable evidence, not decisions", () => {
       expect(shell.facts.join("\n")).toContain("EACCES")
       const cache = createApprovalCache()
       const scope = { sessionID: "inspection", securitySnapshot: "auto", userAuthorizationDigest: "fixture" }
-      const facts = { exactDigest: "same", kind: "write" as const, operation: "create", targets, requiresFullApproval: false, effect: "replace" as const }
+      const facts = { coreDigest: "same", kind: "write" as const, operation: "create", targets, requiresFullApproval: false, effect: "replace" as const }
       cache.store(scope, facts, { decision: "allow", floor: "no", source: "bounded" } as never)
       expect(cache.lookup(scope, facts)).toBeUndefined()
       expect(targetIdentitiesMatch(targets, targets)).toBe(true)

@@ -1,5 +1,62 @@
 # Changelog
 
+## 1.7.0 (2026-10-11)
+
+- Release-review fixes: bind network L1 entries to observed numeric endpoints
+  (family/address/port/IPv6 scope); unidentified endpoints never earn positive
+  cache entries. Keep explicit and worktree write roots observed so sensitive
+  targets cannot bypass their per-target exclusions. Assemble bounded complete
+  cancellation frames and flush them before closing, with executor interruption
+  as the send-failure fallback.
+- Release shared notification claims after both success and failure and serialize
+  publications per session. Derive security state from each session's home-location
+  policy; conflicting registrations retain the restrictive intersection and warn
+  once, while a missing home instance cannot widen authority.
+- Exclude `.git` files as well as directories from L3 candidates; clear L3 state
+  on session deletion and prune expired directory records during access/maintenance.
+  Prevent an in-flight suggestion from reinstating a deleted session's grant.
+
+- Apply `failPolicy` end to end: default fail-open passes incomplete checks
+  with code-only audit traces, including observer/sandbox, broker, JEV,
+  evidence, session, target-race and cache failures. The native watcher
+  supports `--fail-open` degradation; actual denies, permission ceilings
+  and explicit user cancellation/revocation still refuse. Fail-open takes
+  precedence over `sandbox.onUnavailable: "fail_close"` with a load warning.
+- Approval cache: L1 keys on the boundary core (crossing kind/syscall/
+  operation/effect, stable target identities, image identity and non-shell
+  argv, cwd, review policy, bypass surface) instead of the whole review
+  request, so `| tail -30` → `| tail -20` or an appended `; echo x` reuses
+  the same crossing's adjudication; native file tools key on tool + resolved
+  targets + identities + mode rather than raw input text. Positive entries
+  now live 20 minutes on a sliding window and survive new user messages;
+  denials stay 5 minutes, fixed, bound to their user message. Any
+  security-state change still clears the session's whole cache.
+- Add `sandbox.allowWrite`: canonical explicit incidental write roots in Auto
+  and Read only, with per-entry warnings for unsafe roots and unchanged
+  deny/protect/credential/sensitive-target exclusions.
+- Add L3 temporary session write roots after three distinct allowed shell
+  crossings within twenty minutes. Bounded credential/database/source scans
+  filter narrow-first candidates before a separate background JEV choice;
+  grants expire on time, new user authorization, or security-snapshot changes.
+  L3 errors never refuse commands, Read only never widens, and traces use only
+  command digests rather than raw command text.
+- Share user-authority/session security state across the per-location plugin
+  instances the host loads into one server process. Bypass leases, session
+  perm baselines and ancestry, the explicit no-Bypass barrier, security
+  snapshot bases/epochs, the approval cache, L3 grants and notice snapshots
+  now live in a process-wide registry instead of per-instance closures: a
+  `/bypass` or `/perm` change reaches sessions served by other instances,
+  each notice is delivered exactly once, any instance's snapshot change
+  clears the session's shared approval cache, and a location re-boot reloads
+  the plugin into the existing state.
+- Add a linked git worktree's private metadata directory
+  (`<common>/.git/worktrees/<name>`) to the shell write roots of Auto/write
+  sessions, resolved from the `cwd/.git` pointer and verified through the
+  commondir/gitdir round-trip — git's routine index/HEAD bookkeeping there no
+  longer costs a boundary review. Read-only sessions and native file tools
+  gain nothing, forged `.git` pointers are ignored, and the
+  denyWrite/protect/credential/sensitive-target exclusions still apply.
+
 ## 1.6.2 (2026-10-11)
 
 - Ship `bin/opencode-boundary-watch` as executable. 1.6.0 and 1.6.1 packed it

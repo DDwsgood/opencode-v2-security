@@ -6,6 +6,7 @@ import { Cause, Effect, Exit, Option, Scope, Stream } from "effect"
 import plugin from "../src/index"
 import type { BypassStatusData } from "../src/bypass-rpc"
 import { resolvePluginConfig } from "../src/config"
+import { resetSharedSecurityStateForTests } from "../src/security/shared-state"
 
 // Same minimal host-context harness as tests/bypass-rework.test.ts: the
 // plugin's effect(ctx) only needs the ctx slices it actually calls, run
@@ -51,6 +52,9 @@ async function startPlugin(
   options: Record<string, unknown> = {},
   events: unknown[] = [],
 ): Promise<Harness> {
+  // Security state is shared process-wide between plugin instances; each
+  // simulated instance here must start from a clean registry.
+  resetSharedSecurityStateForTests()
   const directory = await ensureWorkdir()
   const collected: Partial<Record<string, HookCb>> = {}
   const evalHooks: HookCb[] = []

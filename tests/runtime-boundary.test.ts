@@ -78,11 +78,31 @@ describe("runtime boundary broker", () => {
     expect(result.action).toBe("deny")
     expect(result.reason).toContain("could not be completed")
   })
+  test("fail_open callback exceptions allow without refusal text and report a safe code", async () => {
+    const failures: string[] = []
+    const host = await createRuntimeBoundaryBroker({ directory: "/tmp/opencode", failPolicy: "fail_open",
+      onBoundary: () => { throw new Error("raw-provider-secret") }, onFailure: (code) => { failures.push(code) } })
+    brokers.push(host)
+    const result = await request(await open(host), event(host.token))
+    expect(result.action).toBe("allow")
+    expect(result.reason).toBeUndefined()
+    expect(JSON.stringify(result)).not.toMatch(/blocked|cannot|could not|raw-provider-secret/i)
+    expect(failures).toEqual(["broker_callback"])
+  })
   test("opaque capabilities cannot use an event-only cache grant", async () => {
     const host = await broker(async () => ({ action: "continue" }))
     const socket = await open(host)
     const result = await request(socket, { ...event(host.token), kind: "opaque", details: { requiresFullApproval: true } })
     expect(result.action).toBe("deny")
+  })
+  test("fail_open treats an invalid full-approval reply as a protocol failure", async () => {
+    const failures: string[] = []
+    const host = await createRuntimeBoundaryBroker({ directory: "/tmp/opencode", failPolicy: "fail_open",
+      onBoundary: async () => ({ action: "continue" }), onFailure: (code) => { failures.push(code) } })
+    brokers.push(host)
+    const result = await request(await open(host), { ...event(host.token), kind: "opaque", details: { requiresFullApproval: true } })
+    expect(result.action).toBe("allow")
+    expect(failures).toEqual(["broker_protocol"])
   })
   test("closing a call cancels its in-progress approval", async () => {
     let observed!: AbortSignal

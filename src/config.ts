@@ -1,6 +1,9 @@
 import { isIP } from "node:net"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { homedir } from "node:os"
+import { credentialStoreReadPaths } from "./security/paths"
+import { resolveAllowWriteRoots } from "./security/write-root-policy"
 import {
   reviewCommandWithAuditor,
   type CloudReviewRequest,
@@ -269,6 +272,9 @@ export type SandboxOptions = {
    * they shadow write roots too. */
   denyWrite?: string[]
   denyRead?: string[]
+  /** Additional incidental write roots, including in Read only. Unsafe roots
+   * are ignored with a warning; deny/protect/credential exclusions still win. */
+  allowWrite?: string[]
   /** Allow sudo/setuid escalation (default false). Honest semantics: bwrap
    * sets no_new_privs unconditionally, so the helper treats true on RW as
    * "run the payload host-direct" — no namespace, NNP, or seccomp floor.
@@ -310,6 +316,8 @@ export type ResolvedSandbox = {
   workspaceNetwork: "on" | "off"
   denyWrite: readonly string[]
   denyRead: readonly string[]
+  allowWrite: readonly string[]
+  allowWriteWarnings: readonly string[]
   allowSudo: boolean
   extraArgs: readonly string[]
   maskWslInterop: boolean
@@ -385,6 +393,7 @@ const ALLOWED_SANDBOX_FIELDS = new Set([
   "workspaceNetwork",
   "denyWrite",
   "denyRead",
+  "allowWrite",
   "allowSudo",
   "extraArgs",
   "maskWslInterop",
@@ -871,6 +880,8 @@ export function resolveSandbox(raw: unknown): ResolvedSandbox {
     workspaceNetwork: "off",
     denyWrite: [],
     denyRead: [],
+    allowWrite: [],
+    allowWriteWarnings: [],
     allowSudo: false,
     extraArgs: [],
     maskWslInterop: true,
@@ -961,6 +972,14 @@ export function resolveSandbox(raw: unknown): ResolvedSandbox {
   if (source.denyRead !== undefined) {
     resolved.denyRead = resolveSandboxPathList(source.denyRead, "denyRead", resolved.scratch)
   }
+  const allowWrite = resolveAllowWriteRoots(source.allowWrite, {
+    home: homedir(), cwd: PACKAGE_ROOT,
+    credentialPaths: credentialStoreReadPaths(homedir()), denyWrite: resolved.denyWrite,
+    protect: [PACKAGE_ROOT, path.join(PACKAGE_ROOT, "bin", "opencode-boundary-watch")],
+    brokerBase: "/tmp/opencode",
+  })
+  resolved.allowWrite = allowWrite.roots
+  resolved.allowWriteWarnings = allowWrite.warnings
   if (source.allowSudo !== undefined) {
     if (typeof source.allowSudo !== "boolean") throw new Error("sandbox.allowSudo must be a boolean")
     resolved.allowSudo = source.allowSudo

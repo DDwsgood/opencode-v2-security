@@ -273,6 +273,27 @@ describe("create.before authority (marker is the sole wrap source)", () => {
     shell: "/bin/bash",
     env: { PATH: "/usr/bin" } as Record<string, string | undefined>,
   })
+  test("fail_open degrades unavailable probes, lost markers and absent observer images", () => {
+    for (const profile of ["ro", "workspace"] as const) {
+      const ev = spawn()
+      const marked = { command: "printf fixture", profile }
+      applySandboxCreateBefore(ev, marked, selection(), unavailable, () => false, "fail_open")
+      expect(ev.command).toBe("printf fixture")
+      expect(ev.command).not.toMatch(/blocked|cannot|could not/i)
+      expect(ev.shell).toBe("/bin/bash")
+      expect(assertSandboxAvailable(profile, unavailable, "fail_close", false, "fail_open")).toBe("degraded")
+    }
+    const markers = createSandboxMarkers()
+    const ev = spawn()
+    ev.command = insertSandboxMarker(markers, "printf fixture", "workspace", NONCE)
+    const invalid = extractSandboxMarker(createSandboxMarkers(), ev.command)
+    applySandboxCreateBefore(ev, invalid, selection(), available, () => true, "fail_open")
+    expect(ev.command).toBe("printf fixture")
+    const watch = { helperPath: "/missing/observer", socketPath: "/fixture/socket", token: "fixture",
+      roots: [], denyRead: [], denyWrite: [], readonly: false, failOpen: true }
+    applySandboxCreateBefore(ev, { command: "printf fixture", profile: "workspace", runtimeWatch: watch }, selection(), available, () => false, "fail_open")
+    expect(ev.command).toBe("printf fixture")
+  })
 
   test("marker-less spawn (user !cmd) is left byte-identical", () => {
     const ev = spawn()

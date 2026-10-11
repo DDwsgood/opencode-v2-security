@@ -5,6 +5,7 @@ import path from "node:path"
 import { Cause, Effect, Exit, Option, Scope, Stream } from "effect"
 import plugin from "../src/index"
 import { BypassRpc, type BypassStatusData } from "../src/bypass-rpc"
+import { resetSharedSecurityStateForTests } from "../src/security/shared-state"
 
 // --- strict schema check against the REAL contract object --------------------
 // The host validates emitted objects by KEY PRESENCE, not by JSON.stringify
@@ -146,6 +147,9 @@ async function startPlugin(
   emitFailure?: Error,
   emitProbe?: () => number,
 ): Promise<Harness> {
+  // Security state is shared process-wide between plugin instances; each
+  // simulated instance here must start from a clean registry.
+  resetSharedSecurityStateForTests()
   const directory = await ensureWorkdir()
   const collected: Partial<Record<string, HookCb>> = {}
   const evalHooks: HookCb[] = []

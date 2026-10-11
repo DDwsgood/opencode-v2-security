@@ -163,8 +163,8 @@ type PythonCandidate = {
 
 /**
  * Error thrown when a dynamic review fails. Carries a coarse classification so
- * callers can distinguish security/protocol violations (fail-close) from
- * infrastructure failures (honor fail policy). `exitCode` is the auditor
+ * callers can distinguish protocol from infrastructure failures. Both honor
+ * failPolicy; neither is an adjudicated DENY. `exitCode` is the auditor
  * process exit code (when available); `reads`/`transcript` are recovered from
  * the auditor's structured side-channel on non-zero exit. `code` mirrors the
  * errno for spawn failures so candidate fallback can still detect ENOENT.
@@ -201,7 +201,7 @@ const MAX_STDOUT_CHARS = 64_000
 const MAX_STDERR_CHARS = 8_000
 // 256KB preflight budget (≈6.4万 token, 15x余量). Exceeding it is a defensive
 // failure signal (possible injection/DoS attempting to overwhelm the reviewer)
-// and is thrown as a protocol ReviewError so callers fail-close.
+// and is thrown as a protocol ReviewError so callers apply failPolicy.
 const MAX_REVIEW_INPUT_BYTES = 262_144
 const DEFAULT_TIMEOUT_MS = 30_000
 // The auditor's review deadline sits strictly below the child-process kill
@@ -593,8 +593,8 @@ function parseReviewResult(stdout: string, policy: ReviewPolicy): CloudReviewRes
 // policy): 4 = HTTP error, 5 = network error. Every other non-zero exit —
 // including 2 (input validation), 6 (mandatory-inspection violation), 7
 // (generic review exception), unrecognized codes, and signal deaths — defaults
-// to "protocol" so a defensive failure closes the gate rather than letting an
-// ambiguous failure fall through to fail_open.
+// to "protocol". These are incomplete checks, not security verdicts; the
+// caller applies failPolicy to both failure kinds.
 const INFRA_EXIT_CODES = new Set([4, 5])
 
 function classifyExitCode(code: number | null): "protocol" | "infra" {

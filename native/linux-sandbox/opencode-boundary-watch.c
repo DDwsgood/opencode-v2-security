@@ -130,6 +130,8 @@
 #error "opencode-boundary-watch supports Linux x86_64 only"
 #endif
 
+#include <arpa/inet.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -276,6 +278,10 @@ static const char *g_broker_path;
 static char g_token[65];
 static pid_t g_self_pid;
 static pid_t g_root_pid;
+static int g_fail_open;
+static char *const *g_payload_argv;
+static int g_broker_fd = -1;
+static void setup_fail_open(void);
 /* Set by the host's normal signals (TERM/INT/HUP). Checked in every wait
  * loop so a cancel tears down the WHOLE payload tree — traced, detached,
  * and orphaned — instead of letting detached survivors outlive us. */
@@ -284,6 +290,9 @@ static void on_term_signal(int sig) { g_term_signal = sig; }
 
 static void die(const char *fmt, ...)
 {
+    if (g_fail_open && g_payload_argv && !g_term_signal)
+        setup_fail_open();
+    if (g_root_pid > 0) kill(g_root_pid, SIGKILL);
     va_list ap;
     va_start(ap, fmt);
     fprintf(stderr, "opencode-boundary-watch: ");
@@ -1003,7 +1012,6 @@ static int proc_check(const char *path, pid_t *pid_out)
 /* Broker channel                                                      */
 /* ------------------------------------------------------------------ */
 
-static int g_broker_fd = -1;
 static unsigned long g_event_id;
 static char g_deny_reason[240]; /* broker 'reason' carried to the kill text */
 static int g_at_exit_stop;      /* decision made at a syscall-EXIT check */
@@ -1132,6 +1140,24 @@ static int cred_context(Tracee *t, uintptr_t argv_ptr,
  *      verdict).
  * argv_ptr is the tracee's execve argv for exec events, 0 otherwise (the
  * current /proc/<tgid>/cmdline is used then). */
+static int is_cancel_frame(const char *line)
+{
+    char compact[512];
+    size_t off = 0;
+    int quoted = 0, escaped = 0;
+    for (const char *p = line; *p; p++) {
+        if (!quoted && isspace((unsigned char)*p)) continue;
+        if (off + 1 >= sizeof(compact)) return 0;
+        compact[off++] = *p;
+        if (escaped) escaped = 0;
+        else if (quoted && *p == '\\') escaped = 1;
+        else if (*p == '"') quoted = !quoted;
+    }
+    compact[off] = 0;
+    return strcmp(compact, "{\"version\":1,\"type\":\"cancel\"}") == 0 ||
+           strcmp(compact, "{\"type\":\"cancel\",\"version\":1}") == 0;
+}
+
 static int broker_decide_argv(Tracee *t, const char *syscall, const char *kind,
                               const char *op, Target *targets, int ntargets,
                               const char *details, int full_approval,
@@ -1228,6 +1254,7 @@ static int broker_decide_argv(Tracee *t, const char *syscall, const char *kind,
     }
     if (!strstr(line, "\"version\":1") && !strstr(line, "\"version\": 1"))
         return -2;
+    if (is_cancel_frame(line)) return -3;
     const char *eid = strstr(line, "\"eventID\"");
     if (!eid || !(eid = strchr(eid, ':'))) return -2;
     if (strtoul(eid + 1, NULL, 10) != g_event_id) return -2;
@@ -1287,6 +1314,49 @@ static void broker_send_exit(int code)
         "{\"version\":1,\"type\":\"exit\",\"token\":\"%s\",\"exit\":%d}\n",
         g_token, code & 0xff);
     if (n > 0) write_all(g_broker_fd, b, (size_t)n);
+}
+
+/* Only a fixed code is reported: setup errors may contain sensitive paths.
+ * The payload has not executed yet, so discard the stopped bootstrap child
+ * and exec the original payload once, restoring its deferred environment. */
+static void setup_fail_open(void)
+{
+    if (g_root_pid > 0) {
+        kill(g_root_pid, SIGKILL);
+        int st;
+        while (waitpid(g_root_pid, &st, __WALL) > 0) {
+            if (WIFEXITED(st) || WIFSIGNALED(st)) break;
+            ptrace(PTRACE_CONT, g_root_pid, 0, 0);
+        }
+    }
+    if (g_broker_fd < 0 && g_broker_path) {
+        struct sockaddr_un sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sun_family = AF_UNIX;
+        if (strlen(g_broker_path) < sizeof(sa.sun_path)) {
+            snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", g_broker_path);
+            g_broker_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (g_broker_fd >= 0)
+                connect(g_broker_fd, (struct sockaddr *)&sa, sizeof(sa));
+        }
+    }
+    char frame[180];
+    int n = snprintf(frame, sizeof(frame),
+        "{\"version\":1,\"type\":\"fail_open\",\"token\":\"%s\",\"code\":\"observer_setup\"}\n", g_token);
+    if (g_broker_fd >= 0) write_all(g_broker_fd, frame, (size_t)n);
+    for (int i = 0; i < g_ndefer; i++) {
+        const char *value = getenv(g_defer_store[i]);
+        if (value) setenv(g_defer_real[i], value, 1);
+        unsetenv(g_defer_store[i]);
+    }
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigprocmask(SIG_SETMASK, &mask, NULL);
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGINT, SIG_DFL);
+    signal(SIGHUP, SIG_DFL);
+    execv(g_payload_argv[0], g_payload_argv);
+    _exit(127); /* The payload's own exec failure, not a plugin refusal. */
 }
 
 /* ------------------------------------------------------------------ */
@@ -1381,7 +1451,7 @@ static void detach_all(void)
     int pending = 0;
     for (int i = 0; i < g_ntids; i++) {
         Tracee *t = &g_tids[i];
-        if (t->dead) continue;
+        if (t->dead || t->detached) continue;
         if (ptrace(PTRACE_DETACH, t->tid, 0, (void *)(long)SIGCONT) == 0) {
             t->detached = 1; /* supervised, no longer traced */
             continue;
@@ -1679,6 +1749,15 @@ static const char *sc_name(long nr)
 static int apply_decision(Tracee *t, int decision, int *exit_code)
 {
     (void)t; (void)exit_code;
+    if (g_term_signal || decision == -3)
+        kill_tree("the command was cancelled", 0);
+    if (decision == -2 && g_fail_open) {
+        char frame[200];
+        int n = snprintf(frame, sizeof(frame),
+            "{\"version\":1,\"type\":\"fail_open\",\"token\":\"%s\",\"code\":\"observer_review\"}\n", g_token);
+        if (g_broker_fd >= 0) write_all(g_broker_fd, frame, (size_t)n);
+        decision = 1;
+    }
     if (decision == 1) {
         detach_all();
         g_detached = 1;
@@ -1692,6 +1771,19 @@ static int apply_decision(Tracee *t, int decision, int *exit_code)
         kill_tree("the boundary review did not complete",
                   !g_at_exit_stop);
     return 0;
+}
+
+static int observer_failure(const char *code, const char *reason, int at_entry)
+{
+    if (!g_fail_open) kill_tree(reason, at_entry);
+    if (g_term_signal) kill_tree("the command was cancelled", 0);
+    char frame[200];
+    int n = snprintf(frame, sizeof(frame),
+        "{\"version\":1,\"type\":\"fail_open\",\"token\":\"%s\",\"code\":\"%s\"}\n", g_token, code);
+    if (g_broker_fd >= 0) write_all(g_broker_fd, frame, (size_t)n);
+    detach_all();
+    g_detached = 1;
+    return RC_DETACHED;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1808,8 +1900,16 @@ static int gate_sockaddr(Tracee *t, const char *sc, const char *op,
         snprintf(details, sizeof(details),
                  "\"family\":\"AF_INET\",\"target\":\"%u.%u.%u.%u:%u\"",
                  sa[4], sa[5], sa[6], sa[7], (unsigned)((sa[2] << 8) | sa[3]));
-    } else if (fam == AF_INET6) {
-        snprintf(details, sizeof(details), "\"family\":\"AF_INET6\"");
+    } else if (fam == AF_INET6 && want >= sizeof(struct sockaddr_in6)) {
+        struct sockaddr_in6 address;
+        char host[INET6_ADDRSTRLEN];
+        memcpy(&address, sa, sizeof(address));
+        if (inet_ntop(AF_INET6, &address.sin6_addr, host, sizeof(host)))
+            snprintf(details, sizeof(details),
+                     "\"family\":\"AF_INET6\",\"target\":\"[%s]:%u\",\"scopeID\":%u",
+                     host, (unsigned)ntohs(address.sin6_port), address.sin6_scope_id);
+        else
+            snprintf(details, sizeof(details), "\"family\":\"AF_INET6\"");
     } else {
         snprintf(details, sizeof(details), "\"family\":\"AF_%u\"", fam);
     }
@@ -2043,7 +2143,7 @@ static int gate_entry(Tracee *t, struct user_regs_struct *r, int *exit_code)
              * guessed-private default would miss a real CLONE_FILES. */
             if (tmem_read(t->tid, (uintptr_t)r->rdi, &flags, 8) != 8 ||
                 getenv("BW_TEST_CLONE3_FAIL") /* test-only injection */)
-                kill_tree("a payload clone3 argument block could not be "
+                return observer_failure("observer_inspection", "a payload clone3 argument block could not be "
                           "read for the boundary check", 0);
             g_gate_used_mutable = 1;
         }
@@ -2685,6 +2785,8 @@ static int entry_gate(Tracee *t, int *exit_code)
     pid_t p = t->tid;
     struct user_regs_struct r;
     if (get_regs(p, &r) < 0) {
+        if (g_fail_open)
+            return observer_failure("observer_registers", "payload registers could not be inspected", 0);
         if (t->hold_sibs) { t->hold_sibs = 0;
                             resume_paused_siblings(t->tgid, p); }
         t->dead = 1;
@@ -2735,7 +2837,7 @@ static int entry_gate(Tracee *t, int *exit_code)
     int paused = 0;
     if (nr_may_gate(nr) && !recvish) {
         if (pause_siblings(t->tgid, p) < 0)
-            kill_tree("a payload thread could not be frozen for the "
+            return observer_failure("observer_freeze", "a payload thread could not be frozen for the "
                       "boundary check", 0);
         paused = 1;
     }
@@ -2876,6 +2978,8 @@ static int handle_stop(Tracee *t, int st, int *exit_code)
 
     struct user_regs_struct r;
     if (get_regs(p, &r) < 0) {
+        if (g_fail_open)
+            return observer_failure("observer_registers", "payload registers could not be inspected", 0);
         if (t->hold_sibs) { t->hold_sibs = 0;
                             resume_paused_siblings(t->tgid, p); }
         t->dead = 1;
@@ -2911,7 +3015,7 @@ static int handle_stop(Tracee *t, int st, int *exit_code)
     }
     if (t->pending_recv &&
         pause_siblings(t->tgid, p) < 0)
-        kill_tree("a payload thread could not be frozen for the "
+        return observer_failure("observer_freeze", "a payload thread could not be frozen for the "
                   "boundary check", 0);
     /* Test-only ordering anchor: a sibling rebind/allocator stop that
      * arrived late still races this exit stop in waitpid's arbitrary
@@ -2945,6 +3049,36 @@ static int handle_stop(Tracee *t, int st, int *exit_code)
  *   -2  broker socket EOF/HUP/ERR or unexpected unsolicited traffic
  * 0 is impossible. */
 static int g_sigfd = -1;
+
+/* Idle traffic is a control frame, not a syscall reply. A started frame must
+ * finish within one second and 511 bytes. Truncation/timeout conservatively
+ * cancels: a fragmented user cancel must never become a fail-open EOF. */
+static int read_idle_control(void)
+{
+    char line[512];
+    size_t off = 0;
+    double deadline = bw_now() + 1.0;
+    for (;;) {
+        if (g_term_signal) return -3;
+        int remaining = (int)((deadline - bw_now()) * 1000);
+        if (remaining <= 0) return -3;
+        struct pollfd fd = { g_broker_fd, POLLIN, 0 };
+        int ready = poll(&fd, 1, remaining);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) return -3;
+        char byte;
+        ssize_t count = recv(g_broker_fd, &byte, 1, MSG_DONTWAIT);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (count <= 0) return off ? -3 : -2;
+        if (byte == '\n') {
+            line[off] = 0;
+            return is_cancel_frame(line) ? -3 : -2;
+        }
+        if (off + 1 >= sizeof(line)) return -3;
+        line[off++] = byte;
+    }
+}
+
 static int wait_event(int *st_out)
 {
     for (;;) {
@@ -2993,7 +3127,12 @@ static int wait_event(int *st_out)
                     (se == EPIPE || se == ECONNRESET || se == ENOTCONN))
                     dead = 1;
             }
-            if (dead) return -2;
+            if (dead) {
+                if (pn > 0) {
+                    return read_idle_control();
+                }
+                return -2;
+            }
         }
         if (fds[0].revents & POLLIN) {
             struct signalfd_siginfo si;
@@ -3008,13 +3147,25 @@ int main(int argc, char **argv)
     clock_gettime(CLOCK_MONOTONIC, &g_t0);
     g_self_pid = getpid();
 
+    /* Discover the payload before setup parsing, so even a stale canonical
+     * root or an unsupported observer option can degrade losslessly. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--") == 0) {
+            if (i + 1 < argc) g_payload_argv = &argv[i + 1];
+            break;
+        }
+        if (strcmp(argv[i], "--fail-open") == 0) g_fail_open = 1;
+    }
+
     const char *shell_args[64];
     int nargs = 0;
     static char dbuf[MAX_ROOTS][PATH_MAX];
     static char wbuf[MAX_ROOTS][PATH_MAX];
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
-        if (strcmp(a, "--broker") == 0 && i + 1 < argc) {
+        if (strcmp(a, "--fail-open") == 0) {
+            g_fail_open = 1;
+        } else if (strcmp(a, "--broker") == 0 && i + 1 < argc) {
             g_broker_path = argv[++i];
         } else if (strcmp(a, "--token") == 0 && i + 1 < argc) {
             i++;
@@ -3163,7 +3314,7 @@ int main(int argc, char **argv)
     unsigned opts = PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
         PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT |
         PTRACE_O_EXITKILL;
-    if (ptrace(PTRACE_SEIZE, root, 0, opts) < 0)
+    if (getenv("BW_TEST_SEIZE_FAIL") ? (errno = EPERM, 1) : ptrace(PTRACE_SEIZE, root, 0, opts) < 0)
         die("PTRACE_SEIZE: %s", strerror(errno));
 
     /* Connect the broker channel now that the payload is seized (the child
@@ -3174,6 +3325,7 @@ int main(int argc, char **argv)
         memset(&sa, 0, sizeof(sa));
         sa.sun_family = AF_UNIX;
         if (strlen(g_broker_path) >= sizeof(sa.sun_path)) {
+            if (g_fail_open) setup_fail_open();
             kill(root, SIGKILL);
             die("broker path too long");
         }
@@ -3181,6 +3333,7 @@ int main(int argc, char **argv)
         g_broker_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (g_broker_fd < 0 ||
             connect(g_broker_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+            if (g_fail_open) setup_fail_open();
             kill(root, SIGKILL);
             die("cannot connect to broker socket: %s", strerror(errno));
         }
@@ -3220,12 +3373,18 @@ int main(int argc, char **argv)
         }
         pid_t p = wait_event(&st);
         if (p == -1) break;                       /* tree fully reaped */
-        if (p == -2)
-            kill_tree("the broker channel closed (command cancelled)", 0);
+        if (p == -2) {
+            observer_failure("broker_eof", "the broker channel closed (command cancelled)", 0);
+            close(g_broker_fd);
+            g_broker_fd = -1;
+            continue;
+        }
         if (p == -3)
             kill_tree("the supervisor was terminated (cancelled)", 0);
-        if (p == -4)
-            kill_tree("supervision failed (poll error)", 0);
+        if (p == -4) {
+            observer_failure("observer_poll", "supervision failed (poll error)", 0);
+            continue;
+        }
         Tracee *t = tid_find(p);
         if (!t) {
             t = tid_register(p);

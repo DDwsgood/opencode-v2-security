@@ -8,7 +8,7 @@
 - `src/index.ts` 串联工具前审查、权限上限、沙箱路由和运行时边界监督；静态语义在 `src/security/classifier.ts`，规则到豁免类别的映射在 `src/security/bypass.ts`。不要为一个局部任务反复通读整个入口。
 - 常规动态审查：`reviewer.ts` → `jev-reviewer.py`（仅 JEV，旧导出接口；新 Linux 边界链路由 `effects-reviewer.ts` 直接请求 JEV，只读会话使用其 readonly 变体）。JEV 的共享效果题在 `risk_heads.py`。核对实际发送题目应看 `build_questions` 与 state 构造函数，不能把保留但已停发的旧题目常量算进去。
 - JEV 官方 `noul` 是命题为真的概率，不是任意严重度数轴；`score` 才是等级量表，要求顶层 `criteria` 为 2～10 项有序数组。题目 ID 不进入模型，类别与判断必须完整写在本题 instructions；不要靠改名解释返回值，也不要把畸形请求的 400 当作题型不支持。接口依据：`https://docs.typesafe.ai/primitives`、`https://docs.typesafe.ai/api`。
-- `reviewer` 的 `"openai"`/`"auto"` 旧拼写仅作兼容输入并解析为 `"jev"`，没有 OpenAI-compatible 审查器回退；JEV 基础设施失败直接按 `failPolicy` 处理。Python stdout 是结构化结果通道，诊断写 stderr。
+- `reviewer` 的 `"openai"`/`"auto"` 旧拼写仅作兼容输入并解析为 `"jev"`，没有 OpenAI-compatible 审查器回退；所有检查故障（含协议、证据、竞争、helper、broker、会话及缓存异常）统一按 `failPolicy` 处理，默认 `fail_open` 放行并记录短码。实际安全否决、权限底线和用户取消／撤销不能放宽；broker 用显式 cancel 帧区分用户取消与故障 EOF。Python stdout 是结构化结果通道，诊断写 stderr。
 
 ## 容易破坏的契约
 
@@ -16,6 +16,10 @@
 - 凭据同对象的读写、删除和保护弱化归 secret，不能机械重复为 filesystem/privilege；独立普通数据损失仍保留。远端动作的附随传输不自动加 network。真实独立复合不能强制单类。
 - 分类、许可决定、实际权限和沙箱能力分开。category 豁免不扩大 r/w 上限；x 仅兼容显示，始终可用且不能单独授予或撤销。不可绕过底线由 `isFloorRule` 判断；不能把“没有类别映射”的普通规则都当底线。
 - 一次批准绑定会话、命令和受审事实；弱 secondary 不进入下一次申请的硬覆盖要求。修改审查逻辑须检查 **Python 结果 → TS 解析 → 宿主拒绝** 整条链，不能只测 Python `decide()`。
+- 用户权限/会话安全状态（bypass 租约、sessionPerms 与祖先链、explicitNoBypass、permStash、securityBases/Epochs、审批缓存、L3、通知快照）存放在 `src/security/shared-state.ts` 的进程级注册表（`globalThis[Symbol.for("opencode-v2-security.state.v1")]`），宿主按会话位置加载的多个插件实例共享；只有 ctx 句柄、broker、RPC 注册、定时器与在途审查才真正按实例持有。任何实例改变某会话的安全状态后须发布 `session-state-changed`，其他实例的反应（刷新合并通知、同步后代、重发 RPC、快照变化时清共享审批缓存）必须保持幂等；实例销毁时注销监听。改动状态归属或通知语义时检查「变更方写共享映射 → publish → 他实例同步」整条链。
+- 共享快照必须使用会话 home location 的策略，不能使用处理方实例的默认权限／永久豁免／传播配置。位置注册冲突保留更严格交集并只警告一次；所属实例缺失时收紧，注销 owner 不清历史用户授权。通知 claim 仅属于在途 publisher token，成功／失败均释放，逐会话串行。
+- 网络 L1 绑定完整观察端点（地址族、规范 IP、端口、IPv6 scope）；未知端点不缓存 allow。显式 allowWrite、worktree 私有根与 L3 根必须保持观察，broker 的逐目标排除不可被 native `--root` 短路。空闲 cancel 必须组装完整且有界的 NDJSON，已开始的残缺帧按取消处理；发送端先刷新再关闭，失败走执行器中断兜底。
+- L3 候选排除任何类型的 `.git`；会话删除清 grant/repetition，在途建议不得复活它们。过期目录记录在访问与既有维护定时器中清理。
 - `/perm`、`/bypass` 状态变更只更新 `session-notifications.ts` 快照，不入队；在 `session.hook("prompt")`（宿主准备下一条真实用户消息、尚未入队）里才用 `session.synthetic`（`resume:false`、`steer`）追加。状态变更时直接 synthetic 会在 inbox 留下待处理 steer 项，正在收尾的 runner 会因此多发一次模型请求；排队（`queue`）消息不携带通知。运行中的变更另由 `tool.execute.after` 前置到下一个已完成工具结果（`takeForToolResult`，计为已送达），本次运行的下一步本来就会读取它，不另起请求。
 - 自动采到正文不等于已证明安全；原始模型选择、程序底线、权限拒绝、协议/网络错误应分源，不能用未选项概率伪造模型拒绝。
 

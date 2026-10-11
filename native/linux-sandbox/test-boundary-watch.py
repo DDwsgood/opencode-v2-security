@@ -34,12 +34,13 @@ class Broker(threading.Thread):
     after a beat)|raw dict. close_after_accept drops the conn right away."""
 
     def __init__(self, sock_path, policy, close_after_accept=False,
-                 eof_delay=0.4):
+                 eof_delay=0.4, idle_control=None):
         super().__init__(daemon=True)
         self.sock_path = sock_path
         self.policy = policy
         self.close_after_accept = close_after_accept
         self.eof_delay = eof_delay
+        self.idle_control = idle_control
         self.events = []
         self.replies = []
         self.exits = []  # terminal {"type":"exit"} frames (no reply)
@@ -59,6 +60,11 @@ class Broker(threading.Thread):
                 time.sleep(self.eof_delay)
                 conn.close()
                 return
+            if self.idle_control is not None:
+                time.sleep(self.eof_delay)
+                for fragment in self.idle_control:
+                    conn.sendall(fragment)
+                    time.sleep(0.05)
             buf = b""
             while True:
                 try:
@@ -1493,6 +1499,108 @@ print("sent")
         self.assertNotIn("--token", out)
         self.assertEqual(br.events, [])
 
+
+    def test_52_fail_open_broker_failures_release_payload(self):
+        for policy in [lambda ev, idx: "eof",
+                       lambda ev, idx: {"version": 9, "action": "allow"}]:
+            with self.subTest(policy=policy):
+                fresh_tree()
+                target = os.path.join(OUT, "fail-open.txt")
+                proc, broker = run_watch(
+                    f"printf fixture > {target}", policy,
+                    extra_args=["--fail-open"])
+                code, out, err = wait_proc(proc)
+                broker.close()
+                self.assertEqual(code, 0, err)
+                self.assertTrue(os.path.exists(target))
+                self.assertNotRegex(out + err, r"blocked|cannot|could not")
+
+    def test_53_fail_open_setup_execs_payload_once(self):
+        for failure in ["BW_TEST_SUBREAPER_FAIL", "BW_TEST_SEIZE_FAIL"]:
+            with self.subTest(failure=failure):
+                fresh_tree()
+                target = os.path.join(WORK, "setup-pass.txt")
+                proc, broker = run_watch(
+                    f"printf fixture >> {target}", lambda ev, idx: "deny",
+                    extra_args=["--fail-open"], env=dict(os.environ, **{failure: "1"}))
+                code, out, err = wait_proc(proc)
+                broker.close()
+                self.assertEqual(code, 0, err)
+                with open(target) as stream:
+                    self.assertEqual(stream.read(), "fixture")
+                self.assertNotRegex(out + err, r"blocked|cannot|could not")
+
+    def test_54_fail_open_timeout_releases_payload(self):
+        fresh_tree()
+        target = os.path.join(OUT, "timeout-pass.txt")
+
+        def slow_reply(ev, idx):
+            time.sleep(6)
+            return "allow"
+
+        proc, broker = run_watch(
+            f"printf fixture > {target}", slow_reply,
+            extra_args=["--fail-open", "--approve-timeout-ms", "5000"])
+        code, out, err = wait_proc(proc)
+        broker.close()
+        self.assertEqual(code, 0, err)
+        self.assertTrue(os.path.exists(target))
+        self.assertNotRegex(out + err, r"blocked|cannot|could not")
+
+    def test_55_fail_open_keeps_denial_and_explicit_cancellation(self):
+        for policy in [lambda ev, idx: "deny",
+                       lambda ev, idx: {"version": 1, "type": "cancel"}]:
+            with self.subTest(policy=policy):
+                fresh_tree()
+                target = os.path.join(OUT, "must-not-run.txt")
+                proc, broker = run_watch(
+                    f"printf fixture > {target}", policy,
+                    extra_args=["--fail-open"])
+                code, out, err = wait_proc(proc)
+                broker.close()
+                self.assertEqual(code, 126, err)
+                self.assertFalse(os.path.exists(target))
+                self.assertIn("Command blocked:", err)
+
+    def test_56_fail_open_idle_eof_releases_whole_tree(self):
+        fresh_tree()
+        target = os.path.join(OUT, "idle-pass.txt")
+        proc, broker = run_watch(
+            f"sleep 1; printf fixture > {target}", lambda ev, idx: "deny",
+            extra_args=["--fail-open"], close_after_accept=True, eof_delay=0.1)
+        code, out, err = wait_proc(proc)
+        broker.close()
+        self.assertEqual(code, 0, err)
+        self.assertTrue(os.path.exists(target))
+        self.assertNotRegex(out + err, r"blocked|cannot|could not")
+
+    def test_57_fragmented_idle_cancel_never_degrades_to_broker_eof(self):
+        fresh_tree()
+        target = os.path.join(WORK, "after-cancel.txt")
+        proc, broker = run_watch(
+            f"sleep 2; printf fixture > {target}", lambda ev, idx: "deny",
+            extra_args=["--fail-open"], eof_delay=0.2,
+            idle_control=[b'{"version":1,"type":"can', b'cel"}\n'])
+        code, out, err = wait_proc(proc)
+        broker.close()
+        self.assertEqual(code, 126, err)
+        self.assertFalse(os.path.exists(target))
+        self.assertIn("cancelled", err)
+        self.assertEqual(broker.events, [])
+
+    def test_58_unfinished_idle_control_frame_uses_bounded_cancel(self):
+        fresh_tree()
+        target = os.path.join(WORK, "after-partial-cancel.txt")
+        proc, broker = run_watch(
+            f"sleep 2; printf fixture > {target}", lambda ev, idx: "deny",
+            extra_args=["--fail-open"], eof_delay=0.2,
+            idle_control=[b'{"version":1,"type":"cancel"}'])
+        code, out, err = wait_proc(proc)
+        broker.close()
+        self.assertEqual(code, 126, err)
+        self.assertFalse(os.path.exists(target))
+        self.assertIn("cancelled", err)
+        self.assertEqual(broker.events, [])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1,11 +1,16 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test"
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test"
 import { execFile } from "node:child_process"
-import { chmod, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises"
+import { chmod, mkdtemp, mkdir, readFile, rename, writeFile } from "node:fs/promises"
 import path from "node:path"
+import * as filesystem from "node:fs/promises"
+import * as classifier from "../src/security/classifier"
+import * as cache from "../src/security/approval-cache"
+import { DEFAULT_BOUNDARY_WATCH_HELPER } from "../src/sandbox"
 import { Cause, Effect, Exit, Option, Scope, Stream } from "effect"
 import plugin from "../src/index"
 import frozen from "../src/security/v10-8-pipeexec.json"
-import { adjudicateEffectAnswers, type EffectReviewRequest } from "../src/security/effects-reviewer"
+import { adjudicateEffectAnswers, EffectsReviewError, type EffectReviewRequest } from "../src/security/effects-reviewer"
+import { resetSharedSecurityStateForTests } from "../src/security/shared-state"
 import { cleanupTestArtifacts } from "./artifacts"
 
 let root: string, workspace: string, outside: string, scratch: string, probe: string
@@ -36,14 +41,28 @@ const report = (deny = false, readonly = false) => {
   return adjudicateEffectAnswers(answers, readonly)
 }
 
-async function harness(deny = false) {
+async function harness(deny = false, options: {
+  failPolicy?: "fail_open" | "fail_close"
+  review?: (request: EffectReviewRequest) => Promise<any>
+  sessionFailure?: boolean
+  contextFailure?: boolean
+  missingContext?: boolean
+  directory?: string
+  denyWrite?: string[]
+  allowWrite?: string[]
+  onSpawn?: () => void
+  failContextRead?: number
+} = {}) {
+  // Security state is shared process-wide between plugin instances; each
+  // simulated instance here must start from a clean registry.
+  resetSharedSecurityStateForTests()
   const hooks = new Map<string, (event: any) => Effect.Effect<any, any>>()
   const commands = new Map<string, any>()
   const calls: EffectReviewRequest[] = []
   const notifications: any[] = []
   const retained = [{ type: "user", text: "Operate on the named fixture files and directories for this acceptance test." }]
   const tools = new Map<string, any>()
-  let executed = 0, serial = 0
+  let executed = 0, serial = 0, contextReads = 0
   for (const name of ["shell", "write"]) tools.set(name, {
     id: name, name, options: { codemode: false }, input: { type: "object", properties: {} },
     execute: (input: any, call: any) => Effect.gen(function* () {
@@ -58,7 +77,7 @@ async function harness(deny = false) {
       }
       const spawn = { command: input.command, cwd: input.workdir ?? workspace, shell: "/bin/bash", env: { ...process.env, ...input.env } }
       yield* hooks.get("shell.create.before")!(spawn)
-      const output = yield* Effect.promise(() => new Promise<{ output: string; exit: number; status?: string }>((resolve) => {
+      const output = yield* Effect.promise((signal) => new Promise<{ output: string; exit: number; status?: string }>((resolve) => {
         if (input.background) {
           // Host shape: background=true returns status:"running" at once and
           // keeps the process alive; the exit frame arrives over the broker.
@@ -70,17 +89,20 @@ async function harness(deny = false) {
         }
         // Honor spawn.shell: the host resolves the shell before the hook
         // and spawns invocation.shell — the watcher wrap may switch it.
-        execFile(spawn.shell, ["-c", spawn.command], { cwd: spawn.cwd, env: spawn.env, timeout: 15_000, maxBuffer: 1024 * 1024 },
+        const child = execFile(spawn.shell, ["-c", spawn.command], { cwd: spawn.cwd, env: spawn.env, signal, timeout: 15_000, maxBuffer: 1024 * 1024 },
           (error, stdout, stderr) => resolve({ output: stdout + stderr, exit: typeof error?.code === "number" ? error.code : error ? 1 : 0 }))
+        child.once("spawn", () => options.onSpawn?.())
       }))
       return { output, content: output.output, metadata: {} }
     }),
   })
   const ctx: any = {
     options: { sandbox: { enabled: true, mode: "auto", scratch, helperPath: probe }, slowCommands: false, logReviewerTrace: false,
+      failPolicy: options.failPolicy ?? "fail_open",
       dynamicReview: { jev: { enabled: false } }, permission: { registerTool: false },
       reviewCommand: async (request: EffectReviewRequest) => {
         calls.push(structuredClone(request))
+        if (options.review) return options.review(request)
         return report(deny, request.input_facts.includes("Session security mode: [Read only]"))
       } },
     tool: {
@@ -96,6 +118,17 @@ async function harness(deny = false) {
       synthetic: (input: any) => Effect.sync(() => { notifications.push(structuredClone(input)) }) },
     event: { subscribe: () => Stream.fromIterable([]) },
   }
+  if (options.denyWrite) ctx.options.sandbox.denyWrite = options.denyWrite
+  if (options.allowWrite) ctx.options.sandbox.allowWrite = options.allowWrite
+  if (options.sessionFailure) ctx.session.get = () => Effect.fail(new Error("synthetic session lookup failure"))
+  else if (options.directory) ctx.session.get = () => Effect.succeed({ location: { directory: options.directory } })
+  if (options.contextFailure) ctx.session.context = () => Effect.fail(new Error("synthetic context lookup failure"))
+  else if (options.failContextRead) ctx.session.context = () => Effect.sync(() => {
+    contextReads++
+    if (contextReads === options.failContextRead) throw new Error("synthetic late context failure")
+    return retained
+  })
+  if (options.missingContext) delete ctx.session.context
   const scope = await Effect.runPromise(Scope.make())
   scopes.push(scope)
   await Effect.runPromise((plugin as any).effect(ctx).pipe(Scope.provide(scope)))
@@ -115,8 +148,27 @@ async function harness(deny = false) {
 }
 
 describe("real observer → broker → frozen reviewer → original process", () => {
+  test("real allowWrite roots observe sensitive writes in Auto and ReadOnly, ordinary files skip review", async () => {
+    const allowed = path.join(outside, "observed-allow-root")
+    await mkdir(allowed)
+    for (const mode of ["auto", "ro"]) {
+      const host = await harness(true, { allowWrite: [allowed] })
+      if (mode === "ro") await host.command("ro")
+      const plain = path.join(allowed, `${mode}.log`)
+      const ordinary = await host.run("shell", { command: python(`open(${JSON.stringify(plain)}, 'w').write('fixture')`) })
+      expect(ordinary.output.exit).toBe(0)
+      expect(host.calls).toHaveLength(0)
+      const sensitive = path.join(allowed, `${mode}.key`)
+      const refused = await host.run("shell", { command: python(`open(${JSON.stringify(sensitive)}, 'w').write('FAKE TEST DATA')`) })
+      expect(refused.output.exit).toBe(126)
+      expect(refused.metadata.boundary.runtimeBlocked).toBe(true)
+      await expect(readFile(sensitive)).rejects.toMatchObject({ code: "ENOENT" })
+      expect(host.calls).toHaveLength(mode === "auto" ? 1 : 0)
+    }
+  })
+
   test("an inspection gap still reaches a floor denial as a proper Tool.Error", async () => {
-    const host = await harness(true)
+    const host = await harness(true, { failPolicy: "fail_close" })
     const directory = path.join(outside, "uninspectable")
     await mkdir(directory)
     await chmod(directory, 0)
@@ -239,7 +291,7 @@ describe("real observer → broker → frozen reviewer → original process", ()
     expect(host.calls).toHaveLength(1)
     expect(result.metadata.boundary.source).toBe("cache:L2")
   })
-  test("mode revocation and new true-user authorization invalidate prior grants", async () => {
+  test("mode revocation invalidates prior grants; a new user message keeps positive ones", async () => {
     const host = await harness()
     const target = path.join(outside, "scope-changes.txt")
     await host.run("write", { path: target, content: "first" })
@@ -247,8 +299,40 @@ describe("real observer → broker → frozen reviewer → original process", ()
     await host.run("write", { path: target, content: "second" })
     expect(host.calls).toHaveLength(2)
     host.newUserMessage("Write the named fixture again for the next task.")
-    await host.run("write", { path: target, content: "third" })
-    expect(host.calls).toHaveLength(3)
+    const third = await host.run("write", { path: target, content: "third" })
+    // Positive entries are bound to the security snapshot, not the message:
+    // the same write replays its cached approval instead of re-reviewing.
+    expect(host.calls).toHaveLength(2)
+    expect(third.metadata.boundary.source).toBe("cache:L1")
+  })
+  test("a cached denial stays bound to its user message", async () => {
+    const host = await harness(true)
+    const target = path.join(outside, "deny-scope.txt")
+    await expect(host.run("write", { path: target, content: "x" })).rejects.toThrow()
+    await expect(host.run("write", { path: target, content: "x" })).rejects.toThrow()
+    expect(host.calls).toHaveLength(1)
+    // A new user message may authorize what was denied: the negative entry
+    // misses and the crossing is reviewed again.
+    host.newUserMessage("Try the write again, it is authorized now.")
+    await expect(host.run("write", { path: target, content: "x" })).rejects.toThrow()
+    expect(host.calls).toHaveLength(2)
+  })
+  test("the L1 core ignores shell command text around an identical crossing", async () => {
+    const host = await harness()
+    // A pre-created target makes mkdir -p a single identical crossing every
+    // run (exists + identities stable); tail's count and a leading `; echo`
+    // change only the shell's command line.
+    const dir = path.join(outside, "core-dir")
+    await mkdir(dir)
+    const first = await host.run("shell", { command: `mkdir -p ${dir} | tail -30` })
+    expect(first.output.exit).toBe(0)
+    const second = await host.run("shell", { command: `mkdir -p ${dir} | tail -20` })
+    const third = await host.run("shell", { command: `echo "v"; mkdir -p ${dir}` })
+    expect(second.output.exit).toBe(0)
+    expect(third.output.exit).toBe(0)
+    expect(host.calls).toHaveLength(1)
+    expect(second.metadata.boundary.source).toBe("cache:L1")
+    expect(third.metadata.boundary.source).toBe("cache:L1")
   })
   test("deep outside mkdir is reviewable without pre-creating anything", async () => {
     const host = await harness()
@@ -322,7 +406,7 @@ describe("real observer → broker → frozen reviewer → original process", ()
     await expect(readFile(marker, "utf8")).resolves.toContain("sourced")
   })
   test("deferred env exhaustion refuses before the payload exists", async () => {
-    const host = await harness()
+    const host = await harness(false, { failPolicy: "fail_close" })
     const marker = path.join(scratch, "defer-exhaust-marker")
     // A hook plus ALL 8 storage aliases occupied by user vars: there is no
     // loss-free mapping left, so the command must be refused — not run with
@@ -389,10 +473,12 @@ describe("real observer → broker → frozen reviewer → original process", ()
     expect(host.calls).toHaveLength(1)
     expect(second.metadata.boundary.source).toBe("cache:L1")
   })
-  test("ReadOnly keeps global temp directories writable, but not the workspace inside them", async () => {
+  test("ReadOnly keeps an approved temp directory writable, but not the workspace inside /tmp", async () => {
     const host = await harness()
     await host.command("ro")
-    const temp = path.join(outside, "ro-temp.txt")
+    // The isolated test HOME can itself live under /tmp; roots covering HOME
+    // are intentionally excluded, while the configured scratch stays writable.
+    const temp = path.join(scratch, "ro-temp.txt")
     const literal = await host.run("shell", { command: `echo literal > ${temp}` })
     expect(literal.output.exit).toBe(0)
     const opaque = await host.run("shell", { command: python(`open(${JSON.stringify(temp)},'a').write('more')`) })
@@ -413,5 +499,165 @@ describe("real observer → broker → frozen reviewer → original process", ()
     expect(result.output.exit).toBe(0)
     expect(result.output.output.trim()).toBe("7")
     expect(host.calls).toHaveLength(0)
+  })
+})
+
+describe("failPolicy at the original native executor", () => {
+  const failures = [
+    ["JEV infrastructure", () => Promise.reject(new EffectsReviewError("raw-provider-secret", "infrastructure"))],
+    ["JEV protocol", () => Promise.reject(new EffectsReviewError("raw-provider-secret", "protocol"))],
+    ["JEV timeout", () => Promise.reject(new EffectsReviewError("Effects review timed out", "infrastructure"))],
+    ["malformed answers", async () => ({ answers: {} })],
+    ["unexpected review exception", () => Promise.reject(new Error("raw-provider-secret"))],
+  ] as const
+  for (const [label, review] of failures) {
+    for (const failPolicy of ["fail_open", "fail_close"] as const) {
+      test(`${label}: ${failPolicy} on native files and runtime crossings`, async () => {
+        const host = await harness(false, { failPolicy, review })
+        const target = path.join(outside, `${label.replaceAll(" ", "-")}-${failPolicy}.txt`)
+        if (failPolicy === "fail_open") {
+          const file = await host.run("write", { path: target, content: "fixture" })
+          expect(file.content).not.toMatch(/blocked|cannot|could not|raw-provider-secret/i)
+          expect(file.metadata.boundary.failOpenPasses.length).toBeGreaterThan(0)
+        } else {
+          const failure = await host.failure("write", { path: target, content: "fixture" })
+          expect(failure._tag).toBe("Tool.Error")
+          expect(failure.message).toContain("Command blocked:")
+        }
+        const shell = await host.run("shell", { command: `printf fixture > ${quote(target)}` })
+        expect(shell.output.exit).toBe(failPolicy === "fail_open" ? 0 : 126)
+        if (failPolicy === "fail_open") {
+          expect(shell.content).not.toMatch(/blocked|cannot|could not|raw-provider-secret/i)
+          expect(shell.metadata.boundary.runtimeBlocked).toBeUndefined()
+        } else expect(shell.content).toContain("Command blocked:")
+      })
+    }
+  }
+  for (const lookup of ["sessionFailure", "contextFailure", "missingContext"] as const) {
+    for (const failPolicy of ["fail_open", "fail_close"] as const) {
+      test(`${lookup}: ${failPolicy}`, async () => {
+        const host = await harness(false, { failPolicy, [lookup]: true })
+        const input = { path: path.join(outside, `${lookup}-${failPolicy}.txt`), content: "fixture" }
+        if (failPolicy === "fail_open") {
+          const result = await host.run("write", input)
+          expect(result.content).toBe("written")
+          expect(result.metadata.boundary.failOpenPasses.length).toBeGreaterThan(0)
+        } else expect((await host.failure("write", input)).message).toContain("Command blocked:")
+      })
+    }
+  }
+  for (const failPolicy of ["fail_open", "fail_close"] as const) {
+    test(`static classifier exceptions: ${failPolicy}`, async () => {
+      const host = await harness(false, { failPolicy })
+      const classify = spyOn(classifier, "classifyShellCommand").mockRejectedValue(new Error("synthetic classifier failure"))
+      try {
+        if (failPolicy === "fail_open") {
+          const result = await host.run("shell", { command: "printf static-pass" })
+          expect(result.content).toBe("static-pass")
+          expect(result.metadata.boundary.executionRoute).toBe("host_direct_reviewed")
+        } else expect((await host.failure("shell", { command: "printf static-pass" })).message).toContain("Command blocked:")
+      } finally { classify.mockRestore() }
+    })
+    test(`missing or non-executable observer: ${failPolicy}`, async () => {
+      const host = await harness(false, { failPolicy })
+      const originalAccess = filesystem.access
+      const unavailable = spyOn(filesystem, "access").mockImplementation(async (target, mode) => {
+        if (target === DEFAULT_BOUNDARY_WATCH_HELPER) throw Object.assign(new Error("synthetic missing image"), { code: "EACCES" })
+        return originalAccess(target, mode)
+      })
+      try {
+        if (failPolicy === "fail_open") {
+          const result = await host.run("shell", { command: "printf observer-pass" })
+          expect(result.content).toBe("observer-pass")
+          expect(result.metadata.boundary.executionRoute).toBe("host_direct_reviewed")
+        } else expect((await host.failure("shell", { command: "printf observer-pass" })).message).toContain("observer is unavailable")
+      } finally { unavailable.mockRestore() }
+    })
+    test(`cache exceptions: ${failPolicy}`, async () => {
+      const originalCreate = cache.createApprovalCache
+      const faulty = spyOn(cache, "createApprovalCache").mockImplementation(() => {
+        const instance = originalCreate()
+        instance.lookup = () => { throw new Error("synthetic cache failure") }
+        return instance
+      })
+      try {
+        const host = await harness(false, { failPolicy })
+        const input = { path: path.join(outside, `cache-fault-${failPolicy}.txt`), content: "fixture" }
+        if (failPolicy === "fail_open") expect((await host.run("write", input)).content).toBe("written")
+        else expect((await host.failure("write", input)).message).toContain("Command blocked:")
+      } finally { faulty.mockRestore() }
+    })
+    test(`target identity changes during review: ${failPolicy}`, async () => {
+      const target = path.join(outside, `race-${failPolicy}.txt`)
+      await writeFile(target, "before")
+      const host = await harness(false, { failPolicy, review: async () => {
+        await rename(target, `${target}.before`)
+        await writeFile(target, "changed-size-after-review")
+        return report()
+      } })
+      if (failPolicy === "fail_open") {
+        expect((await host.run("write", { path: target, content: "fixture" })).content).toBe("written")
+      } else expect((await host.failure("write", { path: target, content: "fixture" })).message).toContain("changed")
+    })
+    test(`observer setup failure before payload execution: ${failPolicy}`, async () => {
+      const host = await harness(false, { failPolicy })
+      const result = await host.run("shell", { command: "printf setup-pass", env: { BW_TEST_SEIZE_FAIL: "1" } })
+      expect(result.output.exit).toBe(failPolicy === "fail_open" ? 0 : 125)
+      if (failPolicy === "fail_open") expect(result.content).toBe("setup-pass")
+      else expect(result.content).toContain("PTRACE_SEIZE")
+    })
+  }
+  test("trace sink failures never turn a fail-open pass into an error", async () => {
+    const host = await harness(false, { review: async () => { throw new EffectsReviewError("synthetic transport failure", "infrastructure") } })
+    const sink = spyOn(filesystem, "appendFile").mockRejectedValue(new Error("synthetic trace failure"))
+    try {
+      const result = await host.run("write", { path: path.join(outside, "trace-fault.txt"), content: "fixture" })
+      expect(result.content).toBe("written")
+      expect(result.metadata.boundary.failOpenPasses).toEqual(["review_infrastructure"])
+    } finally { sink.mockRestore() }
+  })
+  test("adjudicated model/floor denies remain refusals under fail_open", async () => {
+    const host = await harness(true)
+    expect((await host.failure("write", { path: path.join(outside, "floor-deny.txt"), content: "fixture" })).message).toContain("Command blocked:")
+    const result = await host.run("shell", { command: `printf x > ${quote(path.join(outside, "runtime-deny.txt"))}` })
+    expect(result.output.exit).toBe(126)
+    expect(result.metadata.boundary.runtimeBlocked).toBe(true)
+  })
+  test("a selected cached denial stays final before fallible context bookkeeping", async () => {
+    const host = await harness(true, { failContextRead: 3 })
+    const input = { command: `printf fixture > ${quote(path.join(outside, "cached-deny.txt"))}` }
+    expect((await host.run("shell", input)).output.exit).toBe(126)
+    expect((await host.run("shell", input)).output.exit).toBe(126)
+    expect(host.calls).toHaveLength(1)
+  })
+  test("known read-only and configured denyWrite decisions remain final", async () => {
+    const target = path.join(outside, "protected-fixture.txt")
+    const protectedHost = await harness(false, { denyWrite: [target] })
+    expect((await protectedHost.failure("write", { path: target, content: "fixture" })).message).toContain("protected")
+    expect((await protectedHost.run("shell", { command: `printf x > ${quote(target)}` })).output.exit).toBe(126)
+    const readonly = await harness()
+    await readonly.command("ro")
+    expect((await readonly.failure("write", { path: path.join(workspace, "readonly.txt"), content: "fixture" })).message).toContain("Read only")
+    expect((await readonly.failure("shell", { command: "printf x > readonly.txt" })).message).toContain("Command blocked:")
+  })
+  test("a user mode change during a failing review remains a refusal", async () => {
+    let host: Awaited<ReturnType<typeof harness>>
+    host = await harness(false, { review: async () => {
+      await host.command("ro")
+      throw new EffectsReviewError("synthetic timeout", "infrastructure")
+    } })
+    const failure = await host.failure("write", { path: path.join(outside, "revoked.txt"), content: "fixture" })
+    expect(failure.message).toContain("security mode changed")
+    expect(host.executed).toBe(0)
+  })
+  test("mode revocation interrupts an unobserved foreground executor", async () => {
+    let spawned!: () => void
+    const started = new Promise<void>((resolve) => { spawned = resolve })
+    const host = await harness(false, { sessionFailure: true, onSpawn: spawned })
+    const execution = host.run("shell", { command: "exec python3 -c 'import time; time.sleep(30)'" })
+    const completed = execution.then(() => "finished", () => "interrupted")
+    await started
+    await host.command("ro")
+    expect(await completed).toBe("interrupted")
   })
 })

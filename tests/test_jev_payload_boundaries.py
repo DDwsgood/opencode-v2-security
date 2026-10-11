@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPT = (Path(__file__).parents[1] / "src" / "security"
           / "jev-reviewer.py")
@@ -139,8 +140,11 @@ class TestShellFedBodyRescan(unittest.TestCase):
         self.assertIsNotNone(jev._guard_hit(
             "sh <<EOF\n$(rm -rf /)\nEOF", armed=set()))
 
+    @patch.dict("os.environ", {"HOME": "/home/synthetic-guard-fixture"})
     def test_armed_lift_still_applies(self) -> None:
         # rm -rf ~ inside a fed body is filesystem-cat — lifted when armed.
+        # The command is inert; a synthetic non-temp HOME keeps this semantic
+        # case valid when the runner's real fixture HOME is under /tmp/opencode.
         hit = jev._guard_hit("sh <<EOF\nrm -rf ~\nEOF", armed=set())
         self.assertIsNotNone(hit)
         lifted: list = []

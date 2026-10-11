@@ -21,6 +21,8 @@ mock.module("node:fs/promises", () => ({
   },
 }))
 const { default: plugin } = await import("../src/index")
+const { resetSharedSecurityStateForTests } = await import("../src/security/shared-state")
+const { createNoticeStore, createSessionStateNotices } = await import("../src/session-notifications")
 
 const root = await mkdtemp("/tmp/opencode/notice-delivery-")
 const workspace = path.join(root, "workspace")
@@ -34,7 +36,10 @@ afterAll(async () => {
 type Hook = (event: any) => Effect.Effect<void, unknown>
 type Lookup = "ok" | "missing" | "fail"
 
-async function harness() {
+async function harness(failPolicy: "fail_open" | "fail_close" = "fail_open") {
+  // Security state is shared process-wide between plugin instances; each
+  // simulated instance here must start from a clean registry.
+  resetSharedSecurityStateForTests()
   const hooks = new Map<string, Hook>()
   const commands = new Map<string, (input: any) => Effect.Effect<unknown, unknown>>()
   const notifications: any[] = []
@@ -45,7 +50,7 @@ async function harness() {
       execute: () => Effect.succeed({ output: "file body", content: "file body", metadata: {} }) }],
   ])
   const ctx = {
-    options: { sandbox: { enabled: false }, slowCommands: false },
+    options: { sandbox: { enabled: false }, slowCommands: false, failPolicy },
     tool: {
       hook: (name: string, callback: Hook) => Effect.sync(() => { hooks.set(`tool.${name}`, callback) }),
       transform: (callback: (editor: any) => void) =>
@@ -102,6 +107,50 @@ async function harness() {
 }
 
 describe("mid-run notice delivery", () => {
+  test("RO prompt → Auto tool result → RO again delivers the repeated mode", async () => {
+    const host = await harness()
+    await host.command("ro")
+    await host.prompt()
+    expect(host.notifications).toHaveLength(1)
+    await host.command("auto")
+    const auto = await host.after({ content: "fixture" })
+    expect(auto.result.content[0].text).toContain("[Auto mode]")
+    await host.command("ro")
+    const readonly = await host.after({ content: "fixture" })
+    expect(readonly.result.content[0].text).toContain("[Read only]")
+  })
+
+  test("shared claims serialize different snapshots and release on success and failure", async () => {
+    const store = createNoticeStore()
+    let entered!: () => void
+    let release!: () => void
+    const started = new Promise<void>((resolve) => { entered = resolve })
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const published: string[] = []
+    const first = createSessionStateNotices(async (notice) => {
+      entered()
+      await gate
+      published.push(notice.text)
+    }, store)
+    const second = createSessionStateNotices(async (notice) => { published.push(notice.text) }, store)
+    first.setPerm("fixture", "ReadOnly")
+    const earlier = first.deliverWithPrompt("fixture", "steer")
+    await started
+    second.setPerm("fixture", "Auto")
+    const later = second.deliverWithPrompt("fixture", "steer")
+    expect(second.takeForToolResult("fixture")).toBeUndefined()
+    expect(published).toEqual([])
+    release()
+    await Promise.all([earlier, later])
+    expect(published).toEqual(["opencode-v2-security: ReadOnly", "opencode-v2-security: Auto"])
+    expect(store.claims.size).toBe(0)
+    const failed = createSessionStateNotices(async () => { throw new Error("synthetic admission failure") }, store)
+    failed.setPerm("fixture", "ReadOnly")
+    await failed.deliverWithPrompt("fixture", "steer")
+    expect(store.claims.size).toBe(0)
+    expect(second.takeForToolResult("fixture")).toContain("ReadOnly")
+  })
+
   test("a change during a run is prepended to the next completed tool result, once", async () => {
     const host = await harness()
     await host.command("ro")
@@ -149,13 +198,21 @@ describe("ancestry verification at the prompt", () => {
   })
 
   test("a transient lookup failure is re-verified before the prompt's notice", async () => {
-    const host = await harness()
+    const host = await harness("fail_close")
     host.lookups.set("s1", "fail")
     const early = await host.status()
     expect(early.permission).toBe("r-x")
     host.lookups.set("s1", "ok")
     await host.prompt()
     expect(host.notifications.map((item) => item.text).join("\n")).not.toContain("could not be verified")
+    expect((await host.status()).permission).toBe("rwx")
+  })
+  test("fail_open does not manufacture a read-only ceiling from a lookup failure", async () => {
+    const host = await harness("fail_open")
+    host.lookups.set("s1", "fail")
+    expect((await host.status()).permission).toBe("rwx")
+    host.lookups.set("s1", "ok")
+    await host.prompt()
     expect((await host.status()).permission).toBe("rwx")
   })
 })

@@ -5,6 +5,7 @@ import path from "node:path"
 import type { ApprovalCacheTarget, ApprovalCacheWriteEffect } from "./security/approval-cache"
 import { scan } from "./security/shell-scan"
 import { inspectionErrorCode, isMissingPathError } from "./security/inspection"
+import { failureOrPass } from "./failure-policy"
 
 export type RuntimeBoundaryEvent = {
   version: 1
@@ -199,6 +200,9 @@ export async function createRuntimeBoundaryBroker(options: {
   directory: string
   onBoundary(event: RuntimeBoundaryEvent, signal: AbortSignal): Promise<RuntimeBoundaryResponse>
   onError?(reason: string): void
+  failPolicy?: "fail_open" | "fail_close"
+  onFailure?(code: string): void
+  onCancelFailure?(): void
 }): Promise<RuntimeBoundaryBroker> {
   const directory = await mkdtemp(path.join(options.directory, "security-boundary-"))
   try {
@@ -258,6 +262,12 @@ export async function createRuntimeBoundaryBroker(options: {
         terminalExit = Number(raw.exit)
         return
       }
+      if (record(raw) && raw.version === 1 && raw.type === "fail_open" && raw.token === token &&
+        typeof raw.code === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(raw.code)) {
+        active = socket
+        options.onFailure?.(raw.code)
+        return
+      }
       const event = parseRuntimeBoundary(raw, token)
       // A second boundary event while one is unanswered is a protocol
       // violation; the terminal exit frame above stays legal mid-flight.
@@ -269,12 +279,17 @@ export async function createRuntimeBoundaryBroker(options: {
         if (closed || socket.destroyed) return
         // An opaque capability cannot be resumed under an event-only cache
         // grant, since its future effects would no longer be observable.
-        const action = event.details.requiresFullApproval && response.action === "continue" ? "deny" : response.action
+        let action = response.action
+        if (event.details.requiresFullApproval && action === "continue") {
+          const pass = failureOrPass(options.failPolicy ?? "fail_close", "broker_protocol", () => { options.onFailure?.("broker_protocol") })
+          action = pass ? "allow" : "deny"
+        }
         socket.write(JSON.stringify({ version: 1, eventID: event.eventID, action, reason: response.reason }) + "\n")
       }).catch(() => {
+        const pass = failureOrPass(options.failPolicy ?? "fail_close", "broker_callback", () => { options.onFailure?.("broker_callback") })
         if (!closed && !socket.destroyed) socket.write(JSON.stringify({
-          version: 1, eventID: event.eventID, action: "deny",
-          reason: "the boundary check could not be completed",
+          version: 1, eventID: event.eventID, action: pass ? "allow" : "deny",
+          ...(pass ? {} : { reason: "the boundary check could not be completed" }),
         }) + "\n")
       }).finally(() => { pending = false }).catch(() => { fail("the runtime boundary response could not be sent"); socket.destroy() })
     })
@@ -302,7 +317,29 @@ export async function createRuntimeBoundaryBroker(options: {
       closed = true
       controller.abort()
       complete({ ...(terminalExit !== undefined ? { exit: terminalExit } : {}) })
-      for (const socket of sockets) socket.destroy()
+      // EOF is an infrastructure failure under fail-open. User cancellation
+      // and /perm or /bypass revocation therefore use an explicit frame.
+      await Promise.all([...sockets].map((socket) => new Promise<void>((resolve) => {
+        if (socket.destroyed) {
+          resolve()
+          return
+        }
+        let finished = false
+        const finish = (flushed: boolean) => {
+          if (finished) return
+          finished = true
+          clearTimeout(timer)
+          socket.removeListener("close", disconnected)
+          if (!flushed) options.onCancelFailure?.()
+          socket.destroy()
+          resolve()
+        }
+        const disconnected = () => finish(false)
+        // Flush before destroy; a disconnected peer must not strand close().
+        const timer = setTimeout(() => finish(false), 100)
+        socket.once("close", disconnected)
+        socket.write(JSON.stringify({ version: 1, type: "cancel" }) + "\n", (error) => finish(!error))
+      })))
       await new Promise<void>((resolve) => server.close(() => resolve()))
       await cleanup()
     },

@@ -23,6 +23,7 @@ mock.module("node:fs/promises", () => ({
   },
 }))
 const { default: plugin } = await import("../src/index")
+const { resetSharedSecurityStateForTests } = await import("../src/security/shared-state")
 
 const root = await mkdtemp("/tmp/opencode/mode-command-")
 const workspace = path.join(root, "workspace")
@@ -36,6 +37,9 @@ afterAll(async () => {
 type Hook = (event: any) => Effect.Effect<void, unknown>
 
 async function harness(options: { bypassLeaseTtlMs?: number } = {}) {
+  // Security state is shared process-wide between plugin instances; each
+  // simulated instance here must start from a clean registry.
+  resetSharedSecurityStateForTests()
   const hooks = new Map<string, Hook>()
   const commands = new Map<string, (input: any) => Effect.Effect<unknown, unknown>>()
   const events: Array<readonly unknown[]> = []

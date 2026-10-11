@@ -16,6 +16,21 @@ interface SessionState {
   bypass?: string
 }
 
+/** Shared notice snapshot store: several plugin instances run in one server
+ *  process, and a session's notice must exist once regardless of which
+ *  instance recorded the change or which instance handles the delivery
+ *  channel. `claims` holds the text an instance is publishing right now, so
+ *  a second instance never publishes the same notice twice. */
+export interface NoticeStore {
+  states: Map<string, SessionState>
+  delivered: Map<string, string>
+  claims: Map<string, { token: symbol; text: string; done: Promise<void> }>
+}
+
+export function createNoticeStore(): NoticeStore {
+  return { states: new Map(), delivered: new Map(), claims: new Map() }
+}
+
 export interface SessionStateNotification {
   sessionID: string
   text: string
@@ -45,9 +60,9 @@ export interface SessionStateNotices {
 
 export function createSessionStateNotices(
   publish?: (notice: SessionStateNotification) => Promise<unknown>,
+  store: NoticeStore = createNoticeStore(),
 ): SessionStateNotices {
-  const states = new Map<string, SessionState>()
-  const delivered = new Map<string, string>()
+  const { states, delivered, claims } = store
   let pending = Promise.resolve()
 
   const snapshot = (sessionID: string): string | undefined => {
@@ -74,21 +89,34 @@ export function createSessionStateNotices(
     clear(sessionID) {
       states.delete(sessionID)
       delivered.delete(sessionID)
+      claims.delete(sessionID)
     },
     deliverWithPrompt(sessionID, delivery) {
       if (!publish || (delivery !== undefined && delivery !== "steer")) return Promise.resolve()
       const run = pending.then(async () => {
+        // All location instances serialize on this session's shared claim.
+        // Read the snapshot only after the preceding publisher finishes.
+        while (claims.has(sessionID)) await claims.get(sessionID)!.done
         const text = snapshot(sessionID)
         if (!text || delivered.get(sessionID) === text) return
-        await publish({
-          sessionID,
-          text,
-          description: "Security mode changed",
-          metadata: { source: "opencode-v2-security", securityStateNotice: true },
-          resume: false,
-          delivery: "steer",
-        })
-        delivered.set(sessionID, text)
+        let release!: () => void
+        const claim = { token: Symbol("notice-publisher"), text,
+          done: new Promise<void>((resolve) => { release = resolve }) }
+        claims.set(sessionID, claim)
+        try {
+          await publish({
+            sessionID,
+            text,
+            description: "Security mode changed",
+            metadata: { source: "opencode-v2-security", securityStateNotice: true },
+            resume: false,
+            delivery: "steer",
+          })
+          if (claims.get(sessionID)?.token === claim.token) delivered.set(sessionID, text)
+        } finally {
+          if (claims.get(sessionID)?.token === claim.token) claims.delete(sessionID)
+          release()
+        }
       }).catch(() => {
         // No error bodies: admission failures may contain unrelated host data.
         console.warn("[opencode-v2-security] security state notification was not delivered (enforcement unchanged)")
@@ -99,6 +127,11 @@ export function createSessionStateNotices(
     takeForToolResult(sessionID) {
       const text = snapshot(sessionID)
       if (!text || delivered.get(sessionID) === text) return undefined
+      // Another instance is admitting this exact text right now: the notice
+      // is on its way into the transcript through that channel. Do NOT mark
+      // it delivered yet — the publisher marks it on success; if that
+      // admission fails, its claim clears and the next channel retries.
+      if (claims.has(sessionID)) return undefined
       delivered.set(sessionID, text)
       return text
     },

@@ -27,12 +27,13 @@
 
 import { execFile } from "node:child_process"
 import { randomBytes } from "node:crypto"
-import { existsSync } from "node:fs"
+import { accessSync, existsSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import type { Perm } from "./permissions"
 import { splitSimpleSegments } from "./security/classifier"
 import { blockedText, RECHECK } from "./agent-messages"
+import { failureOrPass } from "./failure-policy"
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 
@@ -48,6 +49,7 @@ export type RuntimeWatchSpawn = {
   denyRead: readonly string[]
   denyWrite: readonly string[]
   readonly: boolean
+  failOpen?: boolean
   /** Per-event approval budget handed to the helper (review budget + slack). */
   approveTimeoutMs?: number
   /** Control-plane paths: writes inside them or to their ancestors gate. */
@@ -1281,8 +1283,18 @@ export function applySandboxCreateBefore(
   },
   sandbox: SandboxSelection,
   probe: SandboxProbeResult | undefined,
+  exists: (path: string) => boolean = (target) => {
+    try { accessSync(target, 1); return true } catch { return false }
+  },
+  failPolicy: "fail_open" | "fail_close" = "fail_close",
+  onFailure: (code: string) => void = () => {},
 ): SandboxProfile | undefined {
+  const pass = (code: string) => failureOrPass(failPolicy, code, () => { onFailure(code) })
   if (marked.invalid) {
+    if (pass("sandbox_marker")) {
+      ev.command = stripSandboxMarker(ev.command)
+      return undefined
+    }
     ev.command = sandboxDenyCommand(sandboxMarkerInvalidMessage())
     return undefined
   }
@@ -1290,6 +1302,7 @@ export function applySandboxCreateBefore(
   ev.command = marked.command
   if (marked.runtimeWatch) {
     const watch = marked.runtimeWatch
+    if (!exists(watch.helperPath) && pass("observer_unavailable")) return undefined
     // Avoid incidental interpreter cache writes being mistaken for the
     // user's requested file effects. These are call-local, not host settings.
     ev.env.PYTHONDONTWRITEBYTECODE ??= "1"
@@ -1329,6 +1342,7 @@ export function applySandboxCreateBefore(
       deferredPairs.push([storage, key])
     }
     if (deferOverflow !== undefined) {
+      if (pass("observer_environment")) return undefined
       // Refuse BEFORE the payload exists. Two hazards remain in the REFUSAL
       // shell itself: pin it to /bin/sh (dash ignores BASH_ENV and friends),
       // AND neutralize every hook name — /bin/sh is dynamically linked, so a
@@ -1349,12 +1363,12 @@ export function applySandboxCreateBefore(
       ev.env[key] = ""
     }
     const defers = deferredPairs.map(([storage, key]) => `${storage}=${key}`)
-    const args = [watch.helperPath, "--broker", watch.socketPath, "--token", watch.token,
+    const args = [watch.helperPath, ...(watch.failOpen ? ["--fail-open"] : []), "--broker", watch.socketPath, "--token", watch.token,
+      ...defers.flatMap((pair) => ["--defer", pair]),
       ...watch.roots.flatMap((root) => ["--root", root]),
       ...watch.denyRead.flatMap((target) => ["--deny-read", target]),
       ...watch.denyWrite.flatMap((target) => ["--deny-write", target]),
       ...(watch.protect ?? []).flatMap((target) => ["--protect", target]),
-      ...defers.flatMap((pair) => ["--defer", pair]),
       ...(watch.approveTimeoutMs ? ["--approve-timeout-ms", String(watch.approveTimeoutMs)] : []),
       ...(watch.readonly ? ["--readonly"] : []), "--", ev.shell, "-c", marked.command]
     ev.command = `exec ${args.map(shellQuote).join(" ")}`
@@ -1366,6 +1380,7 @@ export function applySandboxCreateBefore(
     return "workspace"
   }
   if (marked.profile === "full") return "full"
+  if (!exists(sandbox.helperPath) && pass("sandbox_helper")) return marked.profile
   if (marked.profile === "rw" && (sandbox.allowSudo || marked.hostDirect === true)) {
     // Host-direct route (config allowSudo, or the `privilege` bypass
     // category routing this one call out of the sandbox): no bwrap/Landlock.
@@ -1389,6 +1404,7 @@ export function applySandboxCreateBefore(
           ? blockedText("the configured extra sandbox options are not supported for this session's sandbox profile")
           : undefined
     if (reason !== undefined) {
+      if (pass("sandbox_unavailable")) return marked.profile
       ev.command = sandboxDenyCommand(reason)
       return marked.profile
     }
@@ -1399,6 +1415,7 @@ export function applySandboxCreateBefore(
     return marked.profile
   }
   if (!probe?.available) {
+    if (pass("sandbox_unavailable")) return marked.profile
     if (probe !== undefined && !probe.available && sandbox.onUnavailable === "fail_close") {
       ev.command = sandboxDenyCommand(
         sandboxUnavailableMessage(probe.reason ?? "probe did not run"),
@@ -1506,11 +1523,14 @@ export function assertSandboxAvailable(
   probe: SandboxProbeResult | undefined,
   onUnavailable: "fail_close" | "degrade",
   allowSudo = false,
+  failPolicy: "fail_open" | "fail_close" = "fail_close",
+  onFailure: (entry: Record<string, unknown>) => void = () => {},
 ): "ok" | "degraded" {
   if (profile === "full") return "ok"
   if (profile === "rw" && allowSudo) return "ok"
   if (profile === "workspace") {
     if (probe?.available && probe.path !== "landlock-only") return "ok"
+    if (failureOrPass(failPolicy, "sandbox_unavailable", onFailure)) return "degraded"
     throw new Error(
       probe?.available
         ? blockedText("the requested OS sandbox profile cannot be enforced by the available backend")
@@ -1518,6 +1538,7 @@ export function assertSandboxAvailable(
     )
   }
   if (probe?.available) return "ok"
+  if (failureOrPass(failPolicy, "sandbox_unavailable", onFailure)) return "degraded"
   if (onUnavailable === "degrade") return "degraded"
   throw new Error(sandboxUnavailableMessage(probe?.reason ?? "probe did not run"))
 }
