@@ -11,7 +11,7 @@ One binary, two stages:
 host:  opencode-sandbox -c <cmd>                       (stage 1)
          probes bwrap / userns / Landlock ABI once per process
          execs bwrap <floor args> -- <self> --stage2 ... -- bash -c <cmd>
-bwrap: opencode-sandbox --stage2 --mode ro|rw ...      (stage 2)
+bwrap: opencode-sandbox --stage2 --mode ro|rw|workspace ...      (stage 2)
          prctl(NO_NEW_PRIVS) -> seccomp-bpf floor
          RO only: Landlock FS+net+scope ruleset
          execvp(real_bash, ["bash","-c",cmd])
@@ -21,6 +21,26 @@ bwrap: opencode-sandbox --stage2 --mode ro|rw ...      (stage 2)
   minimal `/dev`, root bind, privileged-socket masks (`/run/docker.sock`,
   podman, containerd — emitted only when the destination exists),
   `GIT_CONFIG safe.directory`, `--chdir $CWD`.
+- **WORKSPACE floor (workspace-write)**: new session, userns,
+  `cap-drop ALL`, **`--ro-bind / /`** (whole root read-only) plus writable
+  binds for `SCRATCH` and every `OPENCODE_SANDBOX_WRITE_ROOTS` entry;
+  `TMPDIR=$SCRATCH`, `/run/WSL` masked like RO, `socket masks`, deny lists,
+  `--unshare-net` unless `OPENCODE_SANDBOX_WORKSPACE_NETWORK=1`. `/tmp` is
+  **not** shadowed by a tmpfs — the scratch hierarchy (default `/tmp`)
+  keeps real, cross-call-persistent semantics. Background/detached
+  children survive like RW: no private pidns, no `die-with-parent`, host
+  `/proc` bind. Landlock ABI >= 3 is applied in stage2 as an OPTIONAL
+  second layer (writable set = scratch + write roots, signal scope only);
+  a Landlock failure warns and continues — the mount floor is the
+  enforced boundary. **Hard limits, always fail-closed (independent of
+  `onUnavailable`)**: no host-direct route exists (`ALLOW_SUDO` ignored —
+  a privilege-needing call must be refused by the caller, not silently
+  unwrapped); `OPENCODE_SANDBOX_EXTRA_ARGS` is refused outright (a
+  trailing `--bind`/`--setenv` could shadow the floor); the
+  `landlock-only` path is refused (deny lists, WSL masking, and
+  write-root binds are mount features that do not exist without bwrap);
+  and a completely unavailable probe is refused too — workspace never
+  runs bare.
 - **RO floor adds**: `die-with-parent`, private pid ns (`--unshare-pid`),
   fresh `/proc` (or host `--bind /proc /proc` when the probe shows pidns
   unsupported).
@@ -39,6 +59,49 @@ bwrap: opencode-sandbox --stage2 --mode ro|rw ...      (stage 2)
 - **RW adds**: nothing else by default — host network and WSL interop
   stay usable; docker/podman/containerd masks still apply (the floor
   cannot be exceeded by a permission grant).
+- **Write roots (WORKSPACE only)**: `OPENCODE_SANDBOX_WRITE_ROOTS` is a
+  colon-separated list of absolute paths bound read-write over the
+  read-only root. Strict contract — precise, no widening, **no host side
+  effects**:
+    - every entry must **exist** at spawn time and be **canonical**
+      (`realpath` == spelling — no component may be a symlink) with a
+      non-symlink leaf;
+    - a trailing `/` asserts directory intent and an existing
+      non-directory is rejected;
+    - a **missing** entry fails the spawn (exit 125): the helper never
+      creates the approved target, never mkdirs ancestors, and never
+      widens the grant to a parent directory. First writes to
+      not-yet-existing external files are intentionally unsupported on
+      this path — the built-in file tools gate handles them;
+    - `"/"`, `..`, non-absolute entries, or more than 64 entries also
+      fail the spawn; the scratch dir itself is redundant and skipped;
+    - validated roots are pinned open (`O_PATH|O_NOFOLLOW`) and mounted
+      via `--bind-fd`; the opened object's `dev`+`ino` is fstat-checked
+      against the validating lstat, so a component swap between lstat
+      and open fails the spawn instead of pinning a different inode.
+      Residual TOCTOU: the validated object itself can still be
+      renamed/detached before bwrap mounts it — the fd pins the inode,
+      so the mount can never land on a *different* object; at worst a
+      detached subtree is bound under its old name (stale grant, never
+      a widened one). Strict deny lists stay path-based deliberately:
+      a pinned fd that leaked into the payload could reopen the frozen
+      object via `openat(dirfd, ".")` and undo the deny — worse than
+      the rename window a path bind leaves. Pinned fds are left open
+      across the exec so bwrap can read them; stage2 closes every
+       inherited fd >= 3 (close_range or a complete /proc/self/fd scan;
+       refusal if neither succeeds) before applying its own restrictions, so no
+      host object survives into the payload regardless of whether the
+      bwrap build closes --bind-fd sources. `--bind-fd` support is
+      required (verified against the local bwrap build; older bwrap
+      fails the spawn).
+  Entries are emitted **before** the privileged-socket masks, the
+  `/run/WSL` mask, and the deny lists, so every floor still shadows a
+  write root that covers its path.
+  Workspace scratch must also be an existing canonical directory and is
+  pinned through the same fd/identity check. It is never created on the host
+  by workspace setup; use an existing temporary directory such as `/tmp`.
+  A configured temporary root replaced with a symlink must not implicitly
+  authorize writes to its new referent.
 - **Deny lists (both profiles, emitted after the root bind so later
   mounts shadow it)**:
   `OPENCODE_SANDBOX_DENY_READ` mounts `--tmpfs` over each existing
@@ -52,7 +115,13 @@ bwrap: opencode-sandbox --stage2 --mode ro|rw ...      (stage 2)
   contents read-only). Both lists are a deny-floor below profile
   semantics: they apply in ro and rw, and on the bwrap-only fallback.
   On the landlock-only path there are no mounts, so the lists are
-  inert. Non-absolute or non-existent entries are skipped at spawn time.
+  inert. Legacy ro/rw skip non-absolute or non-existent entries at spawn
+  time; **the workspace profile refuses the spawn (exit 125) for any
+  deny entry that is non-absolute, missing, non-canonical, or a symlink
+  — a deny that cannot be expressed must not silently become an allow**.
+  The workspace ro-bind stays path-based on purpose: an fd pinned for a
+  deny entry that leaked into the payload could reopen the frozen object
+  via `openat(dirfd, ".")`, undoing the freeze.
 - **stage2 always** (except RW + `ALLOW_SUDO`, below): `NO_NEW_PRIVS`
   (neutralises passwordless sudo), then a seccomp deny-list
   (mount/umount2/unshare/setns/pivot_root/bpf/ptrace/
@@ -89,19 +158,30 @@ host root bind shadows the fresh proc/devtmpfs mounts.
   background children** when the command completes. This is acceptable —
   RO sessions never legitimately background anything (writes are denied
   anyway) and maximum isolation is correct there.
+- **WORKSPACE**: same as RW — no pidns, host `/proc`, detached children
+  survive (needed for dev servers and watchers); the write boundary is
+  carried entirely by the mounts (+ optional Landlock).
 
 ## Fallback paths (§3.4 decision table)
 
 | bwrap | userns | Landlock ABI | Path |
 |---|---|---|---|
-| yes | yes | >= 3 | `full` (bwrap floor + Landlock RO) |
-| yes | yes | < 3 / none | `bwrap-only` (RO: `--ro-bind / /` + writable scratch bind + stage2 NNP/seccomp/AF_UNIX-block, no Landlock) |
-| bwrap unusable | — | >= 3 | `landlock-only` (stage2 on host; RO forces AF_UNIX block; no /proc hiding) |
+| yes | yes | >= 3 | `full` (bwrap floor + Landlock RO; workspace: mounts + optional Landlock layer) |
+| yes | yes | < 3 / none | `bwrap-only` (RO: `--ro-bind / /` + writable scratch bind + stage2 NNP/seccomp/AF_UNIX-block, no Landlock; workspace: `--ro-bind / /` + writable binds, no Landlock) |
+| bwrap unusable | — | >= 3 | `landlock-only` (stage2 on host; RO forces AF_UNIX block; no /proc hiding; **workspace refuses — see below**) |
 | no | no | any | `unavailable` -> exit 125, refuse to run |
 
 The `bwrap-only` RO path routes through stage2 with `--no-landlock`
 rather than the plan's literal direct-bash exec: strictly stronger
 (NNP + seccomp floor retained) at no extra cost.
+
+**Workspace on `landlock-only` is refused (exit 125)**, not degraded:
+the write allow-list alone is not the workspace contract — deny lists,
+`/run/WSL` masking, and the write-root binds over a read-only root are
+mount features that do not exist without bwrap. The plugin's
+`assertSandboxAvailable` mirrors this in userspace (workspace +
+`landlock-only` throws regardless of `onUnavailable`); the helper's
+refusal is the kernel-side backstop.
 
 Pin a path for testing with `OPENCODE_SANDBOX_FALLBACK=bwrap-only|landlock-only`.
 
@@ -125,20 +205,22 @@ decision table selects.
 
 | Var | Default | Meaning |
 |---|---|---|
-| `OPENCODE_SANDBOX_MODE` | `rw` | `ro` or `rw` profile |
-| `OPENCODE_SANDBOX_SCRATCH` | `/tmp/opencode` | sole writable hierarchy under RO; `mkdir -p`'d |
+| `OPENCODE_SANDBOX_MODE` | `rw` | `ro`, `rw`, or `workspace` profile (`ww` accepted as an alias) |
+| `OPENCODE_SANDBOX_SCRATCH` | `/tmp/opencode` | sole writable hierarchy under RO; writable bind under workspace; `mkdir -p`'d |
 | `OPENCODE_REAL_BASH` | `/bin/bash` | shell exec'd inside the sandbox |
 | `OPENCODE_SANDBOX_BWRAP` | `/usr/bin/bwrap` then `$PATH` | bwrap override |
 | `OPENCODE_SANDBOX_HELPER` | `/proc/self/exe` | stage2 binary path inside bwrap |
-| `OPENCODE_SANDBOX_RO_NETWORK` | `off` | `off` -> `--unshare-net` + Landlock TCP deny |
+| `OPENCODE_SANDBOX_RO_NETWORK` | `off` | `off` -> `--unshare-net` + Landlock TCP deny (RO) |
+| `OPENCODE_SANDBOX_WORKSPACE_NETWORK` | `0` | workspace: `0` -> `--unshare-net` + Landlock TCP deny; `1` = per-call host-granted network capability |
+| `OPENCODE_SANDBOX_WRITE_ROOTS` | unset | workspace only: colon-separated absolute paths bound rw over the ro root via `--bind-fd` (pinned); strict contract — every entry must exist, be canonical, non-symlink; anything else fails the spawn |
 | `OPENCODE_SANDBOX_RO_AF_UNIX_BLOCK` | `1` | RO seccomp AF_UNIX deny |
-| `OPENCODE_SANDBOX_MASK_WSL_INTEROP` | `1` | RO `--tmpfs /run/WSL` |
+| `OPENCODE_SANDBOX_MASK_WSL_INTEROP` | `1` | RO/workspace `--tmpfs /run/WSL` |
 | `OPENCODE_SANDBOX_MASK_SOCKETS` | docker/podman/containerd socks | colon-separated mask list |
-| `OPENCODE_SANDBOX_DENY_WRITE` | unset | colon-separated abs paths -> `--ro-bind` shadow (readable, read-only) |
-| `OPENCODE_SANDBOX_DENY_READ` | unset | colon-separated abs paths -> `--tmpfs` shadow (dir exists, contents empty); both-lists path = empty AND read-only |
+| `OPENCODE_SANDBOX_DENY_WRITE` | unset | colon-separated abs paths -> `--ro-bind` shadow (readable, read-only); emitted after write roots so it overrides them. Workspace: strict — missing/non-canonical entry fails the spawn |
+| `OPENCODE_SANDBOX_DENY_READ` | unset | colon-separated abs paths -> `--tmpfs` shadow (dir exists, contents empty); both-lists path = empty AND read-only. Workspace: strict like denyWrite |
 | `OPENCODE_SANDBOX_RW_NETWORK` | `1` | `0` -> `--unshare-net` on the RW floor too; AF_UNIX unaffected so WSL interop still works |
-| `OPENCODE_SANDBOX_ALLOW_SUDO` | `0` | `1` -> RW runs host-direct (no bwrap) + stage2 skips NNP + seccomp; RO unaffected |
-| `OPENCODE_SANDBOX_EXTRA_ARGS` | unset | raw bwrap argv elements joined by `\n`; appended verbatim just before the `--` payload separator (validated upstream: no `\n`/`\0`/`--`/empty elements, <=64KB; bwrap rejects bad flags = fail-closed). Trusted-config authority: `--setenv`/`--unsetenv` entries apply to stage2's environment and CAN override env-read stage2 configuration — e.g. `OPENCODE_SANDBOX_SCRATCH` widens the RO Landlock writable hierarchy (equivalent authority to `mode: full`). Do not set reserved `OPENCODE_SANDBOX_*`/`OPENCODE_REAL_BASH` overrides here; this is not a constrained security customization interface. argv-passed stage2 controls (`--mode`, `--real-bash`) and RO's argv-based allowSudo scoping cannot be forged this way |
+| `OPENCODE_SANDBOX_ALLOW_SUDO` | `0` | `1` -> **RW only**: runs host-direct (no bwrap) + stage2 skips NNP + seccomp; RO unaffected; **workspace ignores it** — no host-direct route exists for that profile |
+| `OPENCODE_SANDBOX_EXTRA_ARGS` | unset | raw bwrap argv elements joined by `\n`; appended verbatim just before the `--` payload separator (validated upstream: no `\n`/`\0`/`--`/empty elements, <=64KB; bwrap rejects bad flags = fail-closed). **Workspace profile: refused outright** (a trailing `--bind`/`--setenv` could shadow the floor). ro/rw: trusted-config authority — `--setenv`/`--unsetenv` entries apply to stage2's environment and CAN override env-read stage2 configuration — e.g. `OPENCODE_SANDBOX_SCRATCH` widens the RO Landlock writable hierarchy (equivalent authority to `mode: full`). Do not set reserved `OPENCODE_SANDBOX_*`/`OPENCODE_REAL_BASH` overrides here; this is not a constrained security customization interface. argv-passed stage2 controls (`--mode`, `--real-bash`) and the argv-scoped allowSudo scoping cannot be forged this way |
 | `OPENCODE_SANDBOX_FALLBACK` | unset | pin `bwrap-only` or `landlock-only` |
 
 Exit status propagates unchanged through both exec chains

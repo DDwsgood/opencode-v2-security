@@ -1,152 +1,113 @@
-// session-notifications.ts — no-wake session state notices for /perm and /bypass.
+// Permission transitions are append-only user-role notifications. Never edit
+// the model's system prompt, existing messages, or any historical prefix.
 //
-// Why this exists: the previous mechanism appended `ctx.session.synthetic`
-// reminders (a durable user-role inbox item) on permission/bypass transitions.
-// A synthetic admission is a session INPUT — on hosts where admission promotes
-// pending work it can start a Runner for an idle session, and it permanently
-// lands in the transcript. State notices are not inputs: they describe the
-// CURRENT state and only matter when the model is about to be called anyway.
-//
-// Verified no-wake mechanism (~/src/opencode2, branch v2):
-//   - packages/plugin/src/effect/session.ts:21  SessionContext { system, messages, ... }
-//   - packages/plugin/src/effect/session.ts:67  SessionHooks["context"]
-//   - packages/plugin/src/effect/session.ts:73  SessionDomain.hook = ModelHooks<SessionHooks>
-//   - packages/core/src/session/model-request.ts:301-333  the context hook is invoked
-//     while the next model request is being built (`hooks.trigger("session","context")`)
-//     and `context.system` ships verbatim as the request's system parts.
-//   - Host precedent for mutating it in place: packages/core/src/plugin/system-prompt.ts:36.
-//   - packages/ai/src/schema/messages.ts:21  SystemPart = {type:"text", text, cache?, metadata?}
-//
-// So: mutate `event.system` inside `ctx.session.hook("context", ...)`. No
-// session.synthetic/prompt/generate/interrupt/wait/resume call, no inbox
-// admission, no wake — an idle session stays idle, and the very next real
-// model call (whenever the user causes one) already sees the latest state.
-//
-// Ownership contract: callers (index.ts) decide *when* state changed —
-// transitions, descendant-inherited moves, lease expiry, bypass restore —
-// and pass the exact reminder text they would previously have synthetic'd.
-// This module never invents text and never reads model output: state only
-// enters through setPerm/setBypass, i.e. plugin code paths. Passing
-// `undefined` clears that notice — callers use it to suppress the default/
-// baseline state so no noise is injected.
-
-import { Effect } from "effect"
-
-/** Marker carried on injected SystemPart.metadata so a rebuild/second hook
- *  pass updates the same part instead of stacking duplicates. */
-const MARKER = "opencode-v2-security-session-state"
-
-type SystemPartLike = {
-  type: "text"
-  text: string
-  metadata?: Record<string, unknown>
-}
-
-/** Minimal structural shape of the hook event we touch (verified against
- *  SessionContext; extra fields are ignored). */
-export interface SessionContextEvent {
-  readonly sessionID: string
-  system: Array<SystemPartLike>
-}
+// A state change only records the latest text. It is admitted to the
+// transcript while the host prepares the next real user prompt (the
+// session "prompt" hook), right before that prompt's own admission, so both
+// are promoted together into one model request. Admitting at the moment of
+// the change would leave a pending steer item in the inbox: a runner that is
+// finishing its last step treats it as new input and starts another model
+// request (and a later wake would do the same for an idle session).
+// While a run is in progress, the latest text also rides the next completed
+// tool result, which that run's next model step reads anyway.
 
 interface SessionState {
   perm?: string
   bypass?: string
 }
 
-export interface SessionStateNotices {
-  /** Latest /perm notice text for the session, or undefined to clear. */
-  setPerm(sessionID: string, text: string | undefined): void
-  /** Latest /bypass notice text for the session, or undefined to clear. */
-  setBypass(sessionID: string, text: string | undefined): void
-  /** Drop all notices (e.g. session.deleted). */
-  clear(sessionID: string): void
-  /** Combined notice text for the session as it would be injected now. */
-  snapshot(sessionID: string): string | undefined
+export interface SessionStateNotification {
+  sessionID: string
+  text: string
+  description: string
+  metadata: Record<string, unknown>
+  resume: false
+  delivery: "steer"
 }
 
-export function createSessionStateNotices(): SessionStateNotices {
-  const states = new Map<string, SessionState>()
+export interface SessionStateNotices {
+  setPerm(sessionID: string, text: string | undefined): void
+  setBypass(sessionID: string, text: string | undefined): void
+  clear(sessionID: string): void
+  snapshot(sessionID: string): string | undefined
+  /** Admit the latest undelivered notice ahead of a user prompt that is
+   *  being prepared. A queued prompt is skipped: queued inbox items are
+   *  promoted one per turn, so a notice queued before it would get a model
+   *  request of its own. The notice then rides the next steering prompt. */
+  deliverWithPrompt(sessionID: string, delivery: string | undefined): Promise<void>
+  /** Take the latest undelivered notice for a tool result that the running
+   *  session's next model step will read anyway. Only exists mid-run, so it
+   *  never starts a request; the text then counts as delivered. */
+  takeForToolResult(sessionID: string): string | undefined
+  /** Wait for in-progress admissions. */
+  flush(): Promise<void>
+}
 
-  const set =
-    (key: keyof SessionState) =>
-    (sessionID: string, text: string | undefined): void => {
-      const cur = states.get(sessionID) ?? {}
-      if (cur[key] === text) return
-      const next = { ...cur, [key]: text }
-      if (!next.perm && !next.bypass) states.delete(sessionID)
-      else states.set(sessionID, next)
-    }
+export function createSessionStateNotices(
+  publish?: (notice: SessionStateNotification) => Promise<unknown>,
+): SessionStateNotices {
+  const states = new Map<string, SessionState>()
+  const delivered = new Map<string, string>()
+  let pending = Promise.resolve()
+
+  const snapshot = (sessionID: string): string | undefined => {
+    const state = states.get(sessionID)
+    if (!state) return undefined
+    const parts = [state.perm, state.bypass].filter(
+      (text): text is string => typeof text === "string" && text.length > 0,
+    )
+    return parts.length ? `opencode-v2-security: ${parts.join("\n")}` : undefined
+  }
+
+  const set = (key: keyof SessionState) => (sessionID: string, text: string | undefined) => {
+    const current = states.get(sessionID) ?? {}
+    if (current[key] === text) return
+    const next = { ...current, [key]: text }
+    if (!next.perm && !next.bypass) states.delete(sessionID)
+    else states.set(sessionID, next)
+  }
 
   return {
     setPerm: set("perm"),
     setBypass: set("bypass"),
+    snapshot,
     clear(sessionID) {
       states.delete(sessionID)
+      delivered.delete(sessionID)
     },
-    snapshot(sessionID) {
-      const s = states.get(sessionID)
-      if (!s) return undefined
-      const parts = [s.perm, s.bypass].filter(
-        (t): t is string => typeof t === "string" && t.length > 0,
-      )
-      if (parts.length === 0) return undefined
-      return `opencode-v2-security: ${parts.join("\n")}`
+    deliverWithPrompt(sessionID, delivery) {
+      if (!publish || (delivery !== undefined && delivery !== "steer")) return Promise.resolve()
+      const run = pending.then(async () => {
+        const text = snapshot(sessionID)
+        if (!text || delivered.get(sessionID) === text) return
+        await publish({
+          sessionID,
+          text,
+          description: "Security mode changed",
+          metadata: { source: "opencode-v2-security", securityStateNotice: true },
+          resume: false,
+          delivery: "steer",
+        })
+        delivered.set(sessionID, text)
+      }).catch(() => {
+        // No error bodies: admission failures may contain unrelated host data.
+        console.warn("[opencode-v2-security] security state notification was not delivered (enforcement unchanged)")
+      })
+      pending = run
+      return run
+    },
+    takeForToolResult(sessionID) {
+      const text = snapshot(sessionID)
+      if (!text || delivered.get(sessionID) === text) return undefined
+      delivered.set(sessionID, text)
+      return text
+    },
+    async flush() {
+      for (;;) {
+        const current = pending
+        await current
+        if (pending === current) return
+      }
     },
   }
-}
-
-/** Apply the session's current notices to a context-hook event. Exported for
- *  tests; `attachSessionContextHook` wires it to the host hook. */
-export function applyNoticesToContext(
-  notices: SessionStateNotices,
-  event: SessionContextEvent,
-): void {
-  const text = notices.snapshot(event.sessionID)
-  const existing = event.system.find(
-    (p) => p.metadata && p.metadata[MARKER] === true,
-  )
-  if (text === undefined) {
-    if (existing) event.system.splice(event.system.indexOf(existing), 1)
-    return
-  }
-  if (existing) {
-    existing.text = text
-    return
-  }
-  // Trailing system part: the cached prefix stays intact and the latest
-  // state reads as current, not as a stale earlier instruction.
-  event.system.push({
-    type: "text",
-    text,
-    metadata: { [MARKER]: true, source: "opencode-v2-security" },
-  })
-}
-
-/** Structural minimum of the plugin ctx slice this needs. `session.hook` is
- *  optional so older hosts still load: when absent the function reports false
- *  and callers keep whatever user-facing channel they already have. */
-export type SessionContextHookHost = {
-  session: {
-    hook?: (
-      name: "context",
-      callback: (event: SessionContextEvent) => Effect.Effect<void>,
-    ) => Effect.Effect<unknown>
-  }
-}
-
-/** Register the context hook. Returns Effect<boolean>: true when the hook was
- *  registered. Registers NOTHING else — no inbox admission, no resume, no
- *  wake; the callback only runs while the host is already building a model
- *  request. */
-export function attachSessionContextHook(
-  ctx: SessionContextHookHost,
-  notices: SessionStateNotices,
-): Effect.Effect<boolean> {
-  if (typeof ctx.session.hook !== "function") return Effect.succeed(false)
-  return ctx.session
-    .hook("context", (event) =>
-      Effect.sync(() => applyNoticesToContext(notices, event)),
-    )
-    .pipe(Effect.as(true))
 }

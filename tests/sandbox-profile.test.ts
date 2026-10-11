@@ -8,6 +8,7 @@ import {
   createSandboxMarkers,
   extractSandboxMarker,
   insertSandboxMarker,
+  normalizeWriteRoots,
   parseSandboxProbe,
   probeLinuxSandbox,
   profileForPerm,
@@ -30,6 +31,7 @@ const selection = (overrides: Partial<SandboxSelection> = {}): SandboxSelection 
   scratch: "/tmp/opencode",
   roNetwork: "off",
   rwNetwork: "on",
+  workspaceNetwork: "off",
   denyWrite: [],
   denyRead: [],
   allowSudo: false,
@@ -57,7 +59,16 @@ describe("sandbox config resolution", () => {
       "/run/containerd/containerd.sock",
     ])
     expect(sandbox.roAfUnixBlock).toBe(true)
+    expect(sandbox.workspaceNetwork).toBe("off")
     expect(sandbox.onUnavailable).toBe("fail_close")
+  })
+
+  test("workspace mode and workspaceNetwork resolve; invalid values reject", () => {
+    expect(resolveSandbox({ mode: "workspace" }).mode).toBe("workspace")
+    expect(resolveSandbox({ workspaceNetwork: "on" }).workspaceNetwork).toBe("on")
+    expect(resolveSandbox({ workspaceNetwork: "off" }).workspaceNetwork).toBe("off")
+    expect(() => resolveSandbox({ mode: "ww" })).toThrow()
+    expect(() => resolveSandbox({ workspaceNetwork: "yes" })).toThrow()
   })
 
   test("resolvePluginConfig surfaces sandbox and accepts the top-level key", () => {
@@ -155,17 +166,18 @@ describe("sandbox config resolution", () => {
 })
 
 describe("profileForPerm", () => {
-  test("auto mode maps perm.w=false → ro, w=true → rw", () => {
+  test("auto mode maps perm.w=false → ro, w=true → workspace", () => {
     const auto = selection()
     expect(profileForPerm(perm(true, false), auto)).toBe("ro")
     expect(profileForPerm(perm(false, false), auto)).toBe("ro")
-    expect(profileForPerm(perm(true, true), auto)).toBe("rw")
-    expect(profileForPerm(PERM_FULL, auto)).toBe("rw")
+    expect(profileForPerm(perm(true, true), auto)).toBe("workspace")
+    expect(profileForPerm(PERM_FULL, auto)).toBe("workspace")
   })
 
   test("forced modes override the perm mapping", () => {
     expect(profileForPerm(perm(true, true), selection({ mode: "ro" }))).toBe("ro")
     expect(profileForPerm(perm(true, false), selection({ mode: "rw" }))).toBe("rw")
+    expect(profileForPerm(perm(true, true), selection({ mode: "workspace" }))).toBe("workspace")
     expect(profileForPerm(perm(true, true), selection({ mode: "full" }))).toBe("full")
     expect(profileForPerm(perm(true, false), selection({ mode: "full" }))).toBe("full")
   })
@@ -197,28 +209,31 @@ describe("sandbox markers", () => {
     }
   })
 
-  test("marker is consumed once; replay falls back untouched", () => {
+  test("marker is consumed once; replay is invalid, not bare", () => {
     const markers = createSandboxMarkers()
     const marked = insertSandboxMarker(markers, "ls", "rw", NONCE)
     expect(extractSandboxMarker(markers, marked).profile).toBe("rw")
     const replay = extractSandboxMarker(markers, marked)
     expect(replay.profile).toBeUndefined()
+    expect(replay.invalid).toBe(true)
     expect(replay.command).toBe(marked)
   })
 
-  test("unknown/stale marker leaves the command untouched", () => {
+  test("unknown/stale marker is invalid (deny), command untouched", () => {
     const markers = createSandboxMarkers()
     const forged = ": opencode-sandbox deadbeefdeadbeefdeadbeefdeadbeef\nls"
     const result = extractSandboxMarker(markers, forged)
     expect(result.profile).toBeUndefined()
+    expect(result.invalid).toBe(true)
     expect(result.command).toBe(forged)
   })
 
-  test("expired marker leaves the command untouched", () => {
+  test("expired marker is invalid (deny), command untouched", () => {
     const markers = createSandboxMarkers()
     const marked = insertSandboxMarker(markers, "ls", "ro", NONCE, 1000)
     const result = extractSandboxMarker(markers, marked, 1000 + 60_001)
     expect(result.profile).toBeUndefined()
+    expect(result.invalid).toBe(true)
     expect(result.command).toBe(marked)
   })
 
@@ -305,26 +320,28 @@ describe("create.before authority (marker is the sole wrap source)", () => {
     expect(ev.env).toEqual({ PATH: "/usr/bin" })
   })
 
-  test("TTL-expired marker runs bare (pre-P4 behavior)", () => {
+  test("TTL-expired marker is denied (exit 126), never run bare", () => {
     const markers = createSandboxMarkers()
     const marked_cmd = insertSandboxMarker(markers, "ls", "ro", NONCE, 1000)
     const ev = spawn()
     ev.command = marked_cmd
     const marked = extractSandboxMarker(markers, ev.command, 1000 + 60_001)
     expect(marked.profile).toBeUndefined()
+    expect(marked.invalid).toBe(true)
     applySandboxCreateBefore(ev, marked, selection(), available)
     expect(ev.shell).toBe("/bin/bash")
-    expect(ev.command).toBe(marked_cmd) // inert no-op marker line stays
-    expect(ev.env).toEqual({ PATH: "/usr/bin" })
+    expect(ev.command).toContain("exit 126")
+    expect(ev.command).toContain("security authorization for this call is invalid")
   })
 
-  test("unknown (forged) marker runs bare", () => {
+  test("unknown (forged) marker is denied, not run bare", () => {
     const ev = spawn()
     ev.command = `: opencode-sandbox ${"f".repeat(32)}\nls`
     const marked = extractSandboxMarker(createSandboxMarkers(), ev.command)
+    expect(marked.invalid).toBe(true)
     applySandboxCreateBefore(ev, marked, selection(), available)
     expect(ev.shell).toBe("/bin/bash")
-    expect(ev.env).toEqual({ PATH: "/usr/bin" })
+    expect(ev.command).toContain("exit 126")
   })
 
   test("fail_close exit-126 rewrite applies only to marker-present spawns", () => {
@@ -335,10 +352,11 @@ describe("create.before authority (marker is the sole wrap source)", () => {
     applySandboxCreateBefore(ev, marked, selection(), unavailable)
     expect(ev.shell).toBe("/bin/bash") // no wrap
     expect(ev.command).toContain("exit 126")
-    expect(ev.command).toContain("OS sandbox unavailable")
-    // The deny text must not instruct the AGENT to install bwrap or relax the
-    // config itself — the remedy is user-side only.
-    expect(ev.command).toContain("only the user may install bubblewrap")
+    expect(ev.command).toContain("sandbox is not available")
+    // State a pre-execution block without permission-elevation or manual
+    // installation guidance; a native read tool remains available.
+    expect(ev.command).toContain("The whole command was not run.")
+    expect(ev.command).not.toContain("install bubblewrap")
     expect(ev.command).not.toContain("Install bubblewrap")
   })
 
@@ -378,6 +396,117 @@ describe("create.before authority (marker is the sole wrap source)", () => {
     applySandboxCreateBefore(ev, marked, selection({ allowSudo: true }), unavailable)
     expect(ev.shell).toBe("/bin/bash")
     expect(ev.command).toContain("exit 126")
+  })
+
+  test("workspace marker wraps with WRITE_ROOTS and WORKSPACE_NETWORK env", () => {
+    const markers = createSandboxMarkers()
+    const ev = spawn()
+    ev.command = insertSandboxMarker(markers, "make build", "workspace", NONCE, undefined, {
+      writeRoots: ["/repo/app", "/repo/app/sub/"], // subsumed entry dropped
+    })
+    const marked = extractSandboxMarker(markers, ev.command)
+    applySandboxCreateBefore(ev, marked, selection(), available)
+    expect(ev.command).toBe("make build")
+    expect(ev.shell).toBe("/pkg/bin/opencode-sandbox")
+    expect(ev.env.OPENCODE_SANDBOX_MODE).toBe("workspace")
+    expect(ev.env.OPENCODE_SANDBOX_WRITE_ROOTS).toBe("/repo/app")
+    expect(ev.env.OPENCODE_SANDBOX_WORKSPACE_NETWORK).toBe("0")
+    expect(ev.env.OPENCODE_SANDBOX_MASK_WSL_INTEROP).toBe("1")
+    expect(ev.env.OPENCODE_SANDBOX_ALLOW_SUDO).toBe("0")
+    expect(ev.env.OPENCODE_SANDBOX_RO_NETWORK).toBeUndefined()
+    expect(ev.env.OPENCODE_SANDBOX_RO_AF_UNIX_BLOCK).toBeUndefined()
+  })
+
+  test("workspace: per-call network capability sets WORKSPACE_NETWORK=1", () => {
+    const markers = createSandboxMarkers()
+    const ev = spawn()
+    ev.command = insertSandboxMarker(markers, "npm install", "workspace", NONCE, undefined, {
+      network: true,
+    })
+    const marked = extractSandboxMarker(markers, ev.command)
+    applySandboxCreateBefore(ev, marked, selection(), available)
+    expect(ev.env.OPENCODE_SANDBOX_WORKSPACE_NETWORK).toBe("1")
+  })
+
+  test("workspace: config workspaceNetwork=on also grants network", () => {
+    const spec = buildSandboxSpawn("workspace", selection({ workspaceNetwork: "on" }), () => true)
+    expect(spec.env.OPENCODE_SANDBOX_WORKSPACE_NETWORK).toBe("1")
+  })
+
+  test("workspace: hostDirect marker does not take the host-direct route", () => {
+    const markers = createSandboxMarkers()
+    const ev = spawn()
+    ev.command = insertSandboxMarker(markers, "sudo -n true", "workspace", NONCE, undefined, {
+      hostDirect: true,
+    })
+    const marked = extractSandboxMarker(markers, ev.command)
+    applySandboxCreateBefore(ev, marked, selection({ allowSudo: false }), available)
+    // Still wrapped through the helper as a normal workspace spawn — never
+    // host-direct, never ALLOW_SUDO.
+    expect(ev.shell).toBe("/pkg/bin/opencode-sandbox")
+    expect(ev.env.OPENCODE_SANDBOX_MODE).toBe("workspace")
+    expect(ev.env.OPENCODE_SANDBOX_ALLOW_SUDO).toBe("0")
+  })
+
+  test("workspace + landlock-only probe is refused (exit 126) regardless of degrade", () => {
+    for (const onUnavailable of ["fail_close", "degrade"] as const) {
+      const markers = createSandboxMarkers()
+      const ev = spawn()
+      ev.command = insertSandboxMarker(markers, "make", "workspace", NONCE)
+      const marked = extractSandboxMarker(markers, ev.command)
+      applySandboxCreateBefore(
+        ev,
+        marked,
+        selection({ onUnavailable }),
+        { available: true, path: "landlock-only", landlockAbi: 5 },
+      )
+      expect(ev.shell).toBe("/bin/bash")
+      expect(ev.command).toContain("exit 126")
+      expect(ev.command).toContain("available OS sandbox backend cannot enforce")
+      expect(ev.command).toContain("The whole command was not run.")
+    }
+  })
+
+  test("workspace + unavailable probe is denied even under degrade", () => {
+    for (const onUnavailable of ["fail_close", "degrade"] as const) {
+      const markers = createSandboxMarkers()
+      const ev = spawn()
+      ev.command = insertSandboxMarker(markers, "make", "workspace", NONCE)
+      const marked = extractSandboxMarker(markers, ev.command)
+      applySandboxCreateBefore(ev, marked, selection({ onUnavailable }), unavailable)
+      expect(ev.shell).toBe("/bin/bash")
+      expect(ev.command).toContain("exit 126")
+      expect(ev.command).toContain("sandbox is not available")
+    }
+  })
+
+  test("workspace refuses a configured extraArgs (could shadow the floor)", () => {
+    const markers = createSandboxMarkers()
+    const ev = spawn()
+    ev.command = insertSandboxMarker(markers, "make", "workspace", NONCE)
+    const marked = extractSandboxMarker(markers, ev.command)
+    applySandboxCreateBefore(
+      ev,
+      marked,
+      selection({ extraArgs: ["--bind", "/x", "/x"] }),
+      available,
+    )
+    expect(ev.shell).toBe("/bin/bash")
+    expect(ev.command).toContain("exit 126")
+    expect(ev.command).toContain("configured extra sandbox options are not supported")
+    expect(ev.command).toContain("The whole command was not run.")
+  })
+
+  test("workspace + full/bwrap-only probe wraps normally", () => {
+    for (const path of ["full", "bwrap-only"] as const) {
+      const markers = createSandboxMarkers()
+      const ev = spawn()
+      ev.command = insertSandboxMarker(markers, "make", "workspace", NONCE)
+      const marked = extractSandboxMarker(markers, ev.command)
+      applySandboxCreateBefore(ev, marked, selection(), { available: true, path })
+      expect(ev.shell).toBe("/pkg/bin/opencode-sandbox")
+      expect(ev.env.OPENCODE_SANDBOX_MODE).toBe("workspace")
+    }
   })
 })
 
@@ -469,6 +598,21 @@ describe("spawn env construction (helper contract)", () => {
     expect(ev.shell).toBe("/bin/bash")
     expect(Object.keys(ev.env)).toEqual([])
   })
+
+  test("normalizeWriteRoots: validation, subsumption, dir-intent slash", () => {
+    expect(normalizeWriteRoots(undefined, "/tmp")).toEqual([])
+    expect(normalizeWriteRoots(["/a", "/a/b", "/tmp/x", "/a/"], "/tmp")).toEqual(["/a"])
+    expect(normalizeWriteRoots(["/newdir/"], "/tmp")).toEqual(["/newdir/"])
+    expect(() => normalizeWriteRoots(["/f/../f2"], "/tmp")).toThrow()
+    expect(() => normalizeWriteRoots(["/"], "/tmp")).toThrow()
+    expect(() => normalizeWriteRoots(["relative"], "/tmp")).toThrow()
+    expect(() => normalizeWriteRoots(["/a:b"], "/tmp")).toThrow()
+    expect(() => normalizeWriteRoots(["/a\nb"], "/tmp")).toThrow()
+    expect(() => normalizeWriteRoots([""], "/tmp")).toThrow()
+    expect(() =>
+      normalizeWriteRoots(Array.from({ length: 65 }, (_, i) => `/r${i}`), "/tmp"),
+    ).toThrow(/at most/)
+  })
 })
 
 describe("probe decision table (§3.4)", () => {
@@ -547,10 +691,10 @@ describe("assertSandboxAvailable", () => {
 
   test("fail_close throws the §4.3 message; degrade reports degraded", () => {
     expect(() => assertSandboxAvailable("ro", unavailable, "fail_close")).toThrow(
-      /OS sandbox unavailable.*Refusing shell execution/,
+      /Command blocked:.*sandbox is not available.*The whole command was not run/,
     )
     expect(assertSandboxAvailable("ro", unavailable, "degrade")).toBe("degraded")
-    expect(() => assertSandboxAvailable("rw", undefined, "fail_close")).toThrow(/OS sandbox unavailable/)
+    expect(() => assertSandboxAvailable("rw", undefined, "fail_close")).toThrow(/sandbox is not available/)
   })
 
   // rw+allowSudo selects the helper's host-direct route, which needs no
@@ -564,24 +708,48 @@ describe("assertSandboxAvailable", () => {
 
   test("ro + allowSudo still fail-closes; rw + !allowSudo unaffected", () => {
     expect(() => assertSandboxAvailable("ro", unavailable, "fail_close", true)).toThrow(
-      /OS sandbox unavailable/,
+      /sandbox is not available/,
     )
     expect(() => assertSandboxAvailable("ro", undefined, "fail_close", true)).toThrow(
-      /OS sandbox unavailable/,
+      /sandbox is not available/,
     )
     expect(() => assertSandboxAvailable("rw", unavailable, "fail_close", false)).toThrow(
-      /OS sandbox unavailable/,
+      /sandbox is not available/,
     )
-    expect(() => assertSandboxAvailable("rw", unavailable, "fail_close")).toThrow(/OS sandbox unavailable/)
+    expect(() => assertSandboxAvailable("rw", unavailable, "fail_close")).toThrow(/sandbox is not available/)
+  })
+
+  test("workspace: landlock-only probe throws even under degrade; bwrap paths pass", () => {
+    const landlockOnly = { available: true as const, path: "landlock-only" as const }
+    expect(() => assertSandboxAvailable("workspace", landlockOnly, "fail_close")).toThrow(
+      /requested OS sandbox profile cannot be enforced/,
+    )
+    expect(() => assertSandboxAvailable("workspace", landlockOnly, "degrade")).toThrow(
+      /requested OS sandbox profile cannot be enforced/,
+    )
+    expect(assertSandboxAvailable("workspace", available, "fail_close")).toBe("ok")
+    expect(
+      assertSandboxAvailable("workspace", { available: true, path: "bwrap-only" }, "fail_close"),
+    ).toBe("ok")
+    // An unavailable probe must not degrade to a bare spawn either.
+    expect(() => assertSandboxAvailable("workspace", unavailable, "degrade")).toThrow(
+      /sandbox is not available/,
+    )
+    expect(() => assertSandboxAvailable("workspace", undefined, "degrade")).toThrow(
+      /sandbox is not available/,
+    )
   })
 })
 
 describe("fail modes", () => {
   test("§4.3 message shape", () => {
     const message = sandboxUnavailableMessage("bwrap: not found, Landlock: unavailable")
-    expect(message).toContain("OS sandbox unavailable (bwrap: not found, Landlock: unavailable)")
-    expect(message).toContain("Refusing shell execution")
-    expect(message).toContain("sandbox.onUnavailable:'degrade'")
+    expect(message).toStartWith("Command blocked:")
+    expect(message).toContain("sandbox is not available")
+    expect(message).toContain("The whole command was not run.")
+    expect(message).toContain("Native file read tools still work.")
+    expect(message).not.toContain("sandbox.onUnavailable")
+    expect(message).not.toContain("install bubblewrap")
   })
 
   test("deny command exits 126 and prints the exact message (embedded quotes survive)", () => {
@@ -592,5 +760,77 @@ describe("fail modes", () => {
     const result = Bun.spawnSync(["bash", "-c", command])
     expect(result.exitCode).toBe(126)
     expect(result.stderr.toString().trim()).toBe(message)
+  })
+})
+
+describe("runtime watch deferred-hook refusal (spawn boundary)", () => {
+  const probe: SandboxProbeResult = { available: true, path: "full" }
+  const watch = {
+    helperPath: "/pkg/bin/opencode-boundary-watch",
+    socketPath: "/tmp/opencode/rt.sock",
+    token: "ab".repeat(32),
+    roots: ["/w"],
+    denyRead: [],
+    denyWrite: [],
+    readonly: false,
+  }
+  const spawn = (env: Record<string, string | undefined>) => ({
+    command: "touch /tmp/opencode/PAYLOAD-MARKER",
+    shell: "/bin/bash",
+    env,
+  })
+  const marked = {
+    command: "touch /tmp/opencode/PAYLOAD-MARKER",
+    profile: "workspace" as const,
+    runtimeWatch: watch,
+  }
+
+  test("all 8 storage slots occupied -> refuse, neutralize LD_*, keep user env", () => {
+    const env: Record<string, string> = {
+      BASH_ENV: "/tmp/opencode/hook.sh",
+      LD_PRELOAD: "/tmp/opencode/sentinel-preload.so",
+      LD_AUDIT: "/tmp/opencode/sentinel-audit.so",
+      KEEP_ME: "user-value",
+    }
+    for (let i = 0; i < 8; i++)
+      env[i === 0 ? "OPENCODE_DEFER_BASH_ENV" : `OPENCODE_DEFER${i + 1}_BASH_ENV`] = `user-slot-${i}`
+    const ev = spawn(env)
+    const result = applySandboxCreateBefore(ev, { ...marked }, selection(), probe)
+    // Refused before the payload exists: the deny text replaces the whole
+    // command — the payload marker must not appear in it at all.
+    expect(result).toBeUndefined()
+    expect(ev.command).toContain("exit 126")
+    expect(ev.command).toContain("could not be placed into supervised storage")
+    expect(ev.command).not.toContain("PAYLOAD-MARKER")
+    expect(ev.command).not.toContain("exec ")
+    // The refusal pins /bin/sh (dash ignores BASH_ENV) AND still empties
+    // every hook name: /bin/sh is dynamically linked, so a live LD_* would
+    // load unmonitored code even in the denial shell.
+    expect(ev.shell).toBe("/bin/sh")
+    expect(ev.env.BASH_ENV).toBe("")
+    expect(ev.env.LD_PRELOAD).toBe("")
+    expect(ev.env.LD_AUDIT).toBe("")
+    // User-owned env is not the payload's problem: same-prefix user vars
+    // and unrelated values pass through the refusal untouched.
+    expect(ev.env.KEEP_ME).toBe("user-value")
+    expect(ev.env.OPENCODE_DEFER_BASH_ENV).toBe("user-slot-0")
+    expect(ev.env.OPENCODE_DEFER8_BASH_ENV).toBe("user-slot-7")
+  })
+
+  test("more than 256 defer pairs -> same refusal, same neutralization", () => {
+    const env: Record<string, string> = { KEEP_ME: "user-value" }
+    for (let i = 0; i < 260; i++) env[`LD_HOOK_${i}`] = `sentinel-${i}`
+    const ev = spawn(env)
+    const result = applySandboxCreateBefore(ev, { ...marked }, selection(), probe)
+    expect(result).toBeUndefined()
+    expect(ev.command).toContain("exit 126")
+    expect(ev.command).toContain("could not be placed into supervised storage")
+    expect(ev.command).not.toContain("PAYLOAD-MARKER")
+    expect(ev.shell).toBe("/bin/sh")
+    for (let i = 0; i < 260; i++) expect(ev.env[`LD_HOOK_${i}`]).toBe("")
+    expect(ev.env.KEEP_ME).toBe("user-value")
+    // Nothing was deferred onto OPENCODE_DEFER_* storage names: the refusal
+    // path mutates nothing but the hook names themselves.
+    expect(Object.keys(ev.env).filter((key) => key.startsWith("OPENCODE_DEFER"))).toEqual([])
   })
 })

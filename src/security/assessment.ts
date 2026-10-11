@@ -172,7 +172,7 @@ export type CollectedEvidence = {
 }
 
 export interface AssessmentReport {
-  /** Normalized command text this report judges (escalation headers stripped). */
+  /** Normalized command text this report judges. */
   command: string
   /** Canonical execution cwd at assessment time. */
   cwd: string

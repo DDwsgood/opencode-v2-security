@@ -6,11 +6,14 @@
 // everything the host process must do around that binary, and is pure logic
 // except where noted so it is unit-testable without kernel privileges:
 //
-//   profileForPerm        perm → ro|rw|full profile (mode + enabled folded in)
+//   profileForPerm        perm → ro|workspace|full profile in auto mode
+//                         (rw = legacy host-write, explicit mode only)
 //   insertSandboxMarker   prepend a `: opencode-sandbox <nonce>` no-op line so
 //   extractSandboxMarker  create.before (which has NO sessionID in the 19271
-//                         API) can recover the exact profile chosen at
-//                         execute.before time — see plan §1.3
+//                         API) can recover the exact profile AND the per-call
+//                         grants (writeRoots, network, hostDirect) chosen at
+//                         execute.before time — see plan §1.3. A marker line
+//                         that fails lookup is invalid → deny, never bare.
 //   applySandboxCreateBefore  marker → wrap decision for create.before; the
 //                         marker is the SOLE authority — marker-less spawns
 //                         (user `!cmd`, host-internal) are never sandboxed
@@ -29,24 +32,65 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 import type { Perm } from "./permissions"
 import { splitSimpleSegments } from "./security/classifier"
+import { blockedText, RECHECK } from "./agent-messages"
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 
 /** Default helper location inside the installed package. */
 export const DEFAULT_SANDBOX_HELPER = path.join(PACKAGE_ROOT, "bin", "opencode-sandbox")
+export const DEFAULT_BOUNDARY_WATCH_HELPER = path.join(PACKAGE_ROOT, "bin", "opencode-boundary-watch")
 
-export type SandboxProfile = "ro" | "rw" | "full"
+export type RuntimeWatchSpawn = {
+  helperPath: string
+  socketPath: string
+  token: string
+  roots: readonly string[]
+  denyRead: readonly string[]
+  denyWrite: readonly string[]
+  readonly: boolean
+  /** Per-event approval budget handed to the helper (review budget + slack). */
+  approveTimeoutMs?: number
+  /** Control-plane paths: writes inside them or to their ancestors gate. */
+  protect?: readonly string[]
+}
+
+export type SandboxProfile = "ro" | "rw" | "workspace" | "full"
 
 /** The §3.4 sandbox route reported by `opencode-sandbox --probe`
  * ("full" = bwrap floor + Landlock, not the FULL profile). */
 export type SandboxPath = "full" | "bwrap-only" | "landlock-only" | "unavailable"
+
+/** Per-call wrap options carried by the nonce marker from execute.before to
+ * create.before. The marker is the SOLE authority for wrapping, so anything
+ * the kernel floor must know about THIS call travels here:
+ *   hostDirect  rw only — run without the bwrap floor (privilege route /
+ *               allowSudo). Ignored for ro and workspace: the workspace
+ *               profile never silently drops the floor for a
+ *               privilege-flagged call; the caller refuses it instead.
+ *   writeRoots  workspace only — extra writable paths beyond the worktree
+ *               and scratch, derived from the paths this call's review
+ *               authorized. A trailing "/" marks directory intent for a
+ *               path that does not exist yet.
+ *   network     workspace only — the host granted network access for this
+ *               call (default off). Ignored elsewhere: ro/rw keep their own
+ *               roNetwork/rwNetwork toggles. */
+export type SandboxMarkerOptions = {
+  hostDirect?: boolean
+  writeRoots?: readonly string[]
+  network?: boolean
+  runtimeWatch?: RuntimeWatchSpawn
+}
+
+/** Shape accepted at the wrap call sites; a bare boolean is the legacy
+ * hostDirect spelling kept for callers compiled against the old signature. */
+export type SandboxWrapOptions = SandboxMarkerOptions | boolean
 
 /** The subset of ResolvedSandbox (src/config.ts) the spawn/probe logic needs;
  * structurally compatible so config.ts types satisfy it without an import
  * cycle. */
 export type SandboxSelection = {
   enabled: boolean
-  mode: "auto" | "ro" | "rw" | "full"
+  mode: "auto" | "ro" | "rw" | "full" | "workspace"
   bwrapPath: string
   helperPath: string
   scratch: string
@@ -54,6 +98,10 @@ export type SandboxSelection = {
   /** "on" (default) = RW keeps network; "off" applies the RO network deny to
    * the RW profile. */
   rwNetwork: "on" | "off"
+  /** Workspace profile network default (default "off"): --unshare-net plus
+   * the Landlock TCP deny. A per-call marker network grant overrides it for
+   * that call; "on" grants network to every workspace call. */
+  workspaceNetwork: "on" | "off"
   /** Extra write-freeze (denyWrite) / read-shadow (denyRead) path lists,
    * colon-joined into the helper env. A path in both lists is legal: the
    * helper applies read-shadow first, then write-freeze. */
@@ -88,11 +136,13 @@ export type SandboxProbeResult = {
 // --- profile selection -----------------------------------------------------
 
 /** Effective profile for one shell call. `mode` wins over the perm-derived
- * profile; `enabled:false` or `mode:"full"` always yields "full" (no wrap). */
+ * profile; `enabled:false` or `mode:"full"` always yields "full" (no wrap).
+ * In "auto" the write bit maps to the workspace-write profile — NOT the
+ * legacy host-write "rw", which stays available only as an explicit mode. */
 export function profileForPerm(perm: Perm, sandbox: Pick<SandboxSelection, "enabled" | "mode">): SandboxProfile {
   if (!sandbox.enabled || sandbox.mode === "full") return "full"
-  if (sandbox.mode === "ro" || sandbox.mode === "rw") return sandbox.mode
-  return perm.w ? "rw" : "ro"
+  if (sandbox.mode === "ro" || sandbox.mode === "rw" || sandbox.mode === "workspace") return sandbox.mode
+  return perm.w ? "workspace" : "ro"
 }
 
 // --- privilege-launcher detection -------------------------------------------
@@ -961,7 +1011,7 @@ const MARKER_LINE = /^: opencode-sandbox ([0-9a-f]{32})\r?\n?/
 const MARKER_TTL_MS = 60_000
 const MAX_MARKERS = 1024
 
-export type SandboxMarkers = Map<string, { profile: SandboxProfile; expiresAt: number; hostDirect?: boolean }>
+export type SandboxMarkers = Map<string, { profile: SandboxProfile; expiresAt: number } & SandboxMarkerOptions>
 
 export function createSandboxMarkers(): SandboxMarkers {
   return new Map()
@@ -980,21 +1030,26 @@ function pruneMarkers(markers: SandboxMarkers, now: number) {
 
 /** Prepend the nonce marker line to a command. The nonce is generated after
  * the model produced the tool call and never enters the transcript, so it is
- * unforgeable; a miss at create.before means the spawn runs bare (pre-P4
- * behavior — the classifier still gated the command at execute.before).
- * `hostDirect` marks the per-call host-direct routing (the `privilege`
- * bypass category): create.before then wraps through the helper with
- * ALLOW_SUDO=1 even when sandbox.allowSudo is false. */
+ * unforgeable. A MARKER PRESENT at create.before that fails lookup (unknown
+ * or expired nonce) is denied outright — see extractSandboxMarker. A command
+ * with no marker at all (user `!cmd`, host-internal spawns) is trusted
+ * authority and runs untouched.
+ * `options.hostDirect` marks the per-call host-direct routing (the
+ * `privilege` bypass category): create.before then wraps through the helper
+ * with ALLOW_SUDO=1 — honored on the rw profile only. `options.writeRoots` /
+ * `options.network` are the workspace profile's per-call grants.
+ * A bare boolean `options` is the legacy hostDirect spelling. */
 export function insertSandboxMarker(
   markers: SandboxMarkers,
   command: string,
   profile: SandboxProfile,
   nonce: string = randomBytes(16).toString("hex"),
   now: number = Date.now(),
-  hostDirect?: boolean,
+  options?: SandboxWrapOptions,
 ): string {
   pruneMarkers(markers, now)
-  markers.set(nonce, { profile, expiresAt: now + MARKER_TTL_MS, hostDirect })
+  const opts: SandboxMarkerOptions = typeof options === "boolean" ? { hostDirect: options } : (options ?? {})
+  markers.set(nonce, { profile, expiresAt: now + MARKER_TTL_MS, ...opts })
   return `${MARKER_PREFIX}${nonce}\n${command}`
 }
 
@@ -1006,27 +1061,92 @@ export function stripSandboxMarker(command: string): string {
 }
 
 /**
- * Consume the marker at create.before time. On a hit the marker line is
- * stripped and the stored profile returned. On a miss — unknown nonce,
- * expired entry, or no marker at all — the command is returned untouched so
- * the spawn runs bare (an expired entry is also deleted, and the no-op
- * marker line stays in place, inert for a real shell).
+ * Consume the marker at create.before time.
+ *
+ * Three outcomes, distinguished deliberately:
+ *   - No marker line at all → `{ command, invalid: false }` with no profile:
+ *     trusted authority (user `!cmd`, host-internal spawn), byte-identical.
+ *   - Marker line present but the nonce is unknown, already consumed, or
+ *     expired → `{ command, invalid: true }`: the caller MUST deny (exit-126
+ *     rewrite). A marked spawn that cannot prove its profile never runs
+ *     bare — the fail direction on the authority channel is closed.
+ *   - Marker valid → `{ command, profile, ...options }`: the marker line is
+ *     stripped and the stored profile/options returned.
  */
 export function extractSandboxMarker(
   markers: SandboxMarkers,
   command: string,
   now: number = Date.now(),
-): { command: string; profile?: SandboxProfile; hostDirect?: boolean } {
+): {
+  command: string
+  profile?: SandboxProfile
+  hostDirect?: boolean
+  writeRoots?: readonly string[]
+  network?: boolean
+  runtimeWatch?: RuntimeWatchSpawn
+  /** Marker line present but unusable (unknown/stale/expired nonce): deny. */
+  invalid?: boolean
+} {
   const match = MARKER_LINE.exec(command)
   if (!match) return { command }
   const entry = markers.get(match[1])
-  if (!entry) return { command }
+  if (!entry) return { command, invalid: true }
   markers.delete(match[1])
-  if (entry.expiresAt <= now) return { command }
-  return { command: command.slice(match[0].length), profile: entry.profile, hostDirect: entry.hostDirect }
+  if (entry.expiresAt <= now) return { command, invalid: true }
+  return {
+    command: command.slice(match[0].length),
+    profile: entry.profile,
+    hostDirect: entry.hostDirect,
+    writeRoots: entry.writeRoots,
+    network: entry.network,
+    runtimeWatch: entry.runtimeWatch,
+  }
 }
 
 // --- spawn wrapping --------------------------------------------------------
+
+const MAX_WRITE_ROOTS = 64
+
+/** Normalize workspace write roots for the helper env contract. Throws on
+ * malformed input (non-absolute, "..", ":", "/" root): a bogus per-call root
+ * is a caller bug and must fail loudly, not silently widen or drop. Roots
+ * already covered by scratch or by an earlier root are redundant and dropped —
+ * this is also why a new file under scratch never needs an extraRoots entry.
+ * The trailing "/" spelling asserts directory intent and survives
+ * normalization. Existence, canonicality, and symlink rejection are
+ * enforced by the helper at spawn time (fail-close, exit 125) — it is the
+ * last authority and sees the path at mount time. */
+export function normalizeWriteRoots(roots: readonly string[] | undefined, scratch: string): string[] {
+  if (!roots || roots.length === 0) return []
+  if (roots.length > MAX_WRITE_ROOTS) {
+    throw new Error(`sandbox writeRoots may list at most ${MAX_WRITE_ROOTS} paths`)
+  }
+  const out: string[] = []
+  const covered = new Set<string>()
+  for (const raw of roots) {
+    if (typeof raw !== "string" || !raw.trim()) throw new Error("sandbox writeRoots entries must be non-empty strings")
+    const trimmed = raw.trim()
+    if (trimmed.includes(":") || trimmed.includes("\n") || trimmed.includes("\0")) {
+      throw new Error(`sandbox writeRoots entries may not contain ":", newline, or NUL: ${trimmed}`)
+    }
+    const dirIntent = trimmed.length > 1 && trimmed.endsWith("/")
+    const body = dirIntent ? trimmed.slice(0, -1) : trimmed
+    if (!path.isAbsolute(body)) throw new Error(`sandbox writeRoots entries must be absolute paths: ${trimmed}`)
+    if (body.split("/").includes("..")) throw new Error(`sandbox writeRoots entries may not contain "..": ${trimmed}`)
+    const normalized = path.normalize(body)
+    if (normalized === "/") throw new Error('sandbox writeRoots may not contain "/"')
+    // A root equal to or beneath scratch is already writable — drop it.
+    if (normalized === scratch || normalized.startsWith(`${scratch}/`)) continue
+    // Likewise a root equal to or beneath an earlier root adds nothing.
+    const coveredAlready = [...covered].some(
+      (existing) => normalized === existing || normalized.startsWith(`${existing}/`),
+    )
+    if (coveredAlready) continue
+    covered.add(normalized)
+    out.push(dirIntent ? `${normalized}/` : normalized)
+  }
+  return out
+}
 
 export type SandboxSpawnSpec = {
   /** Path the helper will re-exec as --stage2 inside bwrap. */
@@ -1037,14 +1157,18 @@ export type SandboxSpawnSpec = {
 /** Compute the env contract the helper reads (README "Environment contract").
  * `exists` decides whether a privileged socket still earns a mask slot —
  * injectable for tests (the helper re-checks at spawn time, so filtering here
- * only keeps the env var short). RO-only toggles are emitted only for "ro". */
+ * only keeps the env var short). RO-only toggles are emitted only for "ro";
+ * workspace-only toggles only for "workspace".
+ * `options` accepts the marker-carried per-call grants (writeRoots, network)
+ * or the legacy bare-boolean hostDirect spelling. */
 export function buildSandboxSpawn(
   profile: SandboxProfile,
   sandbox: SandboxSelection,
   exists: (path: string) => boolean = existsSync,
-  hostDirect?: boolean,
+  options?: SandboxWrapOptions,
 ): SandboxSpawnSpec {
-  const mode = profile === "ro" ? "ro" : "rw"
+  const opts: SandboxMarkerOptions = typeof options === "boolean" ? { hostDirect: options } : (options ?? {})
+  const mode = profile === "ro" ? "ro" : profile === "workspace" ? "workspace" : "rw"
   const env: Record<string, string> = {
     OPENCODE_SANDBOX_MODE: mode,
     OPENCODE_SANDBOX_SCRATCH: sandbox.scratch,
@@ -1052,28 +1176,45 @@ export function buildSandboxSpawn(
     OPENCODE_SANDBOX_HELPER: sandbox.helperPath,
     OPENCODE_SANDBOX_MASK_SOCKETS: sandbox.maskPrivilegedSockets.filter((socket) => exists(socket)).join(":"),
     // denyRead shadows reads, denyWrite freezes writes; the same path may be
-    // in both (the helper applies read-shadow first, then write-freeze).
+    // in both (the helper applies read-shadow first, then write-freeze). The
+    // workspace profile additionally emits them AFTER the write-root binds so
+    // they shadow extra writable roots too.
     OPENCODE_SANDBOX_DENY_WRITE: sandbox.denyWrite.join(":"),
     OPENCODE_SANDBOX_DENY_READ: sandbox.denyRead.join(":"),
     OPENCODE_SANDBOX_RW_NETWORK: sandbox.rwNetwork === "on" ? "1" : "0",
     // "1" + MODE=rw tells the helper to skip bwrap and run the payload
     // host-direct (no namespace, NNP, or seccomp floor) — the only way sudo
-    // can actually work, since bwrap sets NNP unconditionally. RO ignores it.
-    // `hostDirect` is the per-call variant of the same route, armed by the
-    // `privilege` bypass category for one privilege-needing call.
-    OPENCODE_SANDBOX_ALLOW_SUDO: sandbox.allowSudo || hostDirect === true ? "1" : "0",
+    // can actually work, since bwrap sets NNP unconditionally. Emitted as
+    // the effective routing intent only for MODE=rw: the workspace profile
+    // never takes the host-direct route (a privilege-flagged workspace call
+    // is refused upstream instead of silently dropping the floor), and RO
+    // ignores the flag entirely.
+    OPENCODE_SANDBOX_ALLOW_SUDO:
+      mode === "rw" && (sandbox.allowSudo || opts.hostDirect === true) ? "1" : "0",
     // Raw bwrap argv pass-through: one argv element per line, appended after
     // all helper-generated args immediately before the `--` payload separator
-    // (later mounts shadow earlier ones). NOTE: --setenv/--unsetenv entries
-    // reach stage2's environment and can override env-read controls such as
-    // OPENCODE_SANDBOX_SCRATCH, weakening the RO Landlock write-freeze —
-    // trusted-config authority, same trust level as mode:"full".
+    // (later mounts shadow earlier ones). ro/rw: trusted-config authority —
+    // --setenv/--unsetenv entries reach stage2's environment and can override
+    // env-read controls such as OPENCODE_SANDBOX_SCRATCH, weakening the write
+    // allow-list (same trust level as mode:"full"). workspace: refused — a
+    // trailing --bind/--setenv could shadow the floor, so applySandboxCreateBefore
+    // denies the call and the helper exits 125 if it ever sees a non-empty value.
     OPENCODE_SANDBOX_EXTRA_ARGS: sandbox.extraArgs.join("\n"),
   }
   if (mode === "ro") {
     env.OPENCODE_SANDBOX_RO_NETWORK = sandbox.roNetwork
     env.OPENCODE_SANDBOX_MASK_WSL_INTEROP = sandbox.maskWslInterop ? "1" : "0"
     env.OPENCODE_SANDBOX_RO_AF_UNIX_BLOCK = sandbox.roAfUnixBlock ? "1" : "0"
+  }
+  if (mode === "workspace") {
+    // Per-call grants carried by the marker: extra writable roots (worktree
+    // is supplied by the caller as part of this list) and the network
+    // capability (default off; session config workspaceNetwork may enable it
+    // for every call).
+    env.OPENCODE_SANDBOX_WRITE_ROOTS = normalizeWriteRoots(opts.writeRoots, sandbox.scratch).join(":")
+    env.OPENCODE_SANDBOX_WORKSPACE_NETWORK =
+      sandbox.workspaceNetwork === "on" || opts.network === true ? "1" : "0"
+    env.OPENCODE_SANDBOX_MASK_WSL_INTEROP = sandbox.maskWslInterop ? "1" : "0"
   }
   return { helperPath: sandbox.helperPath, env }
 }
@@ -1086,13 +1227,20 @@ export function wrapShellForSandbox(
   profile: SandboxProfile,
   sandbox: SandboxSelection,
   exists?: (path: string) => boolean,
-  hostDirect?: boolean,
+  options?: SandboxWrapOptions,
 ): void {
   if (profile === "full") return
-  const spec = buildSandboxSpawn(profile, sandbox, exists, hostDirect)
+  const spec = buildSandboxSpawn(profile, sandbox, exists, options)
   ev.env.OPENCODE_REAL_BASH = ev.shell
   for (const [key, value] of Object.entries(spec.env)) ev.env[key] = value
   ev.shell = spec.helperPath
+}
+
+/** Deny reason for a spawn that carries a marker line whose nonce cannot be
+ * resolved (unknown, replayed, or expired). The command itself is not echoed
+ * (it could carry secrets). */
+export function sandboxMarkerInvalidMessage(): string {
+  return blockedText("the security authorization for this call is invalid, expired or already used", RECHECK)
 }
 
 /** Linux create.before body, extracted so the authority rule is unit-testable.
@@ -1101,28 +1249,122 @@ export function wrapShellForSandbox(
  * marker, and are trusted authority — they are returned byte-identical,
  * unsandboxed, exactly as they were never classified.
  *
- * An expired or unknown marker also runs bare: that is pre-P4 behavior — the
- * command was still gated by the classifier at execute.before; only the
- * kernel wrap is skipped. The safe direction is unchanged (classifier
- * denials still apply, an unknown marker can never cause a wrap).
+ * A marker line that is PRESENT but unresolvable (unknown or expired nonce)
+ * is denied via the exit-126 rewrite: a marked spawn must never fall back to
+ * bare execution — the marker channel is what carries the per-call profile
+ * and grants, so a lost marker is treated as a closed failure.
  *
- * Marker present → the marker line is stripped and the profile wrapped;
+ * Marker valid → the marker line is stripped and the profile wrapped;
  * "full" (sandbox-bypass category / kill switch carrier) returns untouched.
  * The fail_close exit-126 rewrite applies ONLY to marker-present spawns
  * whose probe reports unavailable — belt-and-suspenders, since runBefore
  * already gates tool shells; marker-less spawns are never denied here.
+ *
+ * The workspace profile additionally requires a bwrap-capable path: on
+ * `landlock-only` the deny lists, WSL-interop mask and write-root binds are
+ * unenforceable mount features, so the call is refused (exit-126) rather
+ * than silently dropping them — degrade does not apply to contract loss.
  *
  * `marked` is the extractSandboxMarker result (extraction happens in
  * index.ts on every platform so an explicit "full" marker also skips the
  * Windows supervisor wrap). Returns the resolved profile. */
 export function applySandboxCreateBefore(
   ev: { command: string; shell: string; env: Record<string, string | undefined> },
-  marked: { command: string; profile?: SandboxProfile; hostDirect?: boolean },
+  marked: {
+    command: string
+    profile?: SandboxProfile
+    hostDirect?: boolean
+    writeRoots?: readonly string[]
+    network?: boolean
+    runtimeWatch?: RuntimeWatchSpawn
+    invalid?: boolean
+  },
   sandbox: SandboxSelection,
   probe: SandboxProbeResult | undefined,
 ): SandboxProfile | undefined {
+  if (marked.invalid) {
+    ev.command = sandboxDenyCommand(sandboxMarkerInvalidMessage())
+    return undefined
+  }
   if (!marked.profile) return undefined
   ev.command = marked.command
+  if (marked.runtimeWatch) {
+    const watch = marked.runtimeWatch
+    // Avoid incidental interpreter cache writes being mistaken for the
+    // user's requested file effects. These are call-local, not host settings.
+    ev.env.PYTHONDONTWRITEBYTECODE ??= "1"
+    // Read-only Git commands otherwise refresh the index under index.lock,
+    // which for a linked worktree lives in the main repository's gitdir,
+    // outside the write roots.
+    ev.env.GIT_OPTIONAL_LOCKS ??= "0"
+    // Bootstrap gap: the outer host shell would interpret startup hooks
+    // (BASH_ENV/ENV, exported BASH_FUNC_*, PROMPT_COMMAND, xtrace output,
+    // LD_*) BEFORE `exec` reaches the helper — unmonitored code. The real
+    // name is emptied ("" is inert to bash/dash/ld.so and survives hosts
+    // that merge the parent env after this edit) and the value travels via
+    // a declared OPENCODE_DEFER<N>_<name> storage variable; the helper's
+    // --defer <storage>=<name> pairs tell the traced child exactly which
+    // storage names to restore — nothing else is touched, and a preexisting
+    // same-prefix variable just bumps the numeric suffix (loss-free).
+    //
+    // Two passes: first pick a free storage slot for every hook WITHOUT
+    // mutating env. If any hook cannot be placed (all 8 aliases occupied
+    // by user variables, or the helper's 256-pair cap is hit), the command
+    // is refused outright — keeping the original hook would let it run
+    // unmonitored in the outer shell, and silently dropping the value is
+    // not loss-free. Nothing is mutated on the refusal path.
+    const deferredPairs: Array<[storage: string, realKey: string]> = []
+    let deferOverflow: string | undefined
+    for (const key of Object.keys(ev.env)) {
+      if (!/^(BASH_ENV|ENV|BASHOPTS|SHELLOPTS|PROMPT_COMMAND|PS4|BASH_XTRACEFD|BASH_FUNC_[^%]*%%|LD_.*|DYLD_.*)$/.test(key)) continue
+      let storage: string | undefined
+      for (let level = 0; level < 8 && !storage; level++) {
+        const candidate = level === 0 ? `OPENCODE_DEFER_${key}` : `OPENCODE_DEFER${level + 1}_${key}`
+        // Skip storage names we created this pass or that the user's own
+        // env already occupies — never overwrite an existing variable.
+        if (!deferredPairs.some(([s]) => s === candidate) && ev.env[candidate] === undefined)
+          storage = candidate
+      }
+      if (!storage || deferredPairs.length >= 256) { deferOverflow = key; break }
+      deferredPairs.push([storage, key])
+    }
+    if (deferOverflow !== undefined) {
+      // Refuse BEFORE the payload exists. Two hazards remain in the REFUSAL
+      // shell itself: pin it to /bin/sh (dash ignores BASH_ENV and friends),
+      // AND neutralize every hook name — /bin/sh is dynamically linked, so a
+      // live LD_PRELOAD/LD_AUDIT would still load unmonitored code when the
+      // deny script's shell starts. Emptying the names is loss-free here:
+      // the payload never exists, so nothing needs the deferred values.
+      if (existsSync("/bin/sh")) ev.shell = "/bin/sh"
+      for (const key of Object.keys(ev.env)) {
+        if (/^(BASH_ENV|ENV|BASHOPTS|SHELLOPTS|PROMPT_COMMAND|PS4|BASH_XTRACEFD|BASH_FUNC_[^%]*%%|LD_.*|DYLD_.*)$/.test(key))
+          ev.env[key] = ""
+      }
+      ev.command = sandboxDenyCommand(
+        `Command blocked: the deferred environment hook '${deferOverflow}' could not be placed into supervised storage. The whole command was not run.`)
+      return undefined
+    }
+    for (const [storage, key] of deferredPairs) {
+      ev.env[storage] = ev.env[key] ?? ""
+      ev.env[key] = ""
+    }
+    const defers = deferredPairs.map(([storage, key]) => `${storage}=${key}`)
+    const args = [watch.helperPath, "--broker", watch.socketPath, "--token", watch.token,
+      ...watch.roots.flatMap((root) => ["--root", root]),
+      ...watch.denyRead.flatMap((target) => ["--deny-read", target]),
+      ...watch.denyWrite.flatMap((target) => ["--deny-write", target]),
+      ...(watch.protect ?? []).flatMap((target) => ["--protect", target]),
+      ...defers.flatMap((pair) => ["--defer", pair]),
+      ...(watch.approveTimeoutMs ? ["--approve-timeout-ms", String(watch.approveTimeoutMs)] : []),
+      ...(watch.readonly ? ["--readonly"] : []), "--", ev.shell, "-c", marked.command]
+    ev.command = `exec ${args.map(shellQuote).join(" ")}`
+    // Prefer a fixed outer shell that interprets none of the deferred
+    // hooks: dash ignores BASH_*/SHELLOPTS/PROMPT_COMMAND and reads ENV only
+    // for interactive sessions. args already captured the original
+    // ev.shell, so the payload still runs under the configured shell.
+    if (existsSync("/bin/sh")) ev.shell = "/bin/sh"
+    return "workspace"
+  }
   if (marked.profile === "full") return "full"
   if (marked.profile === "rw" && (sandbox.allowSudo || marked.hostDirect === true)) {
     // Host-direct route (config allowSudo, or the `privilege` bypass
@@ -1130,7 +1372,30 @@ export function applySandboxCreateBefore(
     // Still go through the helper (it owns the routing) — a missing/broken
     // helper must surface as an execution failure, not a silent bare-shell
     // fallback.
-    wrapShellForSandbox(ev, marked.profile, sandbox, undefined, marked.hostDirect)
+    wrapShellForSandbox(ev, marked.profile, sandbox, undefined, { hostDirect: true })
+    return marked.profile
+  }
+  if (marked.profile === "workspace") {
+    // The workspace profile never degrades: an unavailable probe would mean
+    // a bare spawn (worse than landlock-only, which is already refused), and
+    // extraArgs can shadow the floor — both are refused regardless of
+    // onUnavailable. Contract loss is a hard failure, not an availability
+    // choice.
+    const reason = !probe?.available
+      ? sandboxUnavailableMessage(probe?.reason ?? "probe did not run")
+      : probe.path === "landlock-only"
+        ? blockedText("the available OS sandbox backend cannot enforce this session's sandbox profile")
+        : sandbox.extraArgs.length > 0
+          ? blockedText("the configured extra sandbox options are not supported for this session's sandbox profile")
+          : undefined
+    if (reason !== undefined) {
+      ev.command = sandboxDenyCommand(reason)
+      return marked.profile
+    }
+    wrapShellForSandbox(ev, marked.profile, sandbox, undefined, {
+      writeRoots: marked.writeRoots,
+      network: marked.network,
+    })
     return marked.profile
   }
   if (!probe?.available) {
@@ -1142,7 +1407,11 @@ export function applySandboxCreateBefore(
     // degrade (or no probe at all): leave the spawn untouched.
     return marked.profile
   }
-  wrapShellForSandbox(ev, marked.profile, sandbox)
+  wrapShellForSandbox(ev, marked.profile, sandbox, undefined, {
+    hostDirect: marked.hostDirect,
+    writeRoots: marked.writeRoots,
+    network: marked.network,
+  })
   return marked.profile
 }
 
@@ -1208,14 +1477,12 @@ export async function probeLinuxSandbox(
 
 // --- availability gate / fail modes -----------------------------------------
 
-/** §4.3 deny message. Reason contains no secrets (probe fields only). The
- * remedy is user-side: the agent must not install bubblewrap or relax the
- * sandbox configuration itself, so the message names the user explicitly. */
-export function sandboxUnavailableMessage(reason: string): string {
-  return (
-    `OS sandbox unavailable (${reason}). Refusing shell execution. ` +
-    `Report this to the user: only the user may install bubblewrap or set sandbox.onUnavailable:'degrade' ` +
-    `to accept classifier-only risk; do not work around it with other commands.`
+/** A pre-execution setup failure, not a judgment about the operation. Probe
+ * details belong in service diagnostics, not permission-elevation advice. */
+export function sandboxUnavailableMessage(_reason: string): string {
+  return blockedText(
+    "this [Read only] session requires the OS sandbox for shell commands, but the sandbox is not available",
+    "Native file read tools still work.",
   )
 }
 
@@ -1228,7 +1495,12 @@ export function sandboxUnavailableMessage(reason: string): string {
  * unrunnable, so the gate reports "ok". The kernel isolation the probe
  * measures is intentionally absent on that route (allowSudo is the explicit
  * opt-out); the classifier still gates the command. RO stays fail-close
- * regardless of allowSudo. */
+ * regardless of allowSudo.
+ *
+ * The workspace profile never degrades: it must not run on `landlock-only`
+ * (no mounts → deny lists, WSL masking, and write-root binds silently
+ * vanish), and an unavailable probe must not become a bare spawn either —
+ * both are contract loss, refused regardless of `onUnavailable`. */
 export function assertSandboxAvailable(
   profile: SandboxProfile,
   probe: SandboxProbeResult | undefined,
@@ -1237,6 +1509,14 @@ export function assertSandboxAvailable(
 ): "ok" | "degraded" {
   if (profile === "full") return "ok"
   if (profile === "rw" && allowSudo) return "ok"
+  if (profile === "workspace") {
+    if (probe?.available && probe.path !== "landlock-only") return "ok"
+    throw new Error(
+      probe?.available
+        ? blockedText("the requested OS sandbox profile cannot be enforced by the available backend")
+        : sandboxUnavailableMessage(probe?.reason ?? "probe did not run"),
+    )
+  }
   if (probe?.available) return "ok"
   if (onUnavailable === "degrade") return "degraded"
   throw new Error(sandboxUnavailableMessage(probe?.reason ?? "probe did not run"))

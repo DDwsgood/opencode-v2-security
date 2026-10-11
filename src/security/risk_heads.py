@@ -2,11 +2,11 @@
 
 Ported from the offline category-taxonomy experiments (the frozen C4-best
 ``c5-heads-floor`` head set plus the reviewed ``network_access_publication``
-extension and a ``control_domain`` diagnostic). Both systemone reviewers
-(``jev-reviewer.py`` for P0 command review and ``jev-escalation-reviewer.py``
-for P1 escalation review) import this module so the footprint layer — which
-risk categories are *present* — is computed by one deterministic projection
-from the model's verbatim choices, never from weak noul thresholds.
+extension and a ``control_domain`` diagnostic). The systemone reviewer
+(``jev-reviewer.py`` for P0 command review) imports this module so the
+footprint layer — which risk categories are *present* — is computed by one
+deterministic projection from the model's verbatim choices, never from weak
+noul thresholds.
 
 Semantics (C4 owner classes -> canonical legacy category names):
   cat_data          local -> filesystem, remote -> remote, both -> both

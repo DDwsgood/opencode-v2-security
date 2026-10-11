@@ -1,4 +1,4 @@
-/** Canonical bypass categories shared by /bypass, escalation, classifiers,
+/** Canonical bypass categories shared by /bypass, classifiers,
  * and both LLM reviewers. Keep this file dependency-free so config.ts and the
  * reviewer can both import it without a cycle. */
 export const STATIC_BYPASS_CATEGORIES = [

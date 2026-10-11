@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
 import type { Dirent } from "node:fs"
-import { lstat, opendir, readFile, readdir, realpath, stat } from "node:fs/promises"
+import { lstat, opendir, realpath, stat } from "node:fs/promises"
+import { inspectDirectory, inspectRegularTextFile, isMissingPathError } from "./inspection"
 import path from "node:path"
 import { STATIC_BYPASS_CATEGORIES, type BypassCategory } from "../categories"
 import { ruleBypassed } from "./bypass"
@@ -92,7 +93,30 @@ export type StaticSecurityDecision = {
   reviewContext?: StaticReviewContext
 }
 
-export type Strictness = "LOOSE" | "HARD"
+/** Two-state boundary verdict: the static layer only ALLOWs proven-safe
+ * commands and otherwise ASKs for the unified dynamic review. Denials of the
+ * old classifier arrive here as ASK with their rules intact. `originalVerdict`
+ * is diagnostic only: consumers must not refuse on it. */
+export type BoundarySecurityDecision = {
+  verdict: "ALLOW" | "ASK"
+  rules: string[]
+  reason: string
+  fingerprints: ScriptFingerprint[]
+  reviewContext?: StaticReviewContext
+  originalVerdict?: SecurityVerdict
+  source?: "static"
+}
+
+export type Strictness = "LOOSE"
+
+/** The old "HARD" strictness policy no longer exists. A caller that still
+ *  passes it (or any non-LOOSE value) gets an explicit error instead of
+ *  silently running the LOOSE pipeline. */
+function assertSupportedStrictness(strictness: Strictness | undefined): void {
+  if (strictness !== undefined && strictness !== "LOOSE") {
+    throw new Error(`Unsupported strictness: ${String(strictness)}`)
+  }
+}
 
 export type ClassifyShellCommandInput = {
   script: string
@@ -115,7 +139,7 @@ export type ClassifyShellCommandInput = {
    *  the resolved profile is "ro", the helper probe reports a usable route,
    *  and the sandbox/`all` bypasses are not armed. Under LOOSE it lets the RO
    *  gate pass write/mutator/unproven shapes through (the kernel denies the
-   *  syscalls); HARD always keeps the static gates. */
+   *  syscalls). */
   roKernelEnforced?: boolean
   /** Scratch hierarchies the kernel leaves writable under the RO profile —
    *  the plugin's resolved sandbox.scratch (default /tmp). RO static denies
@@ -138,6 +162,9 @@ export type ClassifyShellCommandInput = {
 }
 
 type InternalClassifyInput = ClassifyShellCommandInput & {
+  /** Two-state boundary mode (classifyBoundaryCommand): static DENY signals
+   * are recorded and returned as ASK with their rules and facts intact. */
+  boundary?: boolean
   /** The effective working directory of this segment is not statically known. */
   cwdUnknown?: boolean
   /** The segment's base directory was established by a `cd` whose success is
@@ -157,8 +184,6 @@ const MAX_REFERENCED_PATHS = 32
 const MAX_DIRECTORY_ENTRIES = 200
 const MAX_DIRECTORY_ENTRY_NAME_CHARS = 512
 const MIN_BACKUP_AGE_MS = 2 * 60 * 1000
-const PERMANENT_DELETE_GUIDANCE =
-  "Permanent deletion is irreversible and can destroy data that cannot be recovered"
 
 type Rule = {
   id: string
@@ -286,7 +311,13 @@ async function canonicalProjectedPath(candidate: string) {
     try {
       const canonical = await realpath(current)
       return suffix.length === 0 ? canonical : path.join(canonical, ...suffix.reverse())
-    } catch {
+    } catch (error) {
+      if (!isMissingPathError(error)) return undefined
+      try {
+        if ((await lstat(current)).isSymbolicLink()) return undefined
+      } catch (failure) {
+        if (!isMissingPathError(failure)) return undefined
+      }
       const parent = path.dirname(current)
       if (parent === current) return undefined
       suffix.push(path.basename(current))
@@ -1966,7 +1997,6 @@ function tarOrUnzipBaseWorktree(segment: string, cwd: string, worktree: string):
 function classifyTarExtractOrUnzip(
   segment: string,
   ctx: PathContext,
-  strictness: "LOOSE" | "HARD",
   isUnzip: boolean,
 ): SegmentDecision | undefined {
   const isExtract = isUnzip ? /^unzip\b/i.test(segment) : /^tar\b/i.test(segment)
@@ -1976,13 +2006,6 @@ function classifyTarExtractOrUnzip(
   // command) leave the archive surface for the normal review path.
   if (!isUnzip && /--to-command|--checkpoint-action|--use-compress-program|--info-script|--new-volume-script|\s-[A-Za-z]*[IF](?:\s|$)/.test(segment)) return undefined
   if (!tarOrUnzipBaseWorktree(segment, ctx.cwd, ctx.worktree)) {
-    if (strictness === "HARD") {
-      return {
-        verdict: "DENY",
-        rules: ["filesystem.tar-extract-system"],
-        reason: "Extracting an archive into a non-worktree location is blocked by filesystem policy because it can write outside the tracked worktree",
-      }
-    }
     return {
       verdict: "ASK",
       rules: ["filesystem.tar-extract-system"],
@@ -2105,8 +2128,12 @@ function isSafeSubstitutionSurface(text: string, shell: string, ctx: PathContext
   // Substitution output is unknown: do not feed it to a file-reading command.
   if (subs.length && !/^(?:echo|printf|ls)\b/.test(masked.trim())) return false
   const pieces = splitSimpleSegments(stripped, shell)
+  // `stat` joins the substitution leaf set: it prints file metadata only, its
+  // operands go through the same analyzeSegmentPaths check as every other
+  // piece, and it is already on the RO resolver list. Content readers like
+  // `cat`, env dumpers (env/printenv), and executors are deliberately absent.
   if (!pieces?.length || pieces.some((piece) =>
-    !/^(?:echo|printf|pwd|date|uname|hostname|whoami|ls|head|tail|wc|grep|rg|basename|dirname)\b/.test(piece.trim()) ||
+    !/^(?:echo|printf|pwd|date|uname|hostname|whoami|ls|head|tail|wc|grep|rg|basename|dirname|stat)\b/.test(piece.trim()) ||
     !isKnownSafeSegment(piece) || analyzeSegmentPaths(piece, ctx).kind !== "pass"
   )) return false
   if (hasUnquotedExpansion(maskHeredocDataBodies(stripped, shell), shell)) return false
@@ -2223,17 +2250,7 @@ async function isDisposableCleanupTarget(target: string, cwd: string, worktree: 
   return false
 }
 
-async function isDisposableDirectoryDelete(script: string, cwd: string, worktree: string): Promise<boolean> {
-  const value = stripLeadingDirectoryChanges(script).replace(/\s+/g, " ").trim()
-  const deletion = parseRecursiveForceDeletion(value)
-  if (!deletion) return false
-  for (const t of deletion.targets) {
-    if (!(await isDisposableCleanupTarget(t, cwd, worktree))) return false
-  }
-  return true
-}
-
-function classifySafeChmod(segment: string, ctx: PathContext, strictness: "LOOSE" | "HARD"): SegmentDecision | undefined {
+function classifySafeChmod(segment: string, ctx: PathContext): SegmentDecision | undefined {
   const tokens = simpleInvocationTokens(segment.trim())
   if (commandLeaf(tokens[0] ?? "") !== "chmod") return undefined
   if (safeChmodSegment(segment, ctx.cwd, ctx.worktree)) {
@@ -2524,12 +2541,11 @@ const DEFINITE_DESTRUCTIVE_RULES = new Set([
 ])
 
 /**
- * Rules that DENY in HARD mode and downgrade to an ASK review signal in LOOSE.
- * Mirrors the plan: destructive operations the HARD (injected-agent) model must
- * never auto-run, but good-faith LOOSE work may still be reviewed by the
- * dynamic layer (e.g. official installers).
+ * Destructive operations that are never statically denied but always surface
+ * as an ASK review signal for the dynamic layer (e.g. official installers are
+ * still download-and-execute).
  */
-const HARD_DENY_LOOSE_ASK_RULES: { id: string; reason: string; test: (text: string) => boolean }[] = [
+const ASK_REVIEW_RULES: { id: string; reason: string; test: (text: string) => boolean }[] = [
   {
     id: "execution.remote-pipe",
     reason: "Downloads remote content and immediately executes it",
@@ -3064,7 +3080,13 @@ async function canonicalExistingAnchor(candidate: string) {
   for (let index = 0; index < 64; index += 1) {
     try {
       return await realpath(current)
-    } catch {
+    } catch (error) {
+      if (!isMissingPathError(error)) return undefined
+      try {
+        if ((await lstat(current)).isSymbolicLink()) return undefined
+      } catch (failure) {
+        if (!isMissingPathError(failure)) return undefined
+      }
       const parent = path.dirname(current)
       if (parent === current) return undefined
       current = parent
@@ -3272,7 +3294,6 @@ async function classifyTempConfinedSegment(
   const finding = analyzeSegmentPaths(segment, {
     cwd: base,
     worktree: input.worktree,
-    strictness: input.strictness ?? "LOOSE",
   })
   if (finding.kind !== "pass") {
     // Confined targets make the outside-write/extract asks moot; a deny or a
@@ -3302,10 +3323,9 @@ async function classifyTempConfinedSegment(
 /**
  * Fix C — every forced-recursive delete invocation across the segment's
  * executable surfaces has all of its targets confined to a trusted temp root.
- * Used to exempt `hard.forced-recursive-delete` (and the definite
- * `filesystem.forced-recursive-delete` signal) only when confinement is
- * proven; the absolute floors (`rm -rf /`, system roots, root globs) never
- * reach this check.
+ * Used to exempt the definite `filesystem.forced-recursive-delete` signal
+ * only when confinement is proven; the absolute floors (`rm -rf /`, system
+ * roots, root globs) never reach this check.
  */
 async function forcedDeletesConfinedToTemp(
   surfaces: string[],
@@ -3412,14 +3432,6 @@ async function classifyUserLocalTempSegment(
         if (!(await isTrustedTempPath(target, base, roots))) return undefined
       }
       operations += 1
-      if (input.strictness === "HARD") {
-        return {
-          verdict: "DENY",
-          rules: ["hard.local-temp-delete"],
-          reason: `Permanent deletion inside the trusted Local Temp directory is blocked by filesystem policy. ${PERMANENT_DELETE_GUIDANCE}`,
-          fingerprints: [],
-        }
-      }
       continue
     }
 
@@ -3450,7 +3462,6 @@ async function classifyUserLocalTempSegment(
   }
 
   if (operations === 0) return undefined
-  if (input.strictness === "HARD") return undefined
   if (unverifiedBases.length > 0 && !(await unverifiedBasesAllInTemp(unverifiedBases, input))) {
     const ask = tempContextDeleteAsk()
     return {
@@ -3616,14 +3627,6 @@ async function classifyNamedTempDeletionPolicy(
     }
 
     if (pureDeletion && hasNamedTempTarget) {
-      if (input.strictness === "HARD") {
-        return {
-          verdict: "DENY",
-          rules: ["hard.named-temp-delete"],
-          reason: `Permanent deletion of named temp/tmp targets is blocked by filesystem policy. ${PERMANENT_DELETE_GUIDANCE}`,
-          fingerprints: [],
-        }
-      }
       if (unverifiedBases.length > 0 && !(await unverifiedBasesAllInTemp(unverifiedBases, input))) {
         const ask = tempContextDeleteAsk()
         return { verdict: ask.verdict, rules: ask.rules, reason: ask.reason, fingerprints: [] }
@@ -3690,8 +3693,6 @@ async function inspectBackupDeletionTarget(
   if (isCriticalBackupTarget(literal) || (obvious && isCriticalOriginalPath(obvious.stem))) {
     return { allowed: false, reason: "Critical credential backups cannot be deleted" }
   }
-  const loose = (input.strictness ?? "LOOSE") !== "HARD"
-
   const expanded = expandHome(literal)
   const absolute = path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(input.cwd, expanded)
   if (!isWithin(input.worktree, absolute)) {
@@ -3705,7 +3706,9 @@ async function inspectBackupDeletionTarget(
   try {
     canonicalWorktree = await realpath(input.worktree)
     canonicalParent = await realpath(parent)
-    entries = await readdir(canonicalParent, { withFileTypes: true })
+    const listing = await inspectDirectory(canonicalParent, 1024)
+    if (!listing || listing.truncated) return { allowed: false, reason: "Backup directory inspection is unavailable or exceeds its entry bound" }
+    entries = listing.entries
   } catch {
     return { allowed: false, reason: "Backup directory metadata is unavailable" }
   }
@@ -3717,10 +3720,10 @@ async function inspectBackupDeletionTarget(
   const exactBackup = entries.find((entry) => entry.name === targetName)
   if (!exactBackup) return { allowed: false, reason: "Backup target does not exist with an exact name" }
 
-  // LOOSE relaxation: an obvious backup name plus a similarly named sibling in
-  // the same directory (the original or another dated copy) is deletable
-  // without the exact-original, kind, and age verification below.
-  if (loose && obvious && hasSimilarBackupSibling(entries, targetName)) {
+  // An obvious backup name plus a similarly named sibling in the same
+  // directory (the original or another dated copy) is deletable without the
+  // exact-original, kind, and age verification below.
+  if (obvious && hasSimilarBackupSibling(entries, targetName)) {
     return { allowed: true, reason: "Obvious backup with a similarly named sibling", sibling: true }
   }
 
@@ -3818,7 +3821,7 @@ async function classifyBackupPolicy(
   const copyTarget = copy && literalPathToken(copy.target)
   if (copyTarget && backupPathIdentity(copyTarget)) {
     const copySource = copy && literalPathToken(copy.source)
-    const ctx: PathContext = { cwd: input.cwd, worktree: input.worktree, strictness: input.strictness ?? "LOOSE" }
+    const ctx: PathContext = { cwd: input.cwd, worktree: input.worktree }
     const targetResolved = resolveLexical(copyTarget, input.cwd, expandHome("~"))
     const absolute = targetResolved.absolute
     const inWorktree = absolute !== undefined && isWithinLexical(input.worktree, absolute)
@@ -3839,17 +3842,14 @@ async function classifyBackupPolicy(
 
   const deletion = parseDeleteInvocation(segment)
   if (!deletion) return undefined
-  const loose = (input.strictness ?? "LOOSE") !== "HARD"
   const identityBackupTargets = deletion.targets.filter((target) => {
     const literal = literalPathToken(target)
     return Boolean(literal && backupPathIdentity(literal))
   })
-  const obviousBackupTargets = loose
-    ? deletion.targets.filter((target) => {
-        const literal = literalPathToken(target)
-        return Boolean(literal && !backupPathIdentity(literal) && obviousBackupIdentity(literal))
-      })
-    : []
+  const obviousBackupTargets = deletion.targets.filter((target) => {
+    const literal = literalPathToken(target)
+    return Boolean(literal && !backupPathIdentity(literal) && obviousBackupIdentity(literal))
+  })
   if (identityBackupTargets.length === 0 && obviousBackupTargets.length === 0) {
     if (!deletion.parseable && BACKUP_SUFFIX_REFERENCE.test(segment)) {
       return {
@@ -3897,14 +3897,6 @@ async function classifyBackupPolicy(
     if (inspected.sibling) siblingVerified = true
   }
   if (!verifiedAny) return undefined
-  if (input.strictness === "HARD") {
-    return {
-      verdict: "DENY",
-      rules: ["hard.backup-delete"],
-      reason: `Permanent deletion of backup targets is blocked by filesystem policy. ${PERMANENT_DELETE_GUIDANCE}`,
-      fingerprints: [],
-    }
-  }
   return {
     verdict: "ALLOW",
     rules: ["filesystem.backup-delete"],
@@ -5956,16 +5948,6 @@ function hasGeneralDataDestruction(text: string) {
   return GENERAL_DATA_EXTENSION.test(text) || hasDataPathDestruction(text)
 }
 
-function isCriticalDeletionTarget(target: string) {
-  const literal = literalPathToken(target)
-  return Boolean(literal && isCriticalOriginalPath(literal))
-}
-
-function isGeneralDataTarget(target: string) {
-  const literal = literalPathToken(target)
-  return Boolean(literal && GENERAL_DATA_EXTENSION.test(literal))
-}
-
 function hasDataDestruction(text: string) {
   if (!hasDeletePrimitive(text)) return false
   if (DATA_EXTENSION.test(text)) return true
@@ -6230,7 +6212,9 @@ async function inspectTargetDirectory(candidate: string, cwd: string, worktree: 
   if (!info.isDirectory()) return {}
 
   try {
-    const all = await readdir(canonical, { withFileTypes: true })
+    const listing = await inspectDirectory(canonical, MAX_DIRECTORY_ENTRIES)
+    if (!listing) return { uninspected: candidate }
+    const all = listing.entries
     all.sort((left, right) => left.name.localeCompare(right.name))
     const entries = all.slice(0, MAX_DIRECTORY_ENTRIES).map((entry) => ({
       name: entry.name.slice(0, MAX_DIRECTORY_ENTRY_NAME_CHARS),
@@ -6240,7 +6224,7 @@ async function inspectTargetDirectory(candidate: string, cwd: string, worktree: 
       context: {
         path: path.relative(worktree, canonical).replaceAll("\\", "/") || ".",
         entries,
-        truncated: all.length > entries.length,
+        truncated: listing.truncated,
       } satisfies TargetDirectoryReviewContext,
     }
   } catch {
@@ -6324,14 +6308,13 @@ async function fingerprintLocalScript(candidate: string, cwd: string, worktree: 
   }
   if (!isWithin(worktree, canonical)) {
     if (!outsideWorktree) return undefined
-    const ctx: PathContext = { cwd, worktree, strictness: "LOOSE" }
+    const ctx: PathContext = { cwd, worktree }
     if (checkPathSensitivity(canonical, ctx).sensitive || classifyPathTarget(canonical, "read", ctx).kind !== "pass") return undefined
   }
 
-  const info = await stat(canonical)
-  if (!info.isFile() || info.size > MAX_LOCAL_SCRIPT_BYTES) return undefined
-  const content = await readFile(canonical)
-  if (content.includes(0)) return undefined
+  const inspected = await inspectRegularTextFile(canonical, MAX_LOCAL_SCRIPT_BYTES)
+  if (!inspected.ok) return undefined
+  const { info, content, text } = inspected
 
   let linkPath: string | undefined
   let linkDev: number | undefined
@@ -6352,7 +6335,7 @@ async function fingerprintLocalScript(candidate: string, cwd: string, worktree: 
   }
 
   return {
-    content: content.toString("utf8"),
+    content: text,
     reviewPath: path.relative(worktree, canonical).replaceAll("\\", "/") || path.basename(canonical),
     fingerprint: {
       path: canonical,
@@ -6403,7 +6386,9 @@ async function inspectPythonLocalImports(
   const dir = path.dirname(scriptPath)
   let entries: string[]
   try {
-    entries = await readdir(dir)
+    const listing = await inspectDirectory(dir, 1024)
+    if (!listing || listing.truncated) return undefined
+    entries = listing.entries.map((entry) => entry.name)
   } catch {
     return undefined
   }
@@ -6443,7 +6428,7 @@ async function localPythonScriptProven(
   scanView: string,
   input: InternalClassifyInput,
 ): Promise<boolean> {
-  if (!/\.py$/i.test(candidate) || input.cwdUnknown || (input.strictness ?? "LOOSE") !== "LOOSE") return false
+  if (!/\.py$/i.test(candidate) || input.cwdUnknown) return false
   if (input.permScope && !input.permScope.w) return false
   if (PYTHON_HOOK_ENV.test(scanView)) return false
   const segments = splitSimpleSegments(scanView, input.shell)
@@ -6459,7 +6444,7 @@ async function localPythonScriptProven(
   if (runs === 0) return false
   const proof = await provePythonReadOnly(inspected.content, [path.dirname(inspected.fingerprint.path)])
   if (!proof.ok) return false
-  return provenPathsReadable(proof.paths, { cwd: input.cwd, worktree: input.worktree, strictness: input.strictness ?? "LOOSE" })
+  return provenPathsReadable(proof.paths, { cwd: input.cwd, worktree: input.worktree })
 }
 
 export async function verifyScriptFingerprints(fingerprints: ScriptFingerprint[]) {
@@ -6487,15 +6472,10 @@ export async function verifyScriptFingerprints(fingerprints: ScriptFingerprint[]
       }
       if (canonical !== fingerprint.path) return false
     }
-    let info
-    let content
-    try {
-      info = await stat(fingerprint.path)
-      content = await readFile(fingerprint.path)
-    } catch {
-      return false
-    }
-    if (!info.isFile() || info.size !== fingerprint.size || info.mtimeMs !== fingerprint.mtimeMs) return false
+    const inspected = await inspectRegularTextFile(fingerprint.path, MAX_LOCAL_SCRIPT_BYTES)
+    if (!inspected.ok) return false
+    const { info, content } = inspected
+    if (info.size !== fingerprint.size || info.mtimeMs !== fingerprint.mtimeMs) return false
     if (createHash("sha256").update(content).digest("hex") !== fingerprint.sha256) return false
   }
   return true
@@ -6539,164 +6519,12 @@ function combineSegmentDecisions(results: SegmentDecision[]): SegmentDecision {
   }
 }
 
-async function classifyHardDeletionPolicy(
-  segment: string,
-  input: InternalClassifyInput,
-): Promise<StaticSecurityDecision | undefined> {
-  const ruleSurface = dataLiteralView(segment) ?? segment
-  const surfaces = [
-    ruleSurface,
-    ...extractDecodedPayloads(ruleSurface, { executedOnly: true }),
-    ...ruleScanWrappers(ruleSurface),
-  ]
-  // Heredoc bodies are masked consumer-aware: proven-inert bodies never reach
-  // the forced-delete scan, while unquoted bodies (which expand `$()`/`…`
-  // before the consumer reads them) stay visible. Language `-c`/`-e` payloads
-  // reduce to their execution-sink view (payloadRuleView) — string literals
-  // inside them are data, not commands.
-  const combined = surfaces
-    .flatMap((surface) => {
-      const view = payloadRuleView(surface, input.shell)
-      return [...view.segments, ...view.sinks]
-    })
-    .map((surface) => maskHeredocDataBodies(surface, input.shell))
-    .join("\n\n")
-  const bypassed = input.bypassedCategories
-
-  // HARD-mode exemption for clearing recognized disposable directories inside
-  // the working tree (node_modules, dist, .venv, .next, out, ... §4.9).
-  if (
-    input.cwd !== undefined &&
-    input.worktree !== undefined &&
-    await isDisposableDirectoryDelete(segment, input.cwd, input.worktree)
-  ) {
-    // The exemption may not ride a `cd` claim that is not guaranteed (`;` /
-    // `||` chains): only a canonically temp-confined base qualifies.
-    if (input.baseUnverified === true && !(await baseInsideTempRoot(input.cwd, input))) {
-      return {
-        verdict: "ASK",
-        rules: ["filesystem.temp-context-delete"],
-        reason:
-          "Deletion runs after a `cd` that is not guaranteed to have taken effect, and the claimed base is not a verified temp directory",
-        fingerprints: [],
-      }
-    }
-    return {
-      verdict: "ALLOW",
-      rules: ["cleanup.disposable"],
-      reason: "Forced deletion is limited to a recognized disposable directory inside the working tree",
-      fingerprints: [],
-    }
-  }
-
-  // An echo/printf of a delete-looking string is documentation, not deletion.
-  // Trust that only for a bare output command with no extra decoded or wrapped
-  // surfaces and no command substitution.
-  const inertOutput =
-    surfaces.length === 1 &&
-    commandSubstitutionBodies(segment).length === 0 &&
-    /^(?:echo|printf|write-output|write-host)\b/i.test(stripHarmlessPrefixes(segment).trim())
-
-  if (hasForcedRecursiveDelete(combined) && !inertOutput && !ruleBypassed("hard.forced-recursive-delete", bypassed)) {
-    // Path-aware floor (fix C): the textual `rm -rf` shape still denies, unless
-    // every forced delete target across the surfaces is proven — against the
-    // tracked cd/runtime-workdir base — to land inside a trusted temp root.
-    // Absolute floors (`rm -rf /`, system roots, root globs) stay unconditional.
-    if (!(await forcedDeletesConfinedToTemp(surfaces, input))) {
-      return {
-        verdict: "DENY",
-        rules: ["hard.forced-recursive-delete"],
-        reason: "Forced recursive deletion is blocked by filesystem policy because it can destroy an entire directory tree at once",
-        fingerprints: [],
-      }
-    }
-  }
-
-  const roots = await trustedUserLocalTempRoots(input)
-  for (const surface of surfaces) {
-    const wrappedPowerShell = unwrapPowerShellCommand(surface)
-    const payload = wrappedPowerShell ?? surface
-    const payloadShell = wrappedPowerShell ? "powershell" : input.shell
-    const segments = splitCommandSegments(payload, payloadShell)
-    if (!segments) continue
-
-    let stable: SegmentBase = { dir: path.resolve(input.cwd), unverified: input.baseUnverified === true }
-    let cond: SegmentBase = stable
-    for (const item of segments) {
-      ;({ stable, cond } = advanceSegmentBase(item, stable, cond, input.cwd))
-      const seg = item.text
-      const cd = parseCdSegment(seg)
-      if (cd) {
-        if (item.incoming !== "|" && item.incoming !== "&") {
-          const resolvedDir = resolveCdBase(cd.dir, cond.dir)
-          cond = { dir: resolvedDir, unverified: cond.unverified }
-          if (item.incoming === undefined || item.incoming === ";" || item.incoming === "newline") stable = cond
-        }
-        continue
-      }
-      const base = cond.dir
-
-      const deletion = parseDeleteInvocation(seg)
-      if (!deletion?.parseable || deletion.targets.length === 0) continue
-
-      for (const target of deletion.targets) {
-        const cleaned = stripMatchingQuotes(target)
-        const pathFinding = classifyPathTarget(cleaned, "delete", {
-          cwd: base ?? input.cwd,
-          worktree: input.worktree,
-          strictness: "HARD",
-        })
-        if (pathFinding.kind === "deny" && !ruleBypassed(pathFinding.rule, bypassed)) {
-          return {
-            verdict: "DENY",
-            rules: [pathFinding.rule],
-            reason: pathFinding.reason,
-            fingerprints: [],
-          }
-        }
-        if (hasNamedTempPathSegment(cleaned) && !ruleBypassed("hard.temp-target-delete", bypassed)) {
-          return {
-            verdict: "DENY",
-            rules: ["hard.temp-target-delete"],
-            reason: `Permanent deletion of temp/tmp targets is blocked by filesystem policy. ${PERMANENT_DELETE_GUIDANCE}`,
-            fingerprints: [],
-          }
-        }
-        const literal = literalPathToken(target)
-        if (literal && backupPathIdentity(literal) && !ruleBypassed("hard.backup-target-delete", bypassed)) {
-          return {
-            verdict: "DENY",
-            rules: ["hard.backup-target-delete"],
-            reason: `Permanent deletion of backup targets is blocked by filesystem policy. ${PERMANENT_DELETE_GUIDANCE}`,
-            fingerprints: [],
-          }
-        }
-        if (
-          base &&
-          roots.length > 0 &&
-          (await isTrustedTempPath(target, base, roots)) &&
-          !ruleBypassed("hard.local-temp-delete", bypassed)
-        ) {
-          return {
-            verdict: "DENY",
-            rules: ["hard.local-temp-delete"],
-            reason: `Permanent deletion inside the trusted Local Temp directory is blocked by filesystem policy. ${PERMANENT_DELETE_GUIDANCE}`,
-            fingerprints: [],
-          }
-        }
-      }
-    }
-  }
-  return undefined
-}
-
 async function recycleTargetsFinding(
   targets: string[],
   base: string,
   input: ClassifyShellCommandInput,
-  strictness: Strictness,
 ): Promise<SegmentDecision | undefined> {
-  const ctx: PathContext = { cwd: base, worktree: input.worktree, strictness }
+  const ctx: PathContext = { cwd: base, worktree: input.worktree }
   const home = expandHome("~")
   const tempRoots = await trustedUserLocalTempRoots(input)
   for (const target of targets) {
@@ -7089,7 +6917,7 @@ async function provenHeredocProgram(
   // A timeout wrapper bounds the run; it changes nothing the body can do.
   const argv = fullArgv.slice(timeoutPrefixLength(fullArgv))
   if (argv.length === 0) return undefined
-  const ctx: PathContext = { cwd: base, worktree: input.worktree, strictness: input.strictness ?? "LOOSE" }
+  const ctx: PathContext = { cwd: base, worktree: input.worktree }
   let rule: string
   let reason: string
   if (consumer === "lang") {
@@ -7119,26 +6947,25 @@ async function classifyHeredocSegment(
 ): Promise<SegmentDecision | undefined> {
   const heredocs = parseHeredocs(segment)
   if (heredocs.length === 0) return undefined
-  const strictness: Strictness = input.strictness ?? "LOOSE"
   const bypassed = input.bypassedCategories
-  const m3ctx: PathContext = { cwd: base, worktree: input.worktree, strictness }
+  const m3ctx: PathContext = { cwd: base, worktree: input.worktree }
   const residual = heredocResidualText(segment, heredocs)
   const consumers = heredocs.map(heredocConsumer)
   const hasCode = consumers.some((consumer) => consumer !== "data" && consumer !== "unknown")
   const hasUnknown = consumers.some((consumer) => consumer === "unknown")
 
   // Under a read-only session a code-consumer heredoc executes its body —
-  // deny the channel before the normal consumer review can defer to ASK.
-  // Kernel-enforced LOOSE passes it through after the non-write gate: the
-  // body's write syscalls are kernel-bound, while floors/credentials inside
-  // the body still gate. HARD and kernel-absent RO keep the static deny.
-  // Unknown consumers are equally unprovable under RO (they may execute the
-  // body) — deny instead of letting an ASK reach the dynamic reviewer.
+  // the channel cannot be proven read-only, so the launch gate keeps it under
+  // the runtime observer (ASK permission.exec-unproven) instead of letting a
+  // plain ASK reach the dynamic reviewer without observation.
+  // A kernel-enforced RO session passes it through after the non-write gate:
+  // the body's write syscalls are kernel-bound, while floors/credentials
+  // inside the body still gate.
   if ((hasCode || hasUnknown) && input.permScope && !input.permScope.w) {
-    if (input.roKernelEnforced && strictness !== "HARD") {
-      return (await roNonWriteGate(segment, base, input, strictness)) ?? kernelEnforcedAllow()
+    if (input.roKernelEnforced) {
+      return (await roNonWriteGate(segment, base, input)) ?? kernelEnforcedAllow()
     }
-    return readOnlyExecutionDeny()
+    return readOnlyExecutionAsk()
   }
 
   // An unknown consumer whose own output provably pipes into a KNOWN executor
@@ -7243,7 +7070,7 @@ async function classifyHeredocSegment(
   const decisions: SegmentDecision[] = []
   const bodyInput: InternalClassifyInput = { ...input, cwd: base, baseUnverified: input.baseUnverified }
 
-  if (strictness === "LOOSE" && heredocs.length === 1 && !input.cwdUnknown && !(input.permScope && !input.permScope.w)) {
+  if (heredocs.length === 1 && !input.cwdUnknown && !(input.permScope && !input.permScope.w)) {
     const proven = await provenHeredocProgram(segment, heredocs[0], consumers[0], residual, base, input)
     if (proven) {
       const residualDecision = await classifySegments(proven.residual, bodyInput, depth + 1)
@@ -7317,7 +7144,7 @@ async function classifyHeredocSegment(
     // `data` consumers need no body scan here. An `unknown` consumer is the
     // ambiguity case: static analysis cannot prove whether the body is stored
     // as payload text or executed, so instead of letting the raw body hit the
-    // floor scans as a hard DENY it defers to the dynamic reviewer (ASK).
+    // floor scans as a DENY it defers to the dynamic reviewer (ASK).
     // Provably-executed forms keep their DENYs: shells/interpreters are
     // classified recursively above, and `cat <<EOF | sh`-style pipelines keep
     // the body visible to the full-script floor view (heredocFlowsToCode).
@@ -7497,7 +7324,7 @@ async function expandSafeReadGlobs(segment: string, input: InternalClassifyInput
   if (!/^(?:grep|rg|cat|head|tail|wc|ls)\s/.test(segment)) return undefined
   if (/["'`$\\;|&<>(){}\[\]\n]/.test(segment)) return undefined
   const tokens = segment.trim().split(/\s+/)
-  const ctx: PathContext = { cwd: input.cwd, worktree: input.worktree, strictness: input.strictness ?? "LOOSE" }
+  const ctx: PathContext = { cwd: input.cwd, worktree: input.worktree }
   // Do not broaden command options (rg --pre can execute a program).
   const flags = /^(?:--|-[rnHhilcvswExq]+|-\d+|--line-number|--count|--files-with-matches)$/
   if (tokens.slice(1).some((token) => token.startsWith("-") && !flags.test(token))) return undefined
@@ -7547,9 +7374,7 @@ async function expandSafeReadGlobs(segment: string, input: InternalClassifyInput
 // unconditional permission.write DENYs — RO means no mutation anywhere,
 // including the Windows side. Spawn-class payloads (Start-Process, taskkill,
 // interactive shells, script files, wsl.exe, rundll32, …) and opaque payloads
-// (-EncodedCommand, unparseable statements) are ASK under LOOSE — the dynamic
-// reviewer adjudicates them with its read-only advisory — and static DENYs
-// under HARD.
+// (-EncodedCommand, unparseable statements) keep a static execution deny.
 
 type InteropClass = "read" | "write" | "spawn" | "opaque" | "ask"
 type InteropResult = {
@@ -8299,7 +8124,6 @@ function readOnlyInteropDecision(
   segment: string,
   roView: string,
   input: InternalClassifyInput,
-  strictness: Strictness,
 ): SegmentDecision | undefined {
   const invocation = executableInvocation(segment)
   if (invocation.unresolved) return undefined
@@ -8311,16 +8135,11 @@ function readOnlyInteropDecision(
     (leaf !== undefined && INTEROP_EXECUTABLE_NAMES.has(leaf))
   if (!isInterop) return undefined
 
-  // HARD: blanket interop deny — any Windows-side execution is unproven
-  // under the strictest mode, reads included. LOOSE keeps the payload
-  // ladder below.
-  if (strictness === "HARD") return readOnlyExecutionDeny()
-
   // Bash-level redirects outside the payload still write — `foo.exe > out`
   // is a write regardless of the exe's own semantics.
   if (hasFileWritePrimitive(roView)) return readOnlyWriteDeny()
 
-  const ctx: PathContext = { cwd: input.cwd, worktree: input.worktree, strictness }
+  const ctx: PathContext = { cwd: input.cwd, worktree: input.worktree }
   let result: InteropResult
   if (leaf === "pwsh" || leaf === "powershell") {
     result = interopPwshResult(invocation.args, ctx)
@@ -8378,12 +8197,10 @@ function readOnlyInteropDecision(
     case "spawn":
     case "opaque":
     default:
-      // C1: unproven interop is a static deny in BOTH modes — the reviewer
-      // is no longer load-bearing for interop kill decisions (fail_open
-      // used to admit this whole surface on any outage). Interop is also
-      // excluded from the kernel pass-through: Landlock cannot see
-      // Windows-side effects.
-      return readOnlyExecutionDeny()
+      // Unproven interop stays off the static allow path; under RO the
+      // launch gate admits it to the runtime observer, where the Windows
+      // exec fires an interop event the read-only review decides.
+      return readOnlyExecutionAsk()
   }
 }
 
@@ -9098,6 +8915,27 @@ function roInvocationKind(invocation: ExecutableInvocation, segment: string): "w
     case "xargs":
       return roXargsKind(args)
 
+    // Signalling or re-prioritizing a process is a state change the runtime
+    // observer cannot see (no boundary event), so under RO it must be a
+    // proven-write deny, not an unproven passthrough. `kill -l`/`-L` only
+    // list signal names and `kill -0 <pid>` probes existence without
+    // delivering a signal — those stay reads.
+    case "kill": {
+      const flags = args.map((a) => stripMatchingQuotes(a))
+      // `kill -l [sig]` only prints signal names; `kill -0 <pid>` probes
+      // existence without delivering a signal. A bare `kill <pid>` sends
+      // SIGTERM — a write.
+      if (flags.some((t) => t === "-l" || t === "-L" || t === "--list")) return "read"
+      if (flags.includes("-0") && flags.every((t) => t === "-0" || /^-?\d+$/.test(t))) return "read"
+      return "write"
+    }
+    case "pkill":
+    case "killall":
+    case "taskkill":
+    case "stop-process":
+    case "renice":
+      return "write"
+
     case "git":
       return roGitKind(args)
 
@@ -9400,6 +9238,12 @@ function roInvocationKind(invocation: ExecutableInvocation, segment: string): "w
 
     case "curl": {
       const writesToStdout = new Set(["-o", "--output", "-D", "--dump-header", "-c", "--cookie-jar", "--trace", "--trace-ascii"])
+      // -G applies to the whole invocation, regardless of flag order. It
+      // converts data to a query string, but never exempts uploads/forms or
+      // an explicitly mutating method.
+      const optionEnd = args.findIndex((argument) => stripMatchingQuotes(argument) === "--")
+      const options = optionEnd < 0 ? args : args.slice(0, optionEnd)
+      const getForced = options.some((argument) => ["-G", "--get"].includes(stripMatchingQuotes(argument)))
       for (let i = 0; i < args.length; i += 1) {
         const token = stripMatchingQuotes(args[i] ?? "")
         if (token === "--") break
@@ -9412,6 +9256,20 @@ function roInvocationKind(invocation: ExecutableInvocation, segment: string): "w
           return "write"
         }
         if (/^-[a-zA-Z]*[oODJcT][a-zA-Z]*$/.test(token)) return "write" // bundled -o/-O/-D/-J/-c/-T
+        if (/^--(?:form|form-string|upload-file)(?:=|$)/i.test(token) || /^-[FT]/.test(token)) {
+          return "write"
+        }
+        if (!getForced && (/^--(?:data|data-raw|data-ascii|data-binary|data-urlencode|json)(?:=|$)/i.test(token) || /^-d/.test(token))) {
+          return "write"
+        }
+        if (token === "-X" || token === "--request") {
+          const method = stripMatchingQuotes(args[i + 1] ?? "").toUpperCase()
+          if (!["GET", "HEAD", "OPTIONS"].includes(method)) return "write"
+          i += 1
+          continue
+        }
+        const inlineMethod = /^-X([a-z]+)$/i.exec(token) ?? /^--request=(.+)$/i.exec(token)
+        if (inlineMethod && !["GET", "HEAD", "OPTIONS"].includes(inlineMethod[1].toUpperCase())) return "write"
       }
       return undefined
     }
@@ -9624,15 +9482,15 @@ function roInvocationKind(invocation: ExecutableInvocation, segment: string): "w
 // (default /tmp — the agent's dedicated directory). Two consequences for the
 // RO static gate:
 //
-//  1. Scratch carve-out (ALL strictness levels, kernel present or not): a
-//     mutation whose targets are ENTIRELY confined to roWritableRoots is a
-//     scratch write, not an unauthorized write — ALLOW. Config denyWrite
-//     entries override the carve-out per path.
-//  2. Kernel pass-through (LOOSE only, roKernelEnforced): when the kernel
-//     will actually wrap this call, write-shape/mutator/unproven denials
-//     pass through as ALLOW — the kernel denies the real syscalls. A
-//     non-write gate still runs first (floors, credentials, network, sudo)
-//     because the kernel cannot see those. HARD never passes through.
+//  1. Scratch carve-out (kernel present or not): a mutation whose targets
+//     are ENTIRELY confined to roWritableRoots is a scratch write, not an
+//     unauthorized write — ALLOW. Config denyWrite entries override the
+//     carve-out per path.
+//  2. Kernel pass-through (roKernelEnforced): when the kernel will actually
+//     wrap this call, write-shape/mutator/unproven denials pass through as
+//     ALLOW — the kernel denies the real syscalls. A non-write gate still
+//     runs first (floors, credentials, network, sudo) because the kernel
+//     cannot see those.
 
 /** Write vocabularies whose targets are NOT enumerable: code-level file APIs
  *  inside interpreter payloads (`open(x,'w')`, `writeFileSync`, `.write_text`)
@@ -9751,13 +9609,18 @@ async function roPathWritable(
       (root) =>
         isStrictlyWithin(root, resolved.absolute) ||
         ((resolved.contentsOnly || isContainer) &&
+          path.resolve(root).toLowerCase() === path.resolve(resolved.absolute).toLowerCase()) ||
+        // File-valued roots (incidental history/cache files) exempt exactly
+        // the leaf they name — the observer's is_within grants the equal
+        // path regardless of the target's kind.
+        (!isContainer && !resolved.contentsOnly &&
           path.resolve(root).toLowerCase() === path.resolve(resolved.absolute).toLowerCase()),
     )
   if (!inside) return "outside"
   // Confinement must hold canonically too — a symlinked entry inside /tmp
   // pointing at /etc cannot launder an out-of-scratch write.
   const canonical = await canonicalProjectedPath(resolved.absolute)
-  if (canonical && !roots.some((root) => isWithin(root, canonical))) return "outside"
+  if (!canonical || !roots.some((root) => isWithin(root, canonical))) return "outside"
   // Config denyWrite freezes override the carve-out — judged on the canonical
   // projection so a symlinked scratch entry cannot launder a frozen path.
   if (denyWrite.length > 0) {
@@ -9919,8 +9782,7 @@ async function roScratchCarveOut(
     input.baseUnverified !== true ||
     (await (async () => {
       const canonical = await canonicalProjectedPath(base)
-      const probe = canonical ?? base
-      return roots.some((root) => isWithin(root, probe))
+      return canonical !== undefined && roots.some((root) => isWithin(root, canonical))
     })())
   if (!baseOk) return undefined
 
@@ -9975,10 +9837,9 @@ async function roNonWriteGate(
   segment: string,
   base: string,
   input: InternalClassifyInput,
-  strictness: Strictness,
 ): Promise<SegmentDecision | undefined> {
   const bypassed = input.bypassedCategories
-  const ctx: PathContext = { cwd: base, worktree: input.worktree, strictness }
+  const ctx: PathContext = { cwd: base, worktree: input.worktree }
   // Rule surfaces use the proven-data view (fix D); sensitive-path findings
   // below keep the raw surfaces so masking can never hide a credential path.
   const ruleSurface = dataLiteralView(segment) ?? segment
@@ -10012,10 +9873,7 @@ async function roNonWriteGate(
     return {
       verdict: "DENY",
       rules: ["data.critical-delete"],
-      reason:
-        strictness === "HARD"
-          ? `Attempts to delete credential or key material. ${PERMANENT_DELETE_GUIDANCE}`
-          : "Attempts to delete credential or key material",
+      reason: "Attempts to delete credential or key material",
     }
   }
   for (const surface of surfaces) {
@@ -10082,31 +9940,30 @@ function kernelEnforcedAllow(): SegmentDecision {
 }
 
 /** Whether an RO write/mutator/unproven denial can be lifted for this call:
- *  the scratch carve-out first (all modes), then the kernel pass-through
- *  (LOOSE + roKernelEnforced only). Returns the replacement decision, or
+ *  the scratch carve-out first, then the kernel pass-through
+ *  (roKernelEnforced only). Returns the replacement decision, or
  *  undefined when the caller's static deny stands. */
 async function roWriteGateBypass(
   segment: string,
   roView: string,
   base: string,
   input: InternalClassifyInput,
-  strictness: Strictness,
   kind: "write" | "unproven" | undefined,
 ): Promise<SegmentDecision | undefined> {
   const carved = await roScratchCarveOut(segment, roView, base, input, kind)
   if (carved?.decision) return carved.decision
   if (carved?.frozen) {
-    // A configured sandbox.denyWrite freeze overrides the scratch carve-out
-    // in every mode — including kernel-enforced (the freeze is a declared
-    // deny the kernel may not even see, e.g. mode auto/fail_open).
+    // A configured sandbox.denyWrite freeze overrides the scratch carve-out —
+    // including kernel-enforced (the freeze is a declared deny the kernel
+    // may not even see, e.g. mode auto/fail_open).
     return {
       verdict: "DENY",
-      rules: ["filesystem.deny-write"],
+      rules: ["permission.write", "filesystem.deny-write"],
       reason: "The write target is frozen by a configured sandbox.denyWrite entry",
     }
   }
-  if (!input.roKernelEnforced || strictness === "HARD") return undefined
-  return (await roNonWriteGate(segment, base, input, strictness)) ?? kernelEnforcedAllow()
+  if (!input.roKernelEnforced) return undefined
+  return (await roNonWriteGate(segment, base, input)) ?? kernelEnforcedAllow()
 }
 
 /** Read-path scan for a proven-read invocation under RO: every non-flag
@@ -10136,12 +9993,12 @@ function readOnlyReadFinding(args: string[], ctx: PathContext): PathFinding | un
 
 const READ_ONLY_AUTH_HINT =
   "use a proven read-only operation within this session's permission ceiling, or skip the step"
-const READ_ONLY_EXECUTION_DENY_REASON =
-  "Read-only session: this script, encoded payload, or interop operation exceeds the permitted execution boundary — " +
-  READ_ONLY_AUTH_HINT
-const READ_ONLY_UNPROVEN_DENY_REASON =
-  "Read-only session: the command cannot be proven free of filesystem side effects — the permission ceiling refuses it, " +
-  READ_ONLY_AUTH_HINT
+const READ_ONLY_EXECUTION_ASK_REASON =
+  "Read-only session: this script, encoded payload, or interop operation cannot be proven read-only statically — " +
+  "its effects are checked by the runtime boundary observer"
+const READ_ONLY_UNPROVEN_ASK_REASON =
+  "Read-only session: the command cannot be proven free of filesystem side effects statically — " +
+  "its effects are checked by the runtime boundary observer"
 
 function readOnlyWriteDeny(): SegmentDecision {
   return {
@@ -10152,8 +10009,13 @@ function readOnlyWriteDeny(): SegmentDecision {
   }
 }
 
-function readOnlyExecutionDeny(reason = READ_ONLY_EXECUTION_DENY_REASON): SegmentDecision {
-  return { verdict: "DENY", rules: ["permission.write"], reason }
+/** Not a denial: an execution surface the static layer cannot prove
+ *  read-only is admitted to the runtime observer, which reviews every
+ *  boundary crossing (write/read/network/interop/opaque) as it happens.
+ *  The distinct rule id lets the launch gate separate it from proven-write
+ *  `permission.write` denials without re-parsing the reason text. */
+function readOnlyExecutionAsk(reason = READ_ONLY_EXECUTION_ASK_REASON): SegmentDecision {
+  return { verdict: "ASK", rules: ["permission.exec-unproven"], reason }
 }
 
 /**
@@ -10269,10 +10131,9 @@ async function semanticSegmentAllow(
   segment: string,
   base: string,
   input: InternalClassifyInput,
-  strictness: Strictness,
 ): Promise<SemanticProof | undefined> {
   if (shellEscapeCharacter(input.shell) === "`") return undefined
-  const ctx: PathContext = { cwd: base, worktree: input.worktree, strictness }
+  const ctx: PathContext = { cwd: base, worktree: input.worktree }
   const trusted = trustedCommandProof(segment, ctx, input)
   if (trusted) return trusted
   if (hasDynamicShellExpansion(segment, input.shell)) return undefined
@@ -10293,7 +10154,6 @@ async function classifySegment(
   depth = 0,
 ): Promise<SegmentDecision> {
   const segInput: InternalClassifyInput = { ...input, script: segment, cwd: base }
-  const strictness: Strictness = input.strictness ?? "LOOSE"
   const bypassed = input.bypassedCategories
 
   // Session permission ceiling (r/w MVP): no `w` denies write/delete-shaped
@@ -10305,9 +10165,8 @@ async function classifySegment(
   // Under RO an executable-position interop spawn (.exe/.bat/.cmd/.ps1 or
   // wsl/wslpath/pwsh/powershell/cmd) is no longer blanket-denied: the payload
   // is classified by command semantics — proven reads allow, write shapes
-  // deny as permission.write, and spawn/opaque payloads review under LOOSE
-  // (the dynamic reviewer carries the RO advisory) while HARD keeps the
-  // static execution deny. This check is unconditional — bypass categories
+  // deny as permission.write, and spawn/opaque payloads keep the static
+  // execution deny. This check is unconditional — bypass categories
   // only relax rules, never permissions, so bypass:os/dynamic must not and
   // cannot relax it (any DENY wins).
   const permScope = input.permScope
@@ -10332,14 +10191,16 @@ async function classifySegment(
       // is otherwise an unproven interpreter — reaches the payload classifier
       // instead of an unconditional deny. Segments whose executable is not
       // interop fall through unchanged.
-      const interopDecision = readOnlyInteropDecision(roStripped, roView, input, strictness)
+      const interopDecision = readOnlyInteropDecision(roStripped, roView, input)
       if (interopDecision) return interopDecision
       // Invocation-aware mutation gate: recognized mutating commands (package
       // installs, builds, cleans, git worktree/ref changes, archive/system
       // writers, delete invocations at executable position incl. `sudo rm`,
-      // find -delete/-exec/xargs consumers) are unconditional RO denials —
-      // before every ALLOW/ASK producer below and independent of bypass
-      // categories. Unrecognized executors stay unproven-execution denials.
+      // find -delete/-exec/xargs consumers, process signallers) are
+      // unconditional RO denials — before every ALLOW/ASK producer below and
+      // independent of bypass categories. Unrecognized executors stay
+      // unproven-execution asks, which the launch gate keeps under the
+      // runtime observer.
       // It runs before the generic write-shape scan so recognized read modes
       // (`unzip -l`, `gunzip -c`, `tar -t`) are not mis-denied by the
       // unconditional archive-extraction targets extractWriteTargets emits.
@@ -10350,23 +10211,23 @@ async function classifySegment(
       const roMutation = readOnlyMutatingInvocation(roStripped)
       if (roMutation === "execute") {
         // Executor invocations (`rg --pre`, `git grep -O`, the sed `e`
-        // family) run a child that can read or reach the network — the
-        // kernel's write containment is not enough, so RO never authorizes
-        // them. The floor/credential scan still runs first.
-        const floors = await roNonWriteGate(segment, base, segInput, strictness)
+        // family) run a child whose effects the observer checks; the
+        // floor/credential scan still runs first.
+        const floors = await roNonWriteGate(segment, base, segInput)
         if (floors) return floors
-        return readOnlyExecutionDeny()
+        return readOnlyExecutionAsk()
       }
       if (roMutation === "write" || roMutation === "unproven") {
-        // Scratch carve-out first (/tmp mutations exempt in every mode), then
-        // the kernel pass-through (LOOSE + roKernelEnforced): the kernel
-        // denies the write syscalls, so the static gate defers to it. All
-        // other cases keep the unconditional permission.write deny.
-        const bypass = await roWriteGateBypass(segment, roView, base, segInput, strictness, roMutation)
+        // Scratch carve-out first (/tmp mutations exempt), then the kernel
+        // pass-through (roKernelEnforced): the kernel denies the write
+        // syscalls, so the static gate defers to it. Otherwise "write"
+        // keeps the unconditional permission.write deny while "unproven"
+        // is admitted to the runtime observer as permission.exec-unproven.
+        const bypass = await roWriteGateBypass(segment, roView, base, segInput, roMutation)
         if (bypass) return bypass
         return roMutation === "write"
           ? readOnlyWriteDeny()
-          : readOnlyExecutionDeny(READ_ONLY_UNPROVEN_DENY_REASON)
+          : readOnlyExecutionAsk(READ_ONLY_UNPROVEN_ASK_REASON)
       }
       const writeShaped =
         hasFileWritePrimitive(roView) ||
@@ -10380,7 +10241,7 @@ async function classifySegment(
             hasFileWritePrimitive(payload) || extractWriteTargets(payload).targets.length > 0,
         )
       if (writeShaped || explicitRecycleBinOperation(roSegment, input.shell) !== undefined) {
-        const bypass = await roWriteGateBypass(segment, roView, base, segInput, strictness, roMutation)
+        const bypass = await roWriteGateBypass(segment, roView, base, segInput, roMutation)
         if (bypass) return bypass
         return readOnlyWriteDeny()
       }
@@ -10395,10 +10256,9 @@ async function classifySegment(
       const roBenign =
         benignDynamicSurface(roSegment, roBenignHolder) &&
         !hasUnquotedExpansion(roBenignHolder.v, input.shell)
-      // LOOSE tolerates glob operands on read surfaces (`wc -c *`, `cat *.ts`):
+      // Glob operands on read surfaces (`wc -c *`, `cat *.ts`) are tolerated:
       // the shell expands them to local filenames a read command consumes.
-      // HARD keeps the strict hygiene.
-      const roAllowGlobs = strictness === "LOOSE"
+      const roAllowGlobs = true
       if (
         roMutation === "read" &&
         (roBenign ||
@@ -10410,7 +10270,7 @@ async function classifySegment(
         // text around them still drives sensitivity detection, while the
         // dynamic island (`$(pwd)`, `$(date)`) doesn't poison the parse.
         const scanSegment = roBenign ? roBenignHolder.v : roSegment
-        const roPathCtx: PathContext = { cwd: base, worktree: input.worktree, strictness }
+        const roPathCtx: PathContext = { cwd: base, worktree: input.worktree }
         const roFinding = analyzeSegmentPaths(scanSegment, roPathCtx)
         if (roFinding.kind === "pass") {
           const operandFinding = readOnlyReadFinding(executableInvocation(scanSegment).args, roPathCtx)
@@ -10467,45 +10327,9 @@ async function classifySegment(
 
   const recycle = explicitRecycleBinOperation(segment, input.shell)
   if (recycle && !ruleBypassed("filesystem.recycle-bin", bypassed)) {
-    const recycleFinding = await recycleTargetsFinding(recycle.targets, base, segInput, strictness)
+    const recycleFinding = await recycleTargetsFinding(recycle.targets, base, segInput)
     if (recycleFinding && !recycleFinding.rules.every((rule) => ruleBypassed(rule, bypassed))) {
       return recycleFinding
-    }
-    if (strictness === "HARD") {
-      const tempRoots = await trustedUserLocalTempRoots(segInput)
-      for (const target of recycle.targets) {
-        const literal = literalPathToken(target)
-        const protectedTarget = Boolean(
-          literal && (backupPathIdentity(literal) || hasNamedTempPathSegment(literal)),
-        )
-        const inLocalTemp = tempRoots.length > 0 && await isTrustedTempPath(target, base, tempRoots)
-        if ((protectedTarget || inLocalTemp) && !ruleBypassed("filesystem.protected-target-delete", bypassed)) {
-          return {
-            verdict: "DENY",
-            rules: ["filesystem.protected-target-delete"],
-            reason: `Removing a protected temporary or backup target is blocked by filesystem policy. ${PERMANENT_DELETE_GUIDANCE}`,
-          }
-        }
-      }
-      if (recycle.targets.some(isCriticalDeletionTarget) && !ruleBypassed("data.critical-delete", bypassed)) {
-        return {
-          verdict: "DENY",
-          rules: ["data.critical-delete"],
-          reason: `Attempts to delete credential or key material. ${PERMANENT_DELETE_GUIDANCE}`,
-        }
-      }
-      if (recycle.targets.some(isGeneralDataTarget) && !ruleBypassed("data.destructive-delete", bypassed)) {
-        return {
-          verdict: "DENY",
-          rules: ["data.destructive-delete"],
-          reason: `Attempts to delete a durable structured data file. ${PERMANENT_DELETE_GUIDANCE}`,
-        }
-      }
-      return {
-        verdict: "ALLOW",
-        rules: ["filesystem.recycle-bin"],
-        reason: "Moves items to the recoverable operating-system recycle bin",
-      }
     }
     return {
       verdict: "ALLOW",
@@ -10537,46 +10361,28 @@ async function classifySegment(
     return heredocDecision
   }
 
-  if (strictness === "HARD") {
-    // Deletion/backup policies gate their individual DENY verdicts with
-    // ruleBypassed (filesystem vs secret categories differ per rule).
-    const hardDecision = await classifyHardDeletionPolicy(segment, segInput)
-    if (hardDecision && !hardDecision.rules.every((rule) => ruleBypassed(rule, bypassed))) {
-      return { verdict: hardDecision.verdict, rules: hardDecision.rules, reason: hardDecision.reason }
+  // Deletion/backup policies gate their individual verdicts with
+  // ruleBypassed (filesystem vs secret categories differ per rule).
+  if (!segInput.cwdUnknown) {
+    const namedTempDecision = await classifyNamedTempDeletionPolicy(segment, segInput)
+    if (namedTempDecision && !namedTempDecision.rules.every((rule) => ruleBypassed(rule, bypassed))) {
+      return { verdict: namedTempDecision.verdict, rules: namedTempDecision.rules, reason: namedTempDecision.reason }
+    }
+
+    const userLocalTempDecision = await classifyUserLocalTempSegment(segment, segInput)
+    if (
+      userLocalTempDecision &&
+      !userLocalTempDecision.rules.every((rule) => ruleBypassed(rule, bypassed))
+    ) {
+      return {
+        verdict: userLocalTempDecision.verdict,
+        rules: userLocalTempDecision.rules,
+        reason: userLocalTempDecision.reason,
+      }
     }
     const backupDecision = await classifyBackupPolicy(segment, segInput)
     if (backupDecision && !backupDecision.rules.every((rule) => ruleBypassed(rule, bypassed))) {
-      if (backupDecision.verdict === "ALLOW" && backupDecision.rules.includes("filesystem.backup-delete")) {
-        return {
-          verdict: "DENY",
-          rules: ["hard.backup-delete"],
-          reason: `Permanent deletion of backup targets is blocked by filesystem policy. ${PERMANENT_DELETE_GUIDANCE}`,
-        }
-      }
       return { verdict: backupDecision.verdict, rules: backupDecision.rules, reason: backupDecision.reason }
-    }
-  } else {
-    if (!segInput.cwdUnknown) {
-      const namedTempDecision = await classifyNamedTempDeletionPolicy(segment, segInput)
-      if (namedTempDecision && !namedTempDecision.rules.every((rule) => ruleBypassed(rule, bypassed))) {
-        return { verdict: namedTempDecision.verdict, rules: namedTempDecision.rules, reason: namedTempDecision.reason }
-      }
-
-      const userLocalTempDecision = await classifyUserLocalTempSegment(segment, segInput)
-      if (
-        userLocalTempDecision &&
-        !userLocalTempDecision.rules.every((rule) => ruleBypassed(rule, bypassed))
-      ) {
-        return {
-          verdict: userLocalTempDecision.verdict,
-          rules: userLocalTempDecision.rules,
-          reason: userLocalTempDecision.reason,
-        }
-      }
-      const backupDecision = await classifyBackupPolicy(segment, segInput)
-      if (backupDecision && !backupDecision.rules.every((rule) => ruleBypassed(rule, bypassed))) {
-        return { verdict: backupDecision.verdict, rules: backupDecision.rules, reason: backupDecision.reason }
-      }
     }
   }
 
@@ -10605,7 +10411,7 @@ async function classifySegment(
       !hasDynamicShellExpansion(payload, input.shell) &&
       !hasUnquotedExpansion(maskHeredocDataBodies(payload, input.shell), input.shell) &&
       !hasSensitiveEnvPrefix(payload) &&
-      analyzeSegmentPaths(payload, { cwd: base, worktree: input.worktree, strictness }).kind === "pass"
+      analyzeSegmentPaths(payload, { cwd: base, worktree: input.worktree }).kind === "pass"
     ) {
       return {
         verdict: "ALLOW",
@@ -10616,12 +10422,12 @@ async function classifySegment(
   }
 
   // ---- M3 (P2) §4.9: dedicated safe surfaces -----------------------------
-  const m3ctx: PathContext = { cwd: base, worktree: input.worktree, strictness }
+  const m3ctx: PathContext = { cwd: base, worktree: input.worktree }
 
-  const tarOrUnzip = classifyTarExtractOrUnzip(segment, m3ctx, strictness, /^unzip\b/i.test(segment))
+  const tarOrUnzip = classifyTarExtractOrUnzip(segment, m3ctx, /^unzip\b/i.test(segment))
   if (tarOrUnzip && !tarOrUnzip.rules.every((rule) => ruleBypassed(rule, bypassed))) return tarOrUnzip
 
-  if ((/^curl\b/i.test(segment) || /^wget\b/i.test(segment)) && strictness === "LOOSE" && !input.cwdUnknown) {
+  if ((/^curl\b/i.test(segment) || /^wget\b/i.test(segment)) && !input.cwdUnknown) {
     if (isSafeDownloadTarget(segment, m3ctx)) {
       return {
         verdict: "ALLOW",
@@ -10632,17 +10438,17 @@ async function classifySegment(
   } else if (/^python(?:3)?(?:\.exe)?\s+-m\s+http\.server\b/i.test(segment) && !input.cwdUnknown) {
     // http.server listens on every interface by default: serving a directory
     // outside the worktree (a home directory, `/`) publishes its files.
-    if (strictness === "LOOSE" && !hasDynamicShellExpansion(segment, input.shell) && httpServerRootInWorktree(segment, base, input.worktree)) {
+    if (!hasDynamicShellExpansion(segment, input.shell) && httpServerRootInWorktree(segment, base, input.worktree)) {
       return { verdict: "ALLOW", rules: ["operation.dev-server"], reason: "Serves a local development HTTP server" }
     }
     return { verdict: "ASK", rules: ["operation.context-required"], reason: "Starting a local development server requires review" }
-  } else if (/^ssh-keygen\b/i.test(segment) && strictness === "LOOSE" && !input.cwdUnknown) {
+  } else if (/^ssh-keygen\b/i.test(segment) && !input.cwdUnknown) {
     if (!/\s-y\b|--print/.test(segment) && /\s-N\s+['""]['""]/.test(segment) && !hasDynamicShellExpansion(segment, input.shell)) {
       return { verdict: "ALLOW", rules: ["operation.keygen"], reason: "Generates a new SSH key pair locally" }
     }
   }
 
-  const safeChmod = classifySafeChmod(segment, m3ctx, strictness)
+  const safeChmod = classifySafeChmod(segment, m3ctx)
   if (safeChmod) return safeChmod
 
   // `[ ... ]` / `test` literal test expressions (framing brackets are not globs here)
@@ -10721,8 +10527,8 @@ async function classifySegment(
     (surfaces.length === 2 && quoteSurfaceOfThisSegment !== undefined && surfaces[1] === quoteSurfaceOfThisSegment)
   const explicitDisposableCleanup =
     (await isExplicitDisposableCleanup(segment, base, input.worktree)) && onlyInnocentSurfaces
-  // Temp-confined forced deletes also exempt the definite floor signal — the
-  // HARD-side equivalent of the `hard.forced-recursive-delete` path check.
+  // Temp-confined forced deletes exempt the definite floor signal — the
+  // path-proven equivalent of the old strict-mode forced-delete check.
   const forcedDeletesConfined =
     hasForcedRecursiveDelete(combined) && (await forcedDeletesConfinedToTemp(surfaces, segInput))
 
@@ -10742,7 +10548,7 @@ async function classifySegment(
   // expanded name into an option or a credential read (see safeGlobReader).
   const globReader =
     knownSafe && looseRelaxationsActive() && !input.cwdUnknown &&
-    safeGlobReader(segment, { cwd: base, worktree: input.worktree, strictness })
+    safeGlobReader(segment, { cwd: base, worktree: input.worktree })
   const provablySafe =
     knownSafe &&
     (!hasExpansion || benignDynamic) &&
@@ -10765,7 +10571,7 @@ async function classifySegment(
   if (expandedRead) return classifySegment(expandedRead, base, segInput)
 
   if (provablySafe) {
-    const finding = analyzeSegmentPaths(benignDynamic ? benignHolder.v : segment, { cwd: base, worktree: input.worktree, strictness })
+    const finding = analyzeSegmentPaths(benignDynamic ? benignHolder.v : segment, { cwd: base, worktree: input.worktree })
     if (finding.kind === "pass") {
       // Durable-data in-place overwrite must not ride the provably-safe early
       // allow (`sed -i` on .csv/.json/db/sqlite/xlsx/parquet).
@@ -10792,26 +10598,27 @@ async function classifySegment(
   }
 
   // Read-only execution channels: under RO, anything the classifier cannot
-  // prove read-only is denied here rather than deferred to the dynamic
-  // reviewer. This runs before every ASK producer below and ignores bypass
-  // categories (permissions are orthogonal to bypass; any DENY wins). It sits
-  // after the provably-safe early allow so known-safe reads (`ls`, `cat`,
-  // `echo $(date)`) and pure-data heredocs stay allowed.
+  // prove read-only is marked permission.exec-unproven (ASK) here — the
+  // launch gate keeps it under the runtime observer, which reviews every
+  // boundary crossing as it happens. This runs before the other ASK
+  // producers below and ignores bypass categories (permissions are
+  // orthogonal to bypass). It sits after the provably-safe early allow so
+  // known-safe reads (`ls`, `cat`, `echo $(date)`) and pure-data heredocs
+  // stay allowed.
   //
-  // Kernel pass-through: under LOOSE with roKernelEnforced the kernel denies
-  // the write syscalls this channel could issue, so the channel passes
-  // through once the non-write gate (floors/credentials/network/sudo inside
-  // every surface incl. the payload) is clean. HARD and kernel-absent RO
-  // keep the static deny.
+  // Kernel pass-through: with roKernelEnforced the kernel denies the write
+  // syscalls this channel could issue, so the channel passes through once the
+  // non-write gate (floors/credentials/network/sudo inside every surface
+  // incl. the payload) is clean.
   if (
     permScope &&
     !permScope.w &&
     readOnlyExecutionChannel(segment, combined, input.shell)
   ) {
-    if (input.roKernelEnforced && strictness !== "HARD") {
-      return (await roNonWriteGate(segment, base, segInput, strictness)) ?? kernelEnforcedAllow()
+    if (input.roKernelEnforced) {
+      return (await roNonWriteGate(segment, base, segInput)) ?? kernelEnforcedAllow()
     }
-    return readOnlyExecutionDeny()
+    return readOnlyExecutionAsk()
   }
 
   for (const rule of SECURITY_SIGNAL_RULES) {
@@ -10820,7 +10627,7 @@ async function classifySegment(
       if (DEFINITE_DESTRUCTIVE_RULES.has(rule.id)) {
         if (
           rule.id === "filesystem.forced-recursive-delete" &&
-          (forcedDeletesConfined || (explicitDisposableCleanup && strictness !== "HARD"))
+          (forcedDeletesConfined || explicitDisposableCleanup)
         ) {
           continue
         }
@@ -10833,7 +10640,6 @@ async function classifySegment(
   const compressionFinding = compressionDestructionFinding(segment, {
     cwd: base,
     worktree: input.worktree,
-    strictness,
   })
   if (compressionFinding && !compressionFinding.rules.every((rule) => ruleBypassed(rule, bypassed))) {
     return { verdict: compressionFinding.verdict, rules: compressionFinding.rules, reason: compressionFinding.reason }
@@ -10845,19 +10651,10 @@ async function classifySegment(
     return {
       verdict: "DENY",
       rules: ["data.critical-delete"],
-      reason: strictness === "HARD"
-        ? `Attempts to delete credential or key material. ${PERMANENT_DELETE_GUIDANCE}`
-        : "Attempts to delete credential or key material",
+      reason: "Attempts to delete credential or key material",
     }
   }
   if (!ruleBypassed("data.destructive-delete", bypassed) && hasGeneralDataDestruction(combined)) {
-    if (strictness === "HARD") {
-      return {
-        verdict: "DENY",
-        rules: ["data.destructive-delete"],
-        reason: `Attempts to permanently delete a durable structured data file. ${PERMANENT_DELETE_GUIDANCE}`,
-      }
-    }
     reviewSignals.set(
       "data.destructive-delete",
       "Attempts to delete user data or durable structured files and requires review",
@@ -10869,11 +10666,11 @@ async function classifySegment(
       "Attempts in-place destructive modification of durable structured data",
     )
   }
-  const sensitivePath = sensitivePathFinding(segment, { cwd: base, worktree: input.worktree, strictness })
+  const sensitivePath = sensitivePathFinding(segment, { cwd: base, worktree: input.worktree })
   if (sensitivePath && sensitivePath.kind !== "pass") {
     if (!ruleBypassed(sensitivePath.rule, bypassed)) {
       return {
-        verdict: sensitivePath.kind === "deny" ? "DENY" : "ASK",
+        verdict: "ASK",
         rules: [sensitivePath.rule],
         reason: sensitivePath.reason,
       }
@@ -10883,7 +10680,6 @@ async function classifySegment(
   const exfilRule = hasExfilOrDangerousPerms(segment, combined, {
     cwd: base,
     worktree: input.worktree,
-    strictness,
   })
   // Owner semantics (policyVersion 1.5): when the mode-weakening rule fired
   // on a credential object, the generic world-writable signal on the SAME
@@ -10899,23 +10695,17 @@ async function classifySegment(
     const reason = exfilRule === "permissions.sensitive-mode"
       ? "Setting dangerous permissions on a credential or system file requires review"
       : "Sending credential or system data off-host requires review"
-    if (strictness === "HARD") {
-      return { verdict: "DENY", rules: [exfilRule], reason }
-    }
     reviewSignals.set(exfilRule, reason)
   }
 
-  for (const rule of HARD_DENY_LOOSE_ASK_RULES) {
+  for (const rule of ASK_REVIEW_RULES) {
     if (ruleBypassed(rule.id, bypassed)) continue
     if (rule.test(combined)) {
-      if (strictness === "HARD") {
-        return { verdict: "DENY", rules: [rule.id], reason: rule.reason }
-      }
       reviewSignals.set(rule.id, rule.reason)
     }
   }
 
-  if (explicitDisposableCleanup && strictness !== "HARD") {
+  if (explicitDisposableCleanup) {
     // Same guardrail as the named-temp path: when the base was claimed by a
     // `cd` that is not guaranteed to have run, only a canonically
     // temp-confined base may carry the exemption.
@@ -10941,12 +10731,11 @@ async function classifySegment(
     }
   }
 
-  // Under a kernel-enforced RO session (LOOSE) the write/execution ASK
-  // producers below are suppressed: their question — can this command
-  // write/execute? — is answered by the kernel itself. Non-write producers
-  // (context triggers, review signals, sensitive paths) ran above and keep
-  // their verdicts.
-  const roKernelPassthrough = Boolean(permScope && !permScope.w && input.roKernelEnforced && strictness !== "HARD")
+  // Under a kernel-enforced RO session the write/execution ASK producers
+  // below are suppressed: their question — can this command write/execute? —
+  // is answered by the kernel itself. Non-write producers (context triggers,
+  // review signals, sensitive paths) ran above and keep their verdicts.
+  const roKernelPassthrough = Boolean(permScope && !permScope.w && input.roKernelEnforced)
 
   // Privilege launchers gate before the generic wrapper/indirection ask:
   // `sh -c 'doas id'` is a privilege question first — arming `privilege`
@@ -10965,10 +10754,9 @@ async function classifySegment(
 
   // Semantic proofs: every danger scan above came back clean, so a segment
   // that is proven read-only (or a user-trusted tool) needs no review. RO
-  // sessions keep their own permission-driven path below; HARD keeps every
-  // unproven-by-vocabulary command on review.
-  if (strictness === "LOOSE" && !(permScope && !permScope.w) && !input.cwdUnknown) {
-    const semantic = await semanticSegmentAllow(segment, base, input, strictness)
+  // sessions keep their own permission-driven path below.
+  if (!(permScope && !permScope.w) && !input.cwdUnknown) {
+    const semantic = await semanticSegmentAllow(segment, base, input)
     if (semantic) return { verdict: "ALLOW", rules: [semantic.rule], reason: semantic.reason }
   }
 
@@ -11020,7 +10808,7 @@ async function classifySegment(
       (() => {
         const deletion = parseDeleteInvocation(segment)
         if (!deletion?.parseable || deletion.targets.length === 0) return false
-        const pathCtx: PathContext = { cwd: base, worktree: input.worktree, strictness }
+        const pathCtx: PathContext = { cwd: base, worktree: input.worktree }
         return deletion.targets.every((target) =>
           checkPathSensitivity(stripMatchingQuotes(target), pathCtx).sensitive,
         )
@@ -11064,13 +10852,13 @@ async function classifySegment(
   // With any trigger-family category armed, the surviving fallback describes
   // itself as bypass-gated: the armed BYPASS RULE lets the dynamic reviewer
   // decide consistently instead of reading "unprovable" as high-risk.
-  // Under a read-only session the unproven fallback is a write question:
-  // kernel-enforced LOOSE passes it through (every non-write scan above has
-  // already run clean at this point); HARD and kernel-absent RO keep the
-  // static deny (permissions outrank bypass).
+  // Under a read-only session the unproven fallback is not a static deny:
+  // the command is admitted to the runtime observer, which reviews every
+  // boundary crossing (a kernel-enforced session passes it through outright —
+  // every non-write scan above has already run clean at this point).
   if (permScope && !permScope.w) {
     if (roKernelPassthrough) return kernelEnforcedAllow()
-    return readOnlyExecutionDeny(READ_ONLY_UNPROVEN_DENY_REASON)
+    return readOnlyExecutionAsk(READ_ONLY_UNPROVEN_ASK_REASON)
   }
   if (
     bypassed &&
@@ -11096,10 +10884,10 @@ async function classifySegments(
 ): Promise<SegmentDecision> {
   if (depth > MAX_WRAPPER_DEPTH) {
     if (input.permScope && !input.permScope.w) {
-      if (input.roKernelEnforced && (input.strictness ?? "LOOSE") !== "HARD") {
-        return (await roNonWriteGate(script, path.resolve(input.cwd), input, input.strictness ?? "LOOSE")) ?? kernelEnforcedAllow()
+      if (input.roKernelEnforced) {
+        return (await roNonWriteGate(script, path.resolve(input.cwd), input)) ?? kernelEnforcedAllow()
       }
-      return readOnlyExecutionDeny()
+      return readOnlyExecutionAsk()
     }
     return { verdict: "ASK", rules: ["execution.wrapper"], reason: "Command wrappers exceed the review depth limit" }
   }
@@ -11115,9 +10903,9 @@ async function classifySegments(
   // Opaque split (unclosed quote/escape, unsupported backtick, truncated
   // heredoc): the raw security scans still run — classify the whole script as
   // one surface — but a script that was never fully parsed may not authorize
-  // itself through known-safe/read-only/path-exemption early allows. LOOSE
-  // keeps the ASK floor; HARD and read-only sessions deny outright (with the
-  // kernel-enforced passthrough still available under LOOSE).
+  // itself through known-safe/read-only/path-exemption early allows. The
+  // default keeps the ASK floor; read-only sessions mark it unproven (with the
+  // kernel-enforced passthrough still available).
   const unresolved = parsed === undefined
   const rawSegments = parsed?.segments ?? [{ text: script }]
   const results: SegmentDecision[] = []
@@ -11168,7 +10956,7 @@ async function classifySegments(
       continue
     }
     if (/^(?:for|while|until)\s/.test(segment)) {
-      const pathCtx: PathContext = { cwd: cond.dir ?? input.cwd, worktree: input.worktree, strictness: input.strictness ?? "LOOSE" }
+      const pathCtx: PathContext = { cwd: cond.dir ?? input.cwd, worktree: input.worktree }
       loopFrames.push(cond.dir === undefined ? { name: "", words: undefined } : parseForLoopFrame(segment, script, pathCtx))
     } else if (/^done(?=\s|$)/.test(segment)) {
       loopFrames.pop()
@@ -11262,28 +11050,20 @@ async function classifySegments(
         }
       : combineSegmentDecisions(results)
   if (unresolved && direct.verdict !== "DENY") {
-    const strictness: Strictness = input.strictness ?? "LOOSE"
     if (input.permScope && !input.permScope.w) {
-      if (input.roKernelEnforced && strictness !== "HARD") {
-        const gate = await roNonWriteGate(script, path.resolve(input.cwd), input, strictness)
+      if (input.roKernelEnforced) {
+        const gate = await roNonWriteGate(script, path.resolve(input.cwd), input)
         const opaque = gate ?? kernelEnforcedAllow()
         return substituted ? combineSegmentDecisions([opaque, substituted]) : opaque
       }
-      const opaque = readOnlyExecutionDeny()
+      const opaque = readOnlyExecutionAsk()
       return substituted ? combineSegmentDecisions([opaque, substituted]) : opaque
     }
-    const opaque: SegmentDecision =
-      strictness === "HARD"
-        ? {
-            verdict: "DENY",
-            rules: ["input.opaque"],
-            reason: "The command could not be fully parsed, and strict policy denies unparseable commands",
-          }
-        : {
-            verdict: "ASK",
-            rules: ["input.opaque"],
-            reason: "The command could not be fully parsed for local classification",
-          }
+    const opaque: SegmentDecision = {
+      verdict: "ASK",
+      rules: ["input.opaque"],
+      reason: "The command could not be fully parsed for local classification",
+    }
     return substituted ? combineSegmentDecisions([opaque, substituted]) : opaque
   }
   return substituted ? combineSegmentDecisions([direct, substituted]) : direct
@@ -11348,11 +11128,38 @@ export function isolateDetachedStartCommand(command: string, shell: string) {
 }
 
 export async function classifyShellCommand(input: ClassifyShellCommandInput): Promise<StaticSecurityDecision> {
-  const scope = (input.strictness ?? "LOOSE") !== "LOOSE" ? "off" : input.permScope && !input.permScope.w ? "ro" : "rw"
+  assertSupportedStrictness(input.strictness)
+  const scope = input.permScope && !input.permScope.w ? "ro" : "rw"
   return looseRelaxationScope.run(scope, () => classifyShellCommandInScope(input))
 }
 
-async function classifyShellCommandInScope(input: ClassifyShellCommandInput): Promise<StaticSecurityDecision> {
+/** Two-state static boundary for the unified review pipeline. Shares every
+ * fact computation with classifyShellCommand; the only difference is that a
+ * DENY-class signal comes back as ASK (rules, reason, fingerprints and review
+ * context preserved). Permission ceilings are enforced by the host separately:
+ * this adapter never widens authorization. */
+export async function classifyBoundaryCommand(input: ClassifyShellCommandInput): Promise<BoundarySecurityDecision> {
+  assertSupportedStrictness(input.strictness)
+  const scope = input.permScope && !input.permScope.w ? "ro" : "rw"
+  const decision = await looseRelaxationScope.run(scope, () =>
+    classifyShellCommandInScope({ ...input, boundary: true }),
+  )
+  const verdict: "ALLOW" | "ASK" = decision.verdict === "ALLOW" ? "ALLOW" : "ASK"
+  const originalVerdict = decision.originalVerdict ?? (decision.verdict === "DENY" ? "DENY" : undefined)
+  return {
+    verdict,
+    rules: decision.rules,
+    reason: decision.reason,
+    fingerprints: decision.fingerprints,
+    reviewContext: decision.reviewContext,
+    source: "static",
+    ...(originalVerdict !== undefined ? { originalVerdict } : {}),
+  }
+}
+
+async function classifyShellCommandInScope(
+  input: ClassifyShellCommandInput & { boundary?: boolean },
+): Promise<StaticSecurityDecision & { originalVerdict?: SecurityVerdict }> {
   const source = normalized(input.script).trim()
   if (!source) {
     return { verdict: "DENY", rules: ["input.empty"], reason: "The executable script is empty", fingerprints: [] }
@@ -11392,24 +11199,10 @@ async function classifyShellCommandInScope(input: ClassifyShellCommandInput): Pr
     ...ruleScanWrappers(ruleView),
   ]
   const bypassed = input.bypassedCategories
-  // Pipe-separated segments are classified individually, so remote-pipe
-  // (`curl ... | bash`) must be judged on the full script. HARD mode denies
-  // download-and-execute outright; LOOSE defers it to the dynamic reviewer
-  // (which applies the official-installer rule).
-  const remotePipeRule = SECURITY_SIGNAL_RULES.find((rule) => rule.id === "execution.remote-pipe")
-  if (
-    (input.strictness ?? "LOOSE") === "HARD" &&
-    remotePipeRule &&
-    !ruleBypassed("execution.remote-pipe", bypassed) &&
-    remotePipeRule.test(floorsView)
-  ) {
-    return {
-      verdict: "DENY",
-      rules: ["execution.remote-pipe"],
-      reason: remotePipeRule.reason,
-      fingerprints: [],
-    }
-  }
+  // Boundary mode records full-script hits instead of returning early, so the
+  // fingerprints, review context and every other rule still come from the
+  // normal pipeline (see classifyBoundaryCommand).
+  const earlyRules: Array<{ rule: string; reason: string }> = []
   // Reverse shells / xargs deletion may span `|`/`;` segments, so judge them
   // on the full script (both modes: these are DEFINITE-destructive). Reverse
   // shells are floor rules and never bypassable.
@@ -11418,7 +11211,8 @@ async function classifyShellCommandInScope(input: ClassifyShellCommandInput): Pr
   for (const rule of [reverseShellRule, xargsRule]) {
     if (!rule || ruleBypassed(rule.id, bypassed)) continue
     if (rule.test(floorsView)) {
-      return { verdict: "DENY", rules: [rule.id], reason: rule.reason, fingerprints: [] }
+      if (!input.boundary) return { verdict: "DENY", rules: [rule.id], reason: rule.reason, fingerprints: [] }
+      earlyRules.push({ rule: rule.id, reason: rule.reason })
     }
   }
   // Floor rules that can span `|`/`&` segment splits: fork bombs (the `&`
@@ -11437,7 +11231,8 @@ async function classifyShellCommandInScope(input: ClassifyShellCommandInput): Pr
   for (const rule of [forkBombRule, kernelTriggerRule, kernelCorePatternRule]) {
     if (!rule || ruleBypassed(rule.id, bypassed)) continue
     if (rule.test(floorsView)) {
-      return { verdict: "DENY", rules: [rule.id], reason: rule.reason, fingerprints: [] }
+      if (!input.boundary) return { verdict: "DENY", rules: [rule.id], reason: rule.reason, fingerprints: [] }
+      earlyRules.push({ rule: rule.id, reason: rule.reason })
     }
   }
   // Literal piped into a shell interpreter: `printf 'rm -rf /' | sh`.
@@ -11445,12 +11240,18 @@ async function classifyShellCommandInScope(input: ClassifyShellCommandInput): Pr
     floorsView,
   )
   if (literalShell) {
-    return {
-      verdict: "DENY",
-      rules: ["execution.literal-shell"],
-      reason: "Pipes a destructive literal command into a shell interpreter",
-      fingerprints: [],
+    if (!input.boundary) {
+      return {
+        verdict: "DENY",
+        rules: ["execution.literal-shell"],
+        reason: "Pipes a destructive literal command into a shell interpreter",
+        fingerprints: [],
+      }
     }
+    earlyRules.push({
+      rule: "execution.literal-shell",
+      reason: "Pipes a destructive literal command into a shell interpreter",
+    })
   }
   // Cross-call base (fix E): the shell tool's `workdir` argument is the
   // directory the command will actually execute in — a claim from the tool
@@ -11580,17 +11381,20 @@ async function classifyShellCommandInScope(input: ClassifyShellCommandInput): Pr
 
   const segmentDecision = await classifySegments(scanView, effectiveInput)
 
-  if (segmentDecision.verdict === "DENY") {
+  if (segmentDecision.verdict === "DENY" && !input.boundary) {
     return { verdict: "DENY", rules: segmentDecision.rules, reason: segmentDecision.reason, ...decisionState }
   }
   // An unparseable top-level script may not ride the disposable-cleanup
-  // early allow (it bypasses the ASK floor entirely).
-  const topLevelOpaque = segmentDecision.rules.includes("input.opaque")
+  // early allow (it bypasses the ASK floor entirely). Boundary mode also
+  // forbids every early allow once a segment or full-script floor fired: the
+  // hit must reach the reviewer, not be laundered into an ALLOW.
+  const boundaryDenied = segmentDecision.verdict === "DENY" || earlyRules.length > 0
+  const topLevelOpaque = segmentDecision.rules.includes("input.opaque") || boundaryDenied
 
   if (deletionTargets.truncated && !ruleBypassed("filesystem.deletion-targets-truncated", bypassed)) {
     return {
       verdict: "ASK",
-      rules: [...new Set([...segmentDecision.rules, "filesystem.deletion-targets-truncated"])],
+      rules: [...new Set([...segmentDecision.rules, ...earlyRules.map((hit) => hit.rule), "filesystem.deletion-targets-truncated"])],
       reason: "The command has more deletion targets than can be inspected safely",
       ...decisionState,
     }
@@ -11601,8 +11405,7 @@ async function classifyShellCommandInScope(input: ClassifyShellCommandInput): Pr
     await isExplicitDisposableCleanup(scanView, effectiveInput.cwd, input.worktree) &&
     executableSurfaces.length === 1 &&
     localScriptSurfaces.length === 0 &&
-    provenLocalScripts === 0 &&
-    (input.strictness ?? "LOOSE") !== "HARD"
+    provenLocalScripts === 0
   ) {
     return {
       verdict: "ALLOW",
@@ -11630,7 +11433,6 @@ async function classifyShellCommandInScope(input: ClassifyShellCommandInput): Pr
     const scriptExfil = hasExfilOrDangerousPerms(localScriptCombined, localScriptCombined, {
       cwd: input.cwd,
       worktree: input.worktree,
-      strictness: input.strictness ?? "LOOSE",
     })
     if (scriptExfil && !ruleBypassed(scriptExfil, bypassed)) {
       extraSignals.set(
@@ -11655,6 +11457,7 @@ async function classifyShellCommandInScope(input: ClassifyShellCommandInput): Pr
   }
 
   if (
+    !boundaryDenied &&
     segmentDecision.verdict === "ASK" &&
     segmentDecision.rules.length === 1 &&
     segmentDecision.rules[0] === "execution.local-script" &&
@@ -11670,16 +11473,28 @@ async function classifyShellCommandInScope(input: ClassifyShellCommandInput): Pr
     }
   }
 
-  const rules = [...segmentDecision.rules]
+  const rules = [...new Set([...segmentDecision.rules, ...earlyRules.map((hit) => hit.rule)])]
   for (const [id, reason] of extraSignals) {
     if (!rules.includes(id)) rules.push(id)
   }
-  if (segmentDecision.verdict === "ALLOW" && extraSignals.size > 0) {
+  if (!boundaryDenied && segmentDecision.verdict === "ALLOW" && extraSignals.size > 0) {
     return {
       verdict: "ASK",
       rules,
       reason: [...extraSignals.values()][0],
       ...decisionState,
+    }
+  }
+
+  if (input.boundary) {
+    if (boundaryDenied) {
+      return {
+        verdict: "ASK",
+        rules,
+        reason: segmentDecision.verdict === "DENY" ? segmentDecision.reason : earlyRules[0].reason,
+        originalVerdict: "DENY",
+        ...decisionState,
+      }
     }
   }
 

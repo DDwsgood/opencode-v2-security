@@ -22,6 +22,7 @@ type JsonSchema = {
   readonly required?: readonly string[]
   readonly additionalProperties?: boolean
   readonly items?: JsonSchema
+  readonly enum?: readonly unknown[]
 }
 
 function typeMatches(type: string, value: unknown): boolean {
@@ -77,14 +78,19 @@ function schemaErrors(schema: JsonSchema, value: unknown, path: string): string[
       errors.push(...schemaErrors(schema.items as JsonSchema, item, `${path}[${index}]`)),
     )
   }
+  if (schema.enum && !schema.enum.includes(value)) {
+    errors.push(`${path}: expected one of ${schema.enum.join("|")}`)
+  }
   return errors
 }
 
 const STATUS_SCHEMA = BypassRpc.methods.status.output as JsonSchema
 const CHANGED_SCHEMA = BypassRpc.events.changed.schema as JsonSchema
+const PERMISSION_SCHEMA = BypassRpc.events.permission.schema as JsonSchema
 
 const statusErrors = (data: unknown) => schemaErrors(STATUS_SCHEMA, data, "status")
 const changedErrors = (data: unknown) => schemaErrors(CHANGED_SCHEMA, data, "changed")
+const permissionErrors = (data: unknown) => schemaErrors(PERMISSION_SCHEMA, data, "permission")
 
 function expectValidStatus(data: BypassStatusData) {
   expect(statusErrors(data)).toEqual([])
@@ -155,6 +161,17 @@ async function startPlugin(
         collected[name] = cb
         return Effect.void
       },
+      // index.ts uses tool.transform twice: to walk the native Linux tool
+      // registry (list/update) and to register the `set_permission` tool
+      // (add). A no-op editor keeps this contract test focused on RPC payloads.
+      transform: (callback: (editor: unknown) => void) =>
+        Effect.sync(() =>
+          callback({
+            list: () => [],
+            update: () => {},
+            add: () => {},
+          }),
+        ),
     },
     shell: {
       hook: (name: string, cb: HookCb) => {
@@ -270,6 +287,31 @@ describe("bypass RPC payload contract", () => {
     expect(changedErrors(badEvent)).not.toEqual([])
   })
 
+  test("mode is an optional enum on status, changed and permission", () => {
+    // Optional everywhere: an older server that never sends `mode` must stay
+    // schema-valid, so the key is absent from every `required` list.
+    const status = { sessionID: "s", permission: "rwx", active: [], temporary: [], permanent: [] }
+    expect(statusErrors(status)).toEqual([])
+    expect(statusErrors({ ...status, mode: "auto" })).toEqual([])
+    expect(statusErrors({ ...status, mode: "bogus" })).not.toEqual([])
+    expect(statusErrors({ ...status, mode: undefined })).not.toEqual([])
+
+    const changed = { sessionID: "s", reason: "expired", active: [], temporary: [], permanent: [] }
+    expect(changedErrors(changed)).toEqual([])
+    for (const mode of ["readonly", "auto", "bypass"]) {
+      expect(changedErrors({ ...changed, mode })).toEqual([])
+    }
+    expect(changedErrors({ ...changed, mode: "ALL" })).not.toEqual([])
+
+    const permission = { sessionID: "s", reason: "set", permission: "r-x" }
+    expect(permissionErrors(permission)).toEqual([])
+    expect(permissionErrors({ ...permission, mode: "readonly" })).toEqual([])
+    expect(permissionErrors({ ...permission, mode: "readonly " })).not.toEqual([])
+    // The legacy triple field stays required for internal compatibility.
+    const { permission: _dropped, ...noPermission } = permission
+    expect(permissionErrors(noPermission)).not.toEqual([])
+  })
+
   test("no grants: status omits expiresAt entirely", async () => {
     const h = await startPlugin()
     const status = await h.status("s1")
@@ -381,7 +423,10 @@ describe("bypass RPC payload contract", () => {
     expect(child.active).toContain("filesystem")
     // The mixed case: the unbounded parent lease must not hide the child's
     // finite deadline — the effective set shrinks when the child lease ends.
-    expect(child.expiresAt).toBe(t0 + 60_000)
+    // Real-clock fixture: the arm happens after t0 inside the command
+    // handler, so allow elapsed-time slack rather than exact equality.
+    expect(child.expiresAt).toBeGreaterThanOrEqual(t0 + 60_000)
+    expect(child.expiresAt).toBeLessThan(t0 + 65_000)
 
     const parent = await h.status("s1")
     expectValidStatus(parent)

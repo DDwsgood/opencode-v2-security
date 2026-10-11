@@ -4,10 +4,9 @@
 // path anywhere. A reviewer outcome is one of exactly three automatic
 // sources, and every one is resolved without human interaction:
 //
-//   automatic_approval  — the model allowed (dynamic ALLOW / escalation
-//                         allow_once). Raw allowance is honored verbatim; no
-//                         secondary probability or weak-hint veto re-judges
-//                         it.
+//   automatic_approval  — the model allowed (dynamic ALLOW). Raw allowance
+//                         is honored verbatim; no secondary probability or
+//                         weak-hint veto re-judges it.
 //   collect_evidence    — the reviewer asked for more context. The host
 //                         collects bounded evidence ONCE, resubmits ONCE,
 //                         and denies with a named limitation when the bound
@@ -25,12 +24,12 @@
 // Program stops keep their own source labels (see AssessmentSource) and are
 // never reported as "the model denied".
 
-import { constants } from "node:fs"
-import { lstat, open, opendir, readlink, realpath, stat } from "node:fs/promises"
+import { opendir, realpath, stat } from "node:fs/promises"
 // `readdir` is deliberately not used: directory evidence streams through
 // `opendir` with a cap+1 bound instead of materializing huge listings.
 import path from "node:path"
 import type { AssessmentSource, CollectedEvidence } from "./assessment"
+import { inspectRegularTextFile, inspectionErrorCode, isPseudoFilePath } from "./inspection"
 
 // ---------------------------------------------------------------------------
 // Decision shapes
@@ -132,9 +131,12 @@ export async function collectBoundedEvidence(
   const missing: string[] = []
   const seen = new Set<string>()
   let scriptsRead = 0
-  const root = await realpath(opts.worktree).catch(() => opts.worktree)
+  const root = await realpath(opts.worktree).catch(() => undefined)
+  if (!root && !opts.allowFullReadAccess) {
+    return { evidence, missing: subjects.map((request) => `${request.subject} (workspace read boundary unavailable)`) }
+  }
   const insideRoot = (p: string) =>
-    p === root || p.startsWith(root.endsWith(path.sep) ? root : root + path.sep)
+    root !== undefined && (p === root || p.startsWith(root.endsWith(path.sep) ? root : root + path.sep))
   for (const request of subjects.slice(0, EVIDENCE_MAX_SUBJECTS)) {
     const subject = request.subject
     if (isNeverCollectPath(subject)) {
@@ -143,11 +145,15 @@ export async function collectBoundedEvidence(
     }
     const expanded = subject.replace(/^~(?=$|[\\/])/, process.env.HOME ?? "~")
     const absolute = path.isAbsolute(expanded) ? expanded : path.resolve(opts.cwd, expanded)
+    if (isPseudoFilePath(absolute)) {
+      missing.push(`${subject} (pseudo-file content is not collected)`)
+      continue
+    }
     let canonical: string
     try {
       canonical = await realpath(absolute)
-    } catch {
-      missing.push(subject)
+    } catch (error) {
+      missing.push(`${subject} (${inspectionErrorCode(error)})`)
       continue
     }
     // Dedupe on the RESOLVED path so `a.py`, `./a.py` and a symlink alias
@@ -158,6 +164,10 @@ export async function collectBoundedEvidence(
     // aliases land here even when the subject looked harmless).
     if (isNeverCollectPath(canonical)) {
       missing.push(subject)
+      continue
+    }
+    if (isPseudoFilePath(canonical)) {
+      missing.push(`${subject} (pseudo-file content is not collected)`)
       continue
     }
     if (!opts.allowFullReadAccess && !insideRoot(canonical)) {
@@ -196,68 +206,31 @@ export async function collectBoundedEvidence(
           },
         })
       } else if (scriptsRead < EVIDENCE_MAX_SCRIPTS) {
-        // Byte-bounded descriptor read with identity verification:
-        //   1. O_NOFOLLOW where the platform offers it — the fd opens the
-        //      leaf object itself, not a symlink swapped in after realpath.
-        //   2. fstat confirms a REGULAR file inside the byte bound.
-        //   3. A post-open lstat of the licensed canonical path must match
-        //      the fd's dev+ino: the file we resolved and the file we opened
-        //      are the same object — the realpath→open gap cannot substitute
-        //      a different one.
-        //   4. Linux /proc/self/fd readlink names the actual backing object;
-        //      it must equal the canonical path (deleted-suffix stripped).
-        // An oversized or identity-mismatched subject is `missing`, never a
-        // misleadingly "complete" excerpt.
-        const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)
-        const handle = await open(canonical, flags)
-        try {
-          const fileInfo = await handle.stat()
-          if (!fileInfo.isFile()) {
-            missing.push(subject)
-            continue
-          }
-          const licensed = await lstat(canonical).catch(() => undefined)
-          if (
-            !licensed ||
-            licensed.dev !== fileInfo.dev ||
-            licensed.ino !== fileInfo.ino
-          ) {
-            missing.push(subject)
-            continue
-          }
-          const fdTarget = await readlink(`/proc/self/fd/${handle.fd}`).catch(() => undefined)
-          if (fdTarget !== undefined && fdTarget.replace(/ \(deleted\)$/, "") !== canonical) {
-            missing.push(subject)
-            continue
-          }
-          if (fileInfo.size > EVIDENCE_MAX_SCRIPT_BYTES) {
-            missing.push(`${subject} (exceeds ${EVIDENCE_MAX_SCRIPT_BYTES}-byte evidence bound)`)
-            continue
-          }
-          const buffer = Buffer.alloc(Math.min(fileInfo.size, EVIDENCE_MAX_SCRIPT_BYTES))
-          const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
-          evidence.push({
-            kind: "script",
-            subject,
-            excerpt: buffer.subarray(0, bytesRead).toString("utf8"),
-            truncated: bytesRead < fileInfo.size,
-            identity: {
-              resolvedPath: canonical,
-              dev: fileInfo.dev,
-              ino: fileInfo.ino,
-              size: fileInfo.size,
-              mtimeMs: fileInfo.mtimeMs,
-            },
-          })
-          scriptsRead += 1
-        } finally {
-          await handle.close()
+        const inspected = await inspectRegularTextFile(canonical, EVIDENCE_MAX_SCRIPT_BYTES)
+        if (!inspected.ok) {
+          missing.push(`${subject} (${inspected.reason})`)
+          continue
         }
+        const fileInfo = inspected.info
+        evidence.push({
+          kind: "script",
+          subject,
+          excerpt: inspected.text,
+          truncated: false,
+          identity: {
+            resolvedPath: canonical,
+            dev: fileInfo.dev,
+            ino: fileInfo.ino,
+            size: fileInfo.size,
+            mtimeMs: fileInfo.mtimeMs,
+          },
+        })
+        scriptsRead += 1
       } else {
         missing.push(subject)
       }
-    } catch {
-      missing.push(subject)
+    } catch (error) {
+      missing.push(`${subject} (${inspectionErrorCode(error)})`)
     }
   }
   for (const request of subjects.slice(EVIDENCE_MAX_SUBJECTS)) {

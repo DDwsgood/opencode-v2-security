@@ -306,6 +306,163 @@ bwrap_probe() { # name reason-if-skipped -> 0 run / 1 skipped
   skip "$1" "$2"; return 1
 }
 
+# ========================================================================
+# WORKSPACE PROFILE  (workspace-write: ro root + writable scratch/roots)
+# =======================================================================
+# Requires a bwrap path — on landlock-only the helper refuses (exit 125).
+WSROOT="$SCRATCH/ws-root"
+WSFILE="$SCRATCH/ws-file"
+WSDENY="$SCRATCH/ws-deny"
+WSFILE_NEW="$SCRATCH/ws-newfile"
+mkdir -p "$WSROOT/sub" "$WSDENY"
+echo seed > "$WSFILE"
+echo hidden > "$WSDENY/hidden.txt"
+
+if bwrap_probe "ws: home write blocked" "no bwrap path"; then
+  run_sbx workspace 'echo x > "$HOME/.p4_ws_home" 2>/dev/null; true' \
+    OPENCODE_SANDBOX_WRITE_ROOTS="$WSROOT" >/dev/null
+  assert_absent "ws: home write blocked" "$HOME/.p4_ws_home"
+fi
+
+if bwrap_probe "ws: scratch write allowed" "no bwrap path"; then
+  run_sbx workspace "echo ok > '$SCRATCH/p4_ws_scratch'; true" \
+    OPENCODE_SANDBOX_WRITE_ROOTS="$WSROOT" >/dev/null
+  assert_present "ws: scratch write allowed" "$SCRATCH/p4_ws_scratch"
+  rm -f "$SCRATCH/p4_ws_scratch"
+fi
+
+if bwrap_probe "ws: write-root dir writable" "no bwrap path"; then
+  run_sbx workspace "echo ok > '$WSROOT/sub/newfile'; mkdir '$WSROOT/d' 2>/dev/null; true" \
+    OPENCODE_SANDBOX_WRITE_ROOTS="$WSROOT" >/dev/null
+  assert_present "ws: write-root dir writable" "$WSROOT/sub/newfile"
+  assert_present "ws: write-root mkdir" "$WSROOT/d"
+  rm -f "$WSROOT/sub/newfile"; rmdir "$WSROOT/d"
+fi
+
+if bwrap_probe "ws: sibling path outside write root stays read-only" "no bwrap path"; then
+  run_sbx workspace "echo x > '$SCRATCH/ws-outside' 2>/dev/null; echo x > /etc/p4_ws 2>/dev/null; true" \
+    OPENCODE_SANDBOX_WRITE_ROOTS="$WSROOT" >/dev/null
+  assert_absent "ws: outside-root write blocked" /etc/p4_ws
+fi
+
+if bwrap_probe "ws: file write root is exactly that file" "no bwrap path"; then
+  run_sbx workspace "echo wrote > '$WSFILE' && cat '$WSFILE'; \
+    echo x > '$SCRATCH/ws-other' 2>/dev/null; true" \
+    OPENCODE_SANDBOX_WRITE_ROOTS="$WSFILE" >/dev/null
+  OUT="$(cat "$WSFILE")"
+  if [ "$OUT" = "wrote" ]; then pass "ws: file write root is exactly that file"; \
+    else fail "ws: file write root" "content='$OUT'"; fi
+fi
+
+# A missing write root is a hard refusal — the helper never creates the
+# approved target and never widens to a parent directory.
+if bwrap_probe "ws: missing write root fails closed (no host side effect)" "no bwrap path"; then
+  rm -f "$WSFILE_NEW"
+  OUT="$(run_sbx workspace 'echo SHOULD-NOT-RUN' \
+    OPENCODE_SANDBOX_WRITE_ROOTS="$WSFILE_NEW" 2>&1)"; RC=$?
+  if [ "$RC" = "125" ] && [ ! -e "$WSFILE_NEW" ] \
+     && ! echo "$OUT" | grep -q "SHOULD-NOT-RUN"; then
+    pass "ws: missing write root fails closed (no host side effect)"
+  else
+    fail "ws: missing write root fails closed" "rc=$RC exists=$([ -e "$WSFILE_NEW" ] && echo y) out=$OUT"
+  fi
+fi
+
+# A symlinked write root (component or leaf) is rejected, never followed.
+if bwrap_probe "ws: symlink write root rejected" "no bwrap path"; then
+  ln -sf "$WSROOT" "$SCRATCH/ws-link"
+  OUT="$(run_sbx workspace 'echo SHOULD-NOT-RUN' \
+    OPENCODE_SANDBOX_WRITE_ROOTS="$SCRATCH/ws-link" 2>&1)"; RC=$?
+  if [ "$RC" = "125" ] && ! echo "$OUT" | grep -q "SHOULD-NOT-RUN"; then
+    pass "ws: symlink write root rejected"
+  else
+    fail "ws: symlink write root rejected" "rc=$RC out=$OUT"
+  fi
+  rm -f "$SCRATCH/ws-link"
+fi
+
+# Workspace deny entries that do not exist fail closed (no silent skip).
+if bwrap_probe "ws: missing deny entry fails closed" "no bwrap path"; then
+  OUT="$(run_sbx workspace 'echo SHOULD-NOT-RUN' \
+    OPENCODE_SANDBOX_WRITE_ROOTS="$WSROOT" \
+    OPENCODE_SANDBOX_DENY_WRITE="$SCRATCH/ws-gone" 2>&1)"; RC=$?
+  if [ "$RC" = "125" ] && ! echo "$OUT" | grep -q "SHOULD-NOT-RUN"; then
+    pass "ws: missing deny entry fails closed"
+  else
+    fail "ws: missing deny entry fails closed" "rc=$RC out=$OUT"
+  fi
+fi
+
+# extraArgs are refused under workspace (a trailing --bind could shadow
+# the floor); ro/rw keep the explicit legacy pass-through.
+if bwrap_probe "ws: extraArgs refused" "no bwrap path"; then
+  OUT="$(run_sbx workspace 'echo SHOULD-NOT-RUN' \
+    OPENCODE_SANDBOX_WRITE_ROOTS="$WSROOT" \
+    OPENCODE_SANDBOX_EXTRA_ARGS='--tmpfs
+/tmp/private' 2>&1)"; RC=$?
+  if [ "$RC" = "125" ] && ! echo "$OUT" | grep -q "SHOULD-NOT-RUN"; then
+    pass "ws: extraArgs refused"
+  else
+    fail "ws: extraArgs refused" "rc=$RC out=$OUT"
+  fi
+fi
+
+if bwrap_probe "ws: denyWrite shadows a write root" "no bwrap path"; then
+  run_sbx workspace "echo x > '$WSDENY/new.txt' 2>/dev/null; \
+    test -e '$WSDENY/new.txt' && echo wrote || echo blocked" \
+    OPENCODE_SANDBOX_WRITE_ROOTS="$WSDENY" \
+    OPENCODE_SANDBOX_DENY_WRITE="$WSDENY" >/dev/null
+  assert_absent "ws: denyWrite shadows a write root" "$WSDENY/new.txt"
+fi
+
+if bwrap_probe "ws: denyRead hides a write root" "no bwrap path"; then
+  OUT="$(run_sbx workspace "ls -A '$WSDENY' 2>/dev/null | wc -l" \
+    OPENCODE_SANDBOX_WRITE_ROOTS="$WSDENY" \
+    OPENCODE_SANDBOX_DENY_READ="$WSDENY")"
+  echo "$OUT" | grep -q "^0$" && pass "ws: denyRead hides a write root" \
+    || fail "ws: denyRead hides a write root" "$OUT"
+fi
+
+if bwrap_probe "ws: network off by default" "no bwrap path"; then
+  OUT="$(run_sbx workspace 'curl -s -m 3 -o /dev/null -w "%{http_code}" http://127.0.0.1:8791/ 2>/dev/null; echo rc=$?' \
+    OPENCODE_SANDBOX_WRITE_ROOTS="$WSROOT")"
+  echo "$OUT" | grep -qE "rc=[1-9]" && pass "ws: network off by default" \
+    || fail "ws: network off by default" "$OUT"
+fi
+
+if bwrap_probe "ws: WORKSPACE_NETWORK=1 grants network per call" "no bwrap path"; then
+  OUT="$(run_sbx workspace 'curl -s -m 5 -o /dev/null -w "%{http_code}" https://example.com 2>/dev/null; echo rc=$?' \
+    OPENCODE_SANDBOX_WRITE_ROOTS="$WSROOT" \
+    OPENCODE_SANDBOX_WORKSPACE_NETWORK=1)"
+  echo "$OUT" | grep -q "rc=0" && pass "ws: WORKSPACE_NETWORK=1 grants network" \
+    || fail "ws: WORKSPACE_NETWORK=1 grants network" "$OUT"
+fi
+
+if bwrap_probe "ws: /run/WSL masked" "no bwrap path"; then
+  WSLDIR="$(run_sbx workspace 'ls /run/WSL 2>/dev/null | grep -c interop' \
+    OPENCODE_SANDBOX_WRITE_ROOTS="$WSROOT" | tail -1)"
+  if [ "$WSLDIR" = "0" ]; then pass "ws: /run/WSL masked"; \
+    else fail "ws: /run/WSL masked" "$WSLDIR interop sockets visible"; fi
+fi
+
+if bwrap_probe "ws: sudo refused (NNP, no host-direct route)" "no bwrap path"; then
+  OUT="$(run_sbx workspace 'sudo -n true && echo sudo-ok || echo sudo-fail' \
+    OPENCODE_SANDBOX_WRITE_ROOTS="$WSROOT" \
+    OPENCODE_SANDBOX_ALLOW_SUDO=1)"
+  echo "$OUT" | grep -q "sudo-fail" && pass "ws: sudo refused even with ALLOW_SUDO=1" \
+    || fail "ws: sudo refused even with ALLOW_SUDO=1" "$OUT"
+fi
+
+# landlock-only refuses the workspace profile outright (mount contract loss).
+OUT="$(run_sbx workspace 'echo SHOULD-NOT-RUN' OPENCODE_SANDBOX_FALLBACK=landlock-only 2>&1)"; RC=$?
+if [ "$RC" = "125" ] && ! echo "$OUT" | grep -q "SHOULD-NOT-RUN"; then
+  pass "ws: landlock-only refuses (fail-closed)"
+else
+  fail "ws: landlock-only refuses" "rc=$RC out=$OUT"
+fi
+
+rm -rf "$WSROOT" "$WSDENY"; rm -f "$WSFILE" "$SCRATCH/ws-outside" "$SCRATCH/ws-sibling"
+
 EXT="$SCRATCH/ext-c"
 mkdir -p "$EXT/fix-dw" "$EXT/fix-dr" "$EXT/fix-both"
 echo secret > "$EXT/fix-dr/hidden.txt"
@@ -428,6 +585,21 @@ if bwrap_probe "extra-args: bad flag fails closed" "no bwrap path"; then
     pass "extra-args: bad flag fails closed"
   else fail "extra-args: bad flag fails closed" "$OUT"; fi
 fi
+
+# --- stage2 inherited-fd sweep (no bwrap needed) ------------------------
+# Workspace write roots are pinned as inherited O_PATH fds for bwrap's
+# --bind-fd; stage2 must close every inherited fd >= 3 before the payload
+# runs, regardless of whether bwrap closed them. Direct --stage2 exec is
+# the same code path the landlock-only route takes, so this verifies the
+# sweep itself (NOT the full --bind-fd mount, which needs real bwrap).
+exec 3<"$WSFILE"
+OUT="$(OPENCODE_SANDBOX_MODE=rw OPENCODE_SANDBOX_SCRATCH="$SCRATCH" \
+    OPENCODE_REAL_BASH=/bin/bash \
+    "$HELPER" --stage2 --mode rw --no-landlock -- \
+    bash -c 'if [ -e /proc/self/fd/3 ]; then echo LEAKED; else echo clean; fi' 2>&1)"
+exec 3<&-
+if [ "$OUT" = "clean" ]; then pass "stage2: inherited fd closed before payload"; \
+  else fail "stage2: inherited fd closed before payload" "out=$OUT"; fi
 
 rm -f "$EXT/fix-dr/hidden.txt" "$EXT/fix-both/x.txt" \
       "$EXT/fix-dw/t" "$EXT/fix-dw/t2" "$EXT/fix-both/y"

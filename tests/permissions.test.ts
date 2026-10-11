@@ -21,7 +21,6 @@ describe("parsePerm (r/w MVP)", () => {
     ["read", perm(true, false)],
     ["r--", perm(true, false)],
     ["4", perm(true, false)],
-    ["w", perm(false, true)],
     ["-w-", perm(false, true)],
     ["2", perm(false, true)],
     ["rw", perm(true, true)],

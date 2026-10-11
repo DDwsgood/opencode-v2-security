@@ -18,6 +18,33 @@
 
 export type Perm = { r: boolean; w: boolean; x: boolean }
 
+export type SecurityMode = "readonly" | "auto" | "bypass"
+
+/** User-visible modes; the internal r/w ceiling remains separately enforced. */
+export function parseSecurityMode(raw: string): SecurityMode | undefined {
+  const value = raw.trim().toLowerCase()
+  if (["r", "ro", "read", "readonly", "read-only", "read_only", "r--", "4"].includes(value)) return "readonly"
+  if (["w", "rw", "auto", "automatic", "readwrite", "read-write", "rw-", "6"].includes(value)) return "auto"
+  if (["bypass", "yolo", "all", "*"].includes(value)) return "bypass"
+  return undefined
+}
+
+export function permForMode(mode: SecurityMode): Perm {
+  return { r: true, w: mode !== "readonly", x: false }
+}
+
+/** An inherited read-only ceiling takes precedence over any bypass selection. */
+export function securityModeFor(perm: Perm, bypass: boolean): SecurityMode {
+  return !perm.w ? "readonly" : bypass ? "bypass" : "auto"
+}
+
+export function securityModeLabel(mode: SecurityMode, categories: readonly string[] = [], custom = false): string {
+  if (mode === "readonly") return "[Read only]"
+  if (mode === "bypass") return "[Bypass mode]"
+  const active = [...new Set(categories.filter(category => category !== "ALL" && category !== "all"))].sort()
+  return `[Auto mode${active.length ? `, bypassing: ${active.join(",")}` : ""}${custom ? ", custom bypassing on" : ""}]`
+}
+
 export const PERM_FULL: Perm = { r: true, w: true, x: true }
 export const PERM_NONE: Perm = { r: false, w: false, x: false }
 
@@ -25,10 +52,17 @@ const PERM_ALIAS: Record<string, Perm> = {
   r: { r: true, w: false, x: false },
   ro: { r: true, w: false, x: false },
   read: { r: true, w: false, x: false },
+  readonly: { r: true, w: false, x: false },
+  "read-only": { r: true, w: false, x: false },
+  read_only: { r: true, w: false, x: false },
   "r--": { r: true, w: false, x: false },
-  w: { r: false, w: true, x: false },
+  w: { r: true, w: true, x: false },
   "-w-": { r: false, w: true, x: false },
   rw: { r: true, w: true, x: false },
+  auto: { r: true, w: true, x: false },
+  automatic: { r: true, w: true, x: false },
+  readwrite: { r: true, w: true, x: false },
+  "read-write": { r: true, w: true, x: false },
   "rw-": { r: true, w: true, x: false },
   none: PERM_NONE,
   off: PERM_NONE,

@@ -1,4 +1,3 @@
-import { lstatSync } from "node:fs"
 import { isIP } from "node:net"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -27,7 +26,8 @@ export {
   type StaticBypassCategory,
 } from "./categories"
 
-export type Strictness = "LOOSE" | "HARD"
+/** Retained compatibility spelling for the single current policy. */
+export type Strictness = "LOOSE"
 export type FailPolicy = "fail_open" | "fail_close"
 
 /** Escape-hatch categories the user can arm permanently (config.json
@@ -41,19 +41,21 @@ export type FailPolicy = "fail_open" | "fail_close"
  * (`/bypass all`, session-only) that disables every plugin enforcement layer.
  * `*` is the command-side "arm every category" token. Neither is valid in the
  * permanent `BypassClassifier` config list. */
-const DEFAULT_BYPASS_LEASE_TTL_MS = 20 * 60 * 1000
+/** 0 = a lease without a timeout never expires on its own. */
+const DEFAULT_BYPASS_LEASE_TTL_MS = 0
 const MIN_BYPASS_LEASE_TTL_MS = 60_000
 const MAX_BYPASS_LEASE_TTL_MS = 24 * 60 * 60 * 1000
 
-/** Which dynamic reviewer engine to consult (default "auto"). "auto" tries
- * the Jev reviewer when `dynamicReview.jev` is configured and falls back to
- * the OpenAI-compatible auditor on infrastructure failures. */
+/** Which dynamic reviewer engine to consult. The review chain is JEV-only:
+ * resolved configuration always reports "jev"; the legacy spellings
+ * "openai"/"auto" are still accepted as input for compatibility but resolve
+ * to "jev" with a warning — there is no OpenAI-auditor fallback. */
 export type DynamicReviewerEngine = "jev" | "openai" | "auto"
 
 export type JevReviewOptions = {
   /** Master switch; default true when the jev object is present. */
   enabled?: boolean
-  /** Default "jev-1.13". */
+  /** Default "jev-latest" (matches the frozen question bundle). */
   model?: string
   /** Default "https://opencode.ai/zen/v1/systemone". */
   endpoint?: string
@@ -64,6 +66,9 @@ export type JevReviewOptions = {
 }
 
 export type DynamicReviewOptions = {
+  /** Legacy OpenAI-auditor fields (baseURL/model/apiKey/apiKeyEnv/
+   * auditorPath/pythonPath) are accepted for compatibility but unused: the
+   * review chain is JEV-only — they never enable a review or a fallback. */
   baseURL?: string
   model?: string
   apiKey?: string
@@ -79,10 +84,18 @@ export type DynamicReviewOptions = {
   /** Path to the auditor script. Relative paths resolve against the package root
    * and must point to an existing regular file (directories are rejected). */
   auditorPath?: string
-  /** Reviewer engine selection: "jev", "openai", or "auto" (default). */
+  /** Reviewer engine selection. Only "jev" enables review; "openai"/"auto"
+   * are accepted for compatibility and resolve to "jev" (with a warning). */
   reviewer?: DynamicReviewerEngine
-  /** Jev (systemone) reviewer configuration. */
+  /** Jev (systemone) reviewer configuration. The dedicated reviewer: when a
+   * dynamicReview object is present and jev is not disabled, the default
+   * endpoint/model apply and availability only requires the API key env. */
   jev?: JevReviewOptions
+  /** Verdict when the reviewer asks for evidence that cannot be collected
+   * automatically and no floor rule forbids the call: "allow" (default)
+   * proceeds, "deny" refuses. Any other configured value is a hard config
+   * error — never a silent fallback. */
+  onUncollectable?: "allow" | "deny"
   [key: string]: unknown
 }
 
@@ -125,7 +138,7 @@ export type BashClassifierOptions = {
   /** Default lifetime for temporary per-session bypass leases, in
    * milliseconds, used when a /bypass arm carries no trailing timeout.
    * Leases expire at a fixed absolute deadline: activity never renews them.
-   * Default 20 minutes. */
+   * Default 0: no natural expiry (until /bypass off, deletion or restart). */
   bypassLeaseTtlMs?: number
   /** Whether a session's temporary bypass also covers its subagent children
    * (default true). */
@@ -134,11 +147,6 @@ export type BashClassifierOptions = {
    * session (x is reserved and not enforced in this MVP). See README
    * "Session permissions". */
   permission?: PermissionOptions
-  /** Whether agents may request one-shot escalations via the
-   *  `# - REQUIRE_ESCALATION` header protocol (default true). When false the
-   *  header is inert (a leading comment, not a request), no reviewer is
-   *  consulted for it, and no agent-facing text mentions the mechanism. */
-  escalationEnabled?: boolean
   /** OS-level sandbox (Linux only): bwrap namespace+seccomp floor plus a
    * Landlock write-freeze for read-only profiles. See plan §4. */
   sandbox?: SandboxOptions
@@ -158,7 +166,10 @@ export type ResolvedJevReview = {
 }
 
 export type ResolvedDynamicReview = {
+  /** The JEV chain is usable: a dynamicReview object was configured and its
+   * jev settings resolved (endpoint + model + API key env). */
   available: boolean
+  /** Legacy OpenAI-auditor fields — no longer populated by resolution. */
   endpoint?: string
   model?: string
   apiKey?: string
@@ -167,9 +178,13 @@ export type ResolvedDynamicReview = {
   pythonPath?: string
   auditorPath?: string
   allowFullReadAccess: boolean
+  /** Always "jev" in resolved configuration (legacy spellings are coerced). */
   reviewer: DynamicReviewerEngine
-  /** Jev reviewer settings; absent when dynamicReview.jev is not configured. */
+  /** Jev reviewer settings; present whenever a dynamicReview object was
+   * configured (jev resolution is the only review chain). */
   jev?: ResolvedJevReview
+  /** Verdict for uncollectable evidence that breaks no floor rule. */
+  onUncollectable: "allow" | "deny"
   /** Human-readable unavailability reason; never contains secrets. */
   reason?: string
 }
@@ -218,45 +233,58 @@ export type ResolvedPermission = {
   subagentPermission: boolean
 }
 
-export type SandboxMode = "auto" | "ro" | "rw" | "full"
+export type SandboxMode = "auto" | "ro" | "rw" | "workspace" | "full"
 export type SandboxOnUnavailable = "fail_close" | "degrade"
 
 export type SandboxOptions = {
   /** Master switch; default true on Linux, ignored (forced off) elsewhere. */
   enabled?: boolean
   /** "auto" derives the profile per call from effectivePerm (w=false → ro,
-   * w=true → rw); "ro"/"rw" force that profile; "full" disables the wrap. */
+   * w=true → workspace); "ro"/"rw"/"workspace" force that profile — "rw" is
+   * the legacy host-write profile (whole root bound writable) kept for
+   * explicit opt-in — "full" disables the wrap. */
   mode?: SandboxMode
   /** bwrap binary; absolute path or a bare name resolved by the helper. */
   bwrapPath?: string
   /** Prebuilt helper override; "" resolves to <package>/bin/opencode-sandbox. */
   helperPath?: string
-  /** The only RO-writable hierarchy; must be an absolute, non-traversal path. */
+  /** The only RO-writable hierarchy; must be an absolute, non-traversal path.
+   * Under the workspace profile it is bound writable like the worktree. */
   scratch?: string
   /** "off" (default) = RO gets --unshare-net + Landlock TCP deny. */
   roNetwork?: "off" | "on"
   /** "on" (default) = RW keeps network access; "off" applies the same
    * --unshare-net + Landlock TCP deny to the RW profile. */
   rwNetwork?: "on" | "off"
+  /** Workspace profile default: "off" = --unshare-net + Landlock TCP deny.
+   * A per-call network capability carried on the marker overrides this for
+   * that call only. "on" grants network to every workspace-profile call. */
+  workspaceNetwork?: "on" | "off"
   /** Extra paths write-frozen (denyWrite) or read-shadowed (denyRead) on top
    * of the profile's base rules; colon-joined into OPENCODE_SANDBOX_DENY_*
    * envs. Entries must be absolute, contain no ":" or "..", and may not be
    * "/" or the scratch dir. The same path may appear in both lists — the
-   * helper applies read-shadow first, then write-freeze. */
+   * helper applies read-shadow first, then write-freeze. Under "workspace"
+   * these are the only read/write denials below the write allow-list, and
+   * they shadow write roots too. */
   denyWrite?: string[]
   denyRead?: string[]
   /** Allow sudo/setuid escalation (default false). Honest semantics: bwrap
    * sets no_new_privs unconditionally, so the helper treats true on RW as
-   * "run the payload host-direct" — no namespace, NNP, or seccomp floor —
-   * while RO stays fully isolated and always refuses sudo. */
+   * "run the payload host-direct" — no namespace, NNP, or seccomp floor.
+   * RO ignores it; the workspace profile ignores it as well — a
+   * privilege-needing call under workspace is refused by the caller rather
+   * than silently losing the whole floor. */
   allowSudo?: boolean
   /** Raw bwrap argv pass-through: each entry is ONE argv element appended
    * after all helper-generated args, immediately before the `--` payload
-   * separator. Applies to ro, rw, and the bwrap-only fallback; later mounts
-   * shadow earlier ones (user authority layer). Landlock rules are unaffected.
-   * Newline characters are rejected (newline is the env encoding separator). */
+   * separator. Applies to ro, rw, workspace, and the bwrap-only fallback;
+   * later mounts shadow earlier ones (user authority layer). Landlock rules
+   * are unaffected. Newline characters are rejected (newline is the env
+   * encoding separator). */
   extraArgs?: string[]
-  /** RO masks /run/WSL (WSL interop sockets) with a fresh tmpfs. */
+  /** RO and workspace mask /run/WSL (WSL interop sockets) with a fresh
+   * tmpfs. */
   maskWslInterop?: boolean
   /** Privileged sockets masked with `--bind /dev/null <path>` when they exist. */
   maskPrivilegedSockets?: string[]
@@ -264,7 +292,9 @@ export type SandboxOptions = {
    * backstop. */
   roAfUnixBlock?: boolean
   /** Behavior when the sandbox cannot be built: "fail_close" (default) denies
-   * shell execution; "degrade" runs classifier-only. */
+   * shell execution; "degrade" runs classifier-only. The workspace profile
+   * additionally cannot degrade onto landlock-only when deny lists are
+   * configured — mount-level denials are part of its contract. */
   onUnavailable?: SandboxOnUnavailable
   [key: string]: unknown
 }
@@ -277,6 +307,7 @@ export type ResolvedSandbox = {
   scratch: string
   roNetwork: "off" | "on"
   rwNetwork: "on" | "off"
+  workspaceNetwork: "on" | "off"
   denyWrite: readonly string[]
   denyRead: readonly string[]
   allowSudo: boolean
@@ -301,11 +332,13 @@ export type ResolvedPluginConfig = {
   bypassClassifier: ReadonlySet<BypassCategory>
   bypassLeaseTtlMs: number
   bypassPropagateToSubagents: boolean
-  escalationEnabled: boolean
   permission: ResolvedPermission
   sandbox: ResolvedSandbox
   /** Non-fatal BypassClassifier validation warnings (unknown categories). */
   bypassWarnings: readonly string[]
+  /** Non-fatal dynamicReview warnings (ignored legacy fields, coerced
+   * reviewer spellings). Never contain credentials. */
+  dynamicReviewWarnings: readonly string[]
   dynamicReview: ResolvedDynamicReview
   reviewCommand?: ReviewCommand
 }
@@ -325,7 +358,6 @@ const ALLOWED_TOP_LEVEL = new Set([
   "BypassClassifier",
   "bypassLeaseTtlMs",
   "bypassPropagateToSubagents",
-  "escalationEnabled",
   "permission",
   "sandbox",
   "reviewCommand",
@@ -350,6 +382,7 @@ const ALLOWED_SANDBOX_FIELDS = new Set([
   "scratch",
   "roNetwork",
   "rwNetwork",
+  "workspaceNetwork",
   "denyWrite",
   "denyRead",
   "allowSudo",
@@ -372,12 +405,13 @@ const ALLOWED_DYNAMIC_FIELDS = new Set([
   "auditorPath",
   "reviewer",
   "jev",
+  "onUncollectable",
 ])
 
 const ALLOWED_JEV_FIELDS = new Set(["enabled", "model", "endpoint", "apiKeyEnv"])
 
 const DEFAULT_JEV_ENDPOINT = "https://opencode.ai/zen/v1/systemone"
-const DEFAULT_JEV_MODEL = "jev-1.13"
+const DEFAULT_JEV_MODEL = "jev-latest"
 const DEFAULT_JEV_KEY_ENV = "JEV_API_KEY"
 const FALLBACK_JEV_KEY_ENV = "OC_API_KEY"
 
@@ -420,9 +454,9 @@ function resolveTimeoutMs(raw: unknown): { value: number; reason?: string } {
   return { value: raw }
 }
 
-function resolveMaxRounds(raw: unknown, strictness: Strictness): { value: number; reason?: string } {
-  const fallback = strictness === "LOOSE" ? 1 : 2
-  const limit = strictness === "LOOSE" ? 3 : 5
+function resolveMaxRounds(raw: unknown): { value: number; reason?: string } {
+  const fallback = 1
+  const limit = 3
   if (raw === undefined) return { value: fallback }
   if (typeof raw !== "number" || !Number.isFinite(raw) || !Number.isInteger(raw)) {
     return { value: fallback, reason: "dynamicReview.maxRounds must be an integer" }
@@ -434,45 +468,6 @@ function resolveMaxRounds(raw: unknown, strictness: Strictness): { value: number
     }
   }
   return { value: raw }
-}
-
-function resolveEndpoint(raw: unknown): { endpoint?: string; reason?: string } {
-  if (typeof raw !== "string" || !raw.trim()) {
-    return { reason: "dynamicReview.baseURL is not configured" }
-  }
-  const trimmed = raw.trim()
-  if (URL_CONTROL_CHARS.test(trimmed)) {
-    return { reason: "dynamicReview.baseURL must not contain control characters" }
-  }
-  let parsed: URL
-  try {
-    parsed = new URL(trimmed)
-  } catch {
-    return { reason: "dynamicReview.baseURL is not a valid URL" }
-  }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    return { reason: "dynamicReview.baseURL must use http or https" }
-  }
-  const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "")
-  const ipVersion = isIP(hostname)
-  const loopback =
-    hostname === "localhost" ||
-    (ipVersion === 4 && hostname.startsWith("127.")) ||
-    (ipVersion === 6 && hostname === "::1")
-  if (parsed.protocol === "http:" && !loopback) {
-    return { reason: "dynamicReview.baseURL may use http only for a loopback host" }
-  }
-  if (parsed.username || parsed.password) {
-    return { reason: "dynamicReview.baseURL must not contain userinfo" }
-  }
-  if (parsed.hash) {
-    return { reason: "dynamicReview.baseURL must not contain a fragment" }
-  }
-  const query = parsed.search
-  let pathname = parsed.pathname.replace(/\/+$/, "")
-  if (!pathname.endsWith("/chat/completions")) pathname += "/chat/completions"
-  const endpoint = `${parsed.protocol}//${parsed.host}${pathname}${query}`
-  return { endpoint }
 }
 
 /** Jev endpoint validation: used verbatim (no /chat/completions suffix) —
@@ -576,133 +571,80 @@ function resolveModel(raw: unknown): { model?: string; reason?: string } {
   return { model: trimmed }
 }
 
-function resolveApiKey(dynamic: Record<string, unknown>): { apiKey?: string; reason?: string } {
-  const hasApiKey = dynamic.apiKey !== undefined
-  const hasApiKeyEnv = dynamic.apiKeyEnv !== undefined
-  if (hasApiKey && hasApiKeyEnv) {
-    return { reason: "provide exactly one of dynamicReview.apiKey or apiKeyEnv" }
-  }
-  if (!hasApiKey && !hasApiKeyEnv) {
-    return { reason: "dynamicReview requires apiKey or apiKeyEnv" }
-  }
-
-  let rawKey: string
-  if (hasApiKey) {
-    if (typeof dynamic.apiKey !== "string") {
-      return { reason: "dynamicReview.apiKey must be a string" }
-    }
-    rawKey = dynamic.apiKey
-  } else {
-    const envName = dynamic.apiKeyEnv
-    if (typeof envName !== "string" || !envName.trim()) {
-      return { reason: "dynamicReview.apiKeyEnv must be a non-empty string" }
-    }
-    if (!API_KEY_ENV_PATTERN.test(envName)) {
-      return { reason: "dynamicReview.apiKeyEnv is not a valid environment variable name" }
-    }
-    const value = process.env[envName]
-    if (typeof value !== "string") {
-      return { reason: `dynamicReview.apiKeyEnv "${envName}" did not resolve to a value` }
-    }
-    rawKey = value
-  }
-
-  if (FORBIDDEN_KEY_CHARS.test(rawKey)) {
-    return { reason: "dynamicReview api key contains disallowed control characters" }
-  }
-  const key = rawKey.trim()
-  if (!key) {
-    return { reason: "dynamicReview api key is empty" }
-  }
-  return { apiKey: key }
-}
-
-function isRegularFile(filePath: string): boolean {
-  try {
-    return lstatSync(filePath).isFile()
-  } catch {
-    return false
-  }
-}
-
-function resolveAuditorPath(raw: unknown): { auditorPath?: string; reason?: string } {
-  if (raw === undefined) return {}
-  if (typeof raw !== "string" || !raw.trim()) {
-    return { reason: "dynamicReview.auditorPath must be a non-empty string" }
-  }
-  const resolved = path.resolve(PACKAGE_ROOT, raw.trim())
-  if (!isRegularFile(resolved)) {
-    return { reason: "dynamicReview.auditorPath is not an existing regular file" }
-  }
-  return { auditorPath: resolved }
-}
-
-function resolvePythonPath(raw: unknown): { pythonPath?: string; reason?: string } {
-  if (raw === undefined) return {}
-  if (typeof raw !== "string" || !raw.trim()) {
-    return { reason: "dynamicReview.pythonPath must be a non-empty string" }
-  }
-  const trimmed = raw.trim()
-  // A bare command name (no path separator) is left as-is so the reviewer can
-  // resolve it through PATH at spawn time; a path with a directory component is
-  // resolved against the package root and must be an existing regular file.
-  if (!trimmed.includes("/") && !trimmed.includes("\\")) {
-    return { pythonPath: trimmed }
-  }
-  const resolved = path.resolve(PACKAGE_ROOT, trimmed)
-  if (!isRegularFile(resolved)) {
-    return { reason: "dynamicReview.pythonPath is not an existing regular file" }
-  }
-  return { pythonPath: resolved }
-}
-
-function resolveDynamicReview(raw: unknown, strictness: Strictness): ResolvedDynamicReview {
-  const defaultRounds = strictness === "LOOSE" ? 1 : 2
-  if (raw === undefined) {
-    return {
+/** dynamicReview resolution — JEV-only chain.
+ * `available` depends solely on the jev reviewer resolving: a configured
+ * dynamicReview object is usable as soon as the jev endpoint/model/key-env
+ * resolve (jev object optional — defaults apply). Legacy OpenAI-auditor
+ * fields (baseURL/model/apiKey/apiKeyEnv/auditorPath/pythonPath) are accepted
+ * without validation so old configs keep loading, but they never enable a
+ * review or a fallback; their presence produces a warning. The resolved
+ * `reviewer` is always "jev"; legacy "openai"/"auto" spellings coerce to it.
+ * Unknown or malformed values fail validation explicitly — nothing silently
+ * falls back to the old chain. */
+function resolveDynamicReview(
+  raw: unknown,
+): { value: ResolvedDynamicReview; warnings: string[] } {
+  const defaultRounds = 1
+  const unavailable = (
+    reason: string,
+    partial: Partial<ResolvedDynamicReview> = {},
+  ): { value: ResolvedDynamicReview; warnings: string[] } => ({
+    value: {
       available: false,
       timeoutMs: DEFAULT_TIMEOUT_MS,
       maxRounds: defaultRounds,
       allowFullReadAccess: false,
-      reviewer: "auto",
-      reason: "dynamic review is not configured",
-    }
+      reviewer: "jev",
+      onUncollectable: "allow",
+      reason,
+      ...partial,
+    },
+    warnings: [],
+  })
+  if (raw === undefined) {
+    return unavailable("dynamic review is not configured")
   }
   if (!isPlainObject(raw)) {
-    return {
-      available: false,
-      timeoutMs: DEFAULT_TIMEOUT_MS,
-      maxRounds: defaultRounds,
-      allowFullReadAccess: false,
-      reviewer: "auto",
-      reason: "dynamicReview must be an object",
-    }
+    return unavailable("dynamicReview must be an object")
   }
   for (const key of Object.keys(raw)) {
     if (!ALLOWED_DYNAMIC_FIELDS.has(key)) {
-      return {
-        available: false,
-        timeoutMs: DEFAULT_TIMEOUT_MS,
-        maxRounds: defaultRounds,
-        allowFullReadAccess: false,
-        reviewer: "auto",
-        reason: `dynamicReview contains an unknown field: ${key}`,
-      }
+      return unavailable(`dynamicReview contains an unknown field: ${key}`)
     }
   }
 
   const dynamic = raw as Record<string, unknown>
-  const timeout = resolveTimeoutMs(dynamic.timeoutMs)
-  const rounds = resolveMaxRounds(dynamic.maxRounds, strictness)
-  const allowFullReadAccess = dynamic.allowFullReadAccess
-  const endpointResult = resolveEndpoint(dynamic.baseURL)
-  const modelResult = resolveModel(dynamic.model)
-  const keyResult = resolveApiKey(dynamic)
-  const auditorResult = resolveAuditorPath(dynamic.auditorPath)
-  const pythonResult = resolvePythonPath(dynamic.pythonPath)
-  const jevResult = resolveJev(dynamic.jev)
+  // onUncollectable is a hard-validated knob: an unrecognized configured
+  // value must fail loudly, never silently become the permissive default.
+  if (dynamic.onUncollectable !== undefined) {
+    if (dynamic.onUncollectable !== "allow" && dynamic.onUncollectable !== "deny") {
+      throw new Error('dynamicReview.onUncollectable must be "allow" or "deny"')
+    }
+  }
+  const onUncollectable: "allow" | "deny" = dynamic.onUncollectable === "deny" ? "deny" : "allow"
 
-  let reviewer: DynamicReviewerEngine = "auto"
+  const timeout = resolveTimeoutMs(dynamic.timeoutMs)
+  const rounds = resolveMaxRounds(dynamic.maxRounds)
+  const allowFullReadAccess = dynamic.allowFullReadAccess
+  // Legacy auditorPath/pythonPath are NOT resolved here: they belong to the
+  // removed OpenAI-auditor chain, and validating them would let a stale path
+  // in an old config turn a working JEV setup unavailable.
+  // No dynamicReview.jev object → the defaults apply (endpoint, model,
+  // JEV_API_KEY/OC_API_KEY env). An explicit { enabled: false } disables.
+  const jevResult = resolveJev(dynamic.jev ?? {})
+
+  const warnings: string[] = []
+  const legacyFields = ["baseURL", "model", "apiKey", "apiKeyEnv", "auditorPath", "pythonPath"].filter(
+    (key) => dynamic[key] !== undefined,
+  )
+  if (legacyFields.length > 0) {
+    warnings.push(
+      `dynamicReview fields ${legacyFields.join(", ")} are accepted for compatibility but unused — ` +
+        "the review chain is JEV-only; they never enable a review or a fallback",
+    )
+  }
+
+  let reviewer: DynamicReviewerEngine = "jev"
   const reviewerReason =
     dynamic.reviewer === undefined ||
     dynamic.reviewer === "jev" ||
@@ -710,66 +652,68 @@ function resolveDynamicReview(raw: unknown, strictness: Strictness): ResolvedDyn
     dynamic.reviewer === "auto"
       ? undefined
       : 'dynamicReview.reviewer must be "jev", "openai", or "auto"'
-  if (dynamic.reviewer === "jev" || dynamic.reviewer === "openai") {
-    reviewer = dynamic.reviewer
+  if (dynamic.reviewer === "openai" || dynamic.reviewer === "auto") {
+    warnings.push(
+      `dynamicReview.reviewer:"${dynamic.reviewer}" is a legacy spelling — the review chain is JEV-only; ` +
+        'resolved reviewer is "jev" with no OpenAI-auditor fallback',
+    )
   }
-  if (reviewer === "jev" && !jevResult.jev?.available) {
-    // An explicit engine choice without a working Jev config is a hard
-    // config error — "auto" would simply never select it, but "jev" has no
-    // fallback of its own.
-    return {
-      available: false,
-      timeoutMs: timeout.value,
-      maxRounds: rounds.value,
-      allowFullReadAccess: false,
-      reviewer,
-      jev: jevResult.jev,
-      reason:
-        jevResult.jev?.reason ??
-        jevResult.reason ??
-        "dynamicReview.jev is not configured",
-    }
-  }
+  // Resolved reviewer is always "jev" — routing a resolved "openai"/"auto"
+  // downstream would select the removed auditor path.
+  reviewer = "jev"
 
-  const reason =
-    endpointResult.reason ??
-    modelResult.reason ??
-    keyResult.reason ??
-    timeout.reason ??
-    rounds.reason ??
-    auditorResult.reason ??
-    pythonResult.reason ??
-    jevResult.reason ??
-    reviewerReason
   const accessReason =
     allowFullReadAccess === undefined || typeof allowFullReadAccess === "boolean"
       ? undefined
       : "dynamicReview.allowFullReadAccess must be a boolean"
-  const unavailableReason = reason ?? accessReason
-  if (unavailableReason) {
+  const structuralReason =
+    timeout.reason ??
+    rounds.reason ??
+    jevResult.reason ??
+    reviewerReason ??
+    accessReason
+  if (structuralReason) {
     return {
-      available: false,
-      timeoutMs: timeout.value,
-      maxRounds: rounds.value,
-      allowFullReadAccess: false,
-      reviewer,
-      jev: jevResult.jev,
-      reason: unavailableReason,
+      value: {
+        available: false,
+        timeoutMs: timeout.value,
+        maxRounds: rounds.value,
+        allowFullReadAccess: false,
+        reviewer,
+        jev: jevResult.jev,
+        onUncollectable,
+        reason: structuralReason,
+      },
+      warnings,
+    }
+  }
+  if (!jevResult.jev?.available) {
+    return {
+      value: {
+        available: false,
+        timeoutMs: timeout.value,
+        maxRounds: rounds.value,
+        allowFullReadAccess: false,
+        reviewer,
+        jev: jevResult.jev,
+        onUncollectable,
+        reason: jevResult.jev?.reason ?? "jev reviewer is not available",
+      },
+      warnings,
     }
   }
 
   return {
-    available: true,
-    endpoint: endpointResult.endpoint,
-    model: modelResult.model,
-    apiKey: keyResult.apiKey,
-    timeoutMs: timeout.value,
-    maxRounds: rounds.value,
-    pythonPath: pythonResult.pythonPath,
-    auditorPath: auditorResult.auditorPath,
-    allowFullReadAccess: allowFullReadAccess === true,
-    reviewer,
-    jev: jevResult.jev,
+    value: {
+      available: true,
+      timeoutMs: timeout.value,
+      maxRounds: rounds.value,
+      allowFullReadAccess: allowFullReadAccess === true,
+      reviewer,
+      jev: jevResult.jev,
+      onUncollectable,
+    },
+    warnings,
   }
 }
 
@@ -813,11 +757,10 @@ function resolveBypassLeaseTtlMs(raw: unknown): number {
     typeof raw !== "number" ||
     !Number.isFinite(raw) ||
     !Number.isInteger(raw) ||
-    raw < MIN_BYPASS_LEASE_TTL_MS ||
-    raw > MAX_BYPASS_LEASE_TTL_MS
+    (raw !== 0 && (raw < MIN_BYPASS_LEASE_TTL_MS || raw > MAX_BYPASS_LEASE_TTL_MS))
   ) {
     throw new Error(
-      `bypassLeaseTtlMs must be an integer between ${MIN_BYPASS_LEASE_TTL_MS} and ${MAX_BYPASS_LEASE_TTL_MS}`,
+      `bypassLeaseTtlMs must be 0 (no expiry) or an integer between ${MIN_BYPASS_LEASE_TTL_MS} and ${MAX_BYPASS_LEASE_TTL_MS}`,
     )
   }
   return raw
@@ -925,6 +868,7 @@ export function resolveSandbox(raw: unknown): ResolvedSandbox {
     scratch: "/tmp",
     roNetwork: "off",
     rwNetwork: "on",
+    workspaceNetwork: "off",
     denyWrite: [],
     denyRead: [],
     allowSudo: false,
@@ -946,8 +890,14 @@ export function resolveSandbox(raw: unknown): ResolvedSandbox {
     resolved.enabled = source.enabled
   }
   if (source.mode !== undefined) {
-    if (source.mode !== "auto" && source.mode !== "ro" && source.mode !== "rw" && source.mode !== "full") {
-      throw new Error('sandbox.mode must be "auto", "ro", "rw", or "full"')
+    if (
+      source.mode !== "auto" &&
+      source.mode !== "ro" &&
+      source.mode !== "rw" &&
+      source.mode !== "workspace" &&
+      source.mode !== "full"
+    ) {
+      throw new Error('sandbox.mode must be "auto", "ro", "rw", "workspace", or "full"')
     }
     resolved.mode = source.mode
   }
@@ -973,13 +923,14 @@ export function resolveSandbox(raw: unknown): ResolvedSandbox {
     }
     const trimmed = source.scratch.trim()
     if (!path.isAbsolute(trimmed)) throw new Error("sandbox.scratch must be an absolute path")
+    if (/[\0\r\n:]/.test(trimmed)) throw new Error("sandbox.scratch contains an unsupported path separator or control character")
     // Reject ".." even when it would normalize away (e.g. /a/../b): the helper
     // rejects such scratch at spawn (exit 125), so accepting it here would
     // turn a config mistake into a runtime fail-close on every shell call.
     if (trimmed.split(path.sep).includes("..")) {
       throw new Error(`sandbox.scratch may not contain "..": ${trimmed}`)
     }
-    const normalized = path.normalize(trimmed)
+    const normalized = path.resolve(trimmed)
     const blocked = new Set(["/", "/home", "/root"])
     if (blocked.has(normalized)) {
       throw new Error(`sandbox.scratch may not be /, /home, or /root: ${trimmed}`)
@@ -997,6 +948,12 @@ export function resolveSandbox(raw: unknown): ResolvedSandbox {
       throw new Error('sandbox.rwNetwork must be "on" or "off"')
     }
     resolved.rwNetwork = source.rwNetwork
+  }
+  if (source.workspaceNetwork !== undefined) {
+    if (source.workspaceNetwork !== "on" && source.workspaceNetwork !== "off") {
+      throw new Error('sandbox.workspaceNetwork must be "on" or "off"')
+    }
+    resolved.workspaceNetwork = source.workspaceNetwork
   }
   if (source.denyWrite !== undefined) {
     resolved.denyWrite = resolveSandboxPathList(source.denyWrite, "denyWrite", resolved.scratch)
@@ -1152,12 +1109,11 @@ export function resolvePluginConfig(raw?: BashClassifierOptions): ResolvedPlugin
     supervisorPath = path.resolve(DEFAULT_SUPERVISOR_PATH)
   }
 
-  let strictness: Strictness = "LOOSE"
+  const strictness: Strictness = "LOOSE"
   if (source.strictness !== undefined) {
-    if (source.strictness !== "LOOSE" && source.strictness !== "HARD") {
-      throw new Error('strictness must be "LOOSE" or "HARD"')
+    if (source.strictness !== "LOOSE") {
+      throw new Error('Only the single current policy is supported; strictness may be omitted or "LOOSE"')
     }
-    strictness = source.strictness
   }
 
   let failPolicy: FailPolicy = "fail_open"
@@ -1214,15 +1170,8 @@ export function resolvePluginConfig(raw?: BashClassifierOptions): ResolvedPlugin
     bypassPropagateToSubagents = source.bypassPropagateToSubagents
   }
 
-  let escalationEnabled = true
-  if (source.escalationEnabled !== undefined) {
-    if (typeof source.escalationEnabled !== "boolean") {
-      throw new Error("escalationEnabled must be a boolean")
-    }
-    escalationEnabled = source.escalationEnabled
-  }
-
-  const dynamicReview = resolveDynamicReview(source.dynamicReview, strictness)
+  const dynamic = resolveDynamicReview(source.dynamicReview)
+  const dynamicReview = dynamic.value
   const permission = resolvePermission(source.permission)
   const sandbox = resolveSandbox(source.sandbox)
   const routeReview = configuredReviewCommand ?? (dynamicReview.available ? reviewCommandWithAuditor : undefined)
@@ -1248,11 +1197,11 @@ export function resolvePluginConfig(raw?: BashClassifierOptions): ResolvedPlugin
     bypassClassifier: bypass.value,
     bypassLeaseTtlMs,
     bypassPropagateToSubagents,
-    escalationEnabled,
     permission,
     sandbox,
     dynamicReview,
     reviewCommand,
     bypassWarnings: bypass.warnings,
+    dynamicReviewWarnings: dynamic.warnings,
   }
 }

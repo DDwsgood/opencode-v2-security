@@ -74,7 +74,6 @@ describe("misrouted rules return to their natural families", () => {
 
   test("system-file writes and destructive SQL are filesystem effects", () => {
     for (const rule of [
-      "system.file-override",
       "system.sensitive-write",
       "database.destructive-statement",
     ]) {

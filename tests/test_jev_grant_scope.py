@@ -197,22 +197,6 @@ class TestOneCallGrant(unittest.TestCase):
                                         "test-placeholder", jev.DEFAULT_THRESHOLDS)
         self.assertFalse(result["deny"])
 
-    def test_reference_only_and_fully_visible_scripts_do_not_trigger_hard_gate(self):
-        with patch.dict(os.environ, {jev.ENV_POLICY: "HARD"}):
-            self.assertFalse(jev._hard_script_inspection_missing({
-                "command": "cat /tmp/unseen.py", "referencedPaths": ["/tmp/unseen.py"]}, set()))
-            self.assertFalse(jev._hard_script_inspection_missing({
-                "command": "python3 /tmp/seen.py",
-                "localScripts": [{"path": "/tmp/seen.py", "content": "print('hello')"}]}, set()))
-
-    def test_hard_inspection_rejects_omitted_and_truncated_executable_bodies(self):
-        with patch.dict(os.environ, {jev.ENV_POLICY: "HARD"}):
-            for scripts in ([{"path": "script.py", "content": "x" * (jev.MAX_SCRIPT_BYTES + 1)}],
-                            [{"path": f"script{i}.py", "content": "print(1)"} for i in range(5)]):
-                self.assertTrue(jev._hard_script_inspection_missing({"localScripts": scripts}, set()))
-                self.assertFalse(jev._hard_script_inspection_missing(
-                    {"localScripts": scripts}, {"indirection"}))
-
 
 if __name__ == "__main__":
     unittest.main()

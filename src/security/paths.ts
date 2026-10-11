@@ -4,13 +4,13 @@
 // read/write argument is known, literal, and inside an allowed area.
 import { AsyncLocalStorage } from "node:async_hooks"
 import path from "node:path"
+import { isStandardCacheWrite } from "./automatic-write-roots"
 
-/** Set for the duration of one classification: LOOSE read-write ("rw"),
- *  LOOSE read-only ("ro"), or HARD ("off"). Lexer and vocabulary relaxations
- *  that only exist to raise the LOOSE static-allow rate check it, so HARD
- *  (and any helper called outside a classification) keeps the stricter
- *  original behavior. */
-export const looseRelaxationScope = new AsyncLocalStorage<"rw" | "ro" | "off">()
+/** Set for the duration of one classification: read-write ("rw") or
+ *  read-only ("ro"). Lexer and vocabulary relaxations that only exist to
+ *  raise the static-allow rate check it, so helpers called outside a
+ *  classification keep the stricter original behavior. */
+export const looseRelaxationScope = new AsyncLocalStorage<"rw" | "ro">()
 
 export function looseRelaxationsActive(): boolean {
   const scope = looseRelaxationScope.getStore()
@@ -23,11 +23,13 @@ export function looseReadWriteActive(): boolean {
   return looseRelaxationScope.getStore() === "rw"
 }
 
-export type Strictness = "LOOSE" | "HARD"
 export type PathContext = {
   cwd: string
   worktree: string
-  strictness: Strictness
+  /** @deprecated The strict policy was removed; the single remaining policy
+   *  behaves as the old LOOSE mode. Kept optional for host compatibility —
+   *  it is never read. */
+  strictness?: "LOOSE"
 }
 
 export type PathFinding =
@@ -57,13 +59,16 @@ const CRITICAL_RE = [
 
 const CREDENTIAL_HOME_DIRS = [".ssh", ".gnupg", ".aws", ".kube", ".azure", ".config/gcloud", ".config/azure-cli"]
 
+// `.bash_history`/`.zsh_history` and ordinary logs (reviewer traces,
+// `*.log`/`*.jsonl`) are NOT credential stores by path alone: reading them is
+// not refused. Real secret material stays covered — `.ssh`/.gnupg-style
+// directories, key/certificate names, `.env`, `/proc/*/environ`, and env
+// dumps handled by the command-shape scans.
 const CREDENTIAL_HOME_FILES = [
   ".netrc",
   ".git-credentials",
   ".npmrc",
   ".pypirc",
-  ".bash_history",
-  ".zsh_history",
   ".docker/config.json",
 ]
 
@@ -71,6 +76,21 @@ const CREDENTIAL_ABS_RE = [
   /^\/proc\/(?:\d+|self|thread-self)\/environ/,
   /^\/etc\/sudoers(?:$|[./])/,
 ]
+
+/** Credential stores the runtime observer gates only by leaf pattern
+ *  (.env, key/cert extensions, ~/.ssh/id_*): the named directories and files
+ *  below are credential paths in the classifier but invisible to that leaf
+ *  scan. A read-only session passes them to the observer as extra deny-read
+ *  roots so a read produces a reviewable boundary event instead of running
+ *  silently. Relative-to-home only — foreign homes cannot be enumerated
+ *  without scanning /home. */
+export function credentialStoreReadPaths(home: string): string[] {
+  if (!path.isAbsolute(home)) return []
+  return [
+    ...CREDENTIAL_HOME_DIRS.map((dir) => path.join(home, dir)),
+    ...CREDENTIAL_HOME_FILES.map((file) => path.join(home, file)),
+  ]
+}
 
 const CREDENTIAL_NAME_RE = [
   /^id_(?:rsa|dsa|ecdsa|ed25519|ed448)$/,
@@ -271,8 +291,6 @@ const EMBEDDED_CREDENTIAL_RE = new RegExp(
     String.raw`\.git-credentials`,
     String.raw`(?:^|[/\s"'=(,;:&|])\.npmrc(?:["'\s,;)&|]|$)`,
     String.raw`(?:^|[/\s"'=(,;:&|])\.pypirc(?:["'\s,;)&|]|$)`,
-    String.raw`\.bash_history`,
-    String.raw`\.zsh_history`,
     String.raw`\.docker/config\.json`,
     String.raw`/proc/(?:\d+|self|thread-self)/environ`,
     String.raw`(?:^|[/\s"'=(,;:&|])sudoers(?:[./]|["'\s,;)&|]|$)`,
@@ -346,9 +364,7 @@ function isBroadScanRoot(absolute: string | undefined): boolean {
 }
 
 const REASON_SENSITIVE_READ_ASK = "Reading a credential or sensitive system file requires review"
-const REASON_SENSITIVE_READ_DENY = "Attempts to read credential or sensitive system data"
 const REASON_SENSITIVE_WRITE_ASK = "Writing to a credential or system file requires review"
-const REASON_SENSITIVE_WRITE_DENY = "Attempts to overwrite credential or system files"
 const REASON_SENSITIVE_DELETE = "Attempts to delete credential or system data"
 const REASON_OUTSIDE_WRITE = "Writing outside the working tree requires review"
 const REASON_BROAD_SCAN = "Scanning a filesystem root requires review"
@@ -388,33 +404,21 @@ export function classifyPathTarget(raw: string, mode: "read" | "write" | "delete
   // a kernel.sysctl-write question (privilege category), not a secret one.
   // Reads keep their sensitive-path classification.
   if (mode !== "read" && resolved.absolute !== undefined && /^\/proc\/sys(?:\/|$)/i.test(resolved.absolute.replaceAll("\\", "/"))) {
-    return ctx.strictness === "HARD"
-      ? { kind: "deny", rule: "kernel.sysctl-write", reason: "Modifying kernel parameters is blocked by privilege policy" }
-      : { kind: "ask", rule: "kernel.sysctl-write", reason: "Modifying kernel parameters requires review" }
+    return { kind: "ask", rule: "kernel.sysctl-write", reason: "Modifying kernel parameters requires review" }
   }
 
   if (mode === "read" && sensitiveRead) {
-    return ctx.strictness === "HARD"
-      ? { kind: "deny", rule: "data.critical-read", reason: REASON_SENSITIVE_READ_DENY }
-      : { kind: "ask", rule: "credentials.sensitive-access", reason: REASON_SENSITIVE_READ_ASK }
+    return { kind: "ask", rule: "credentials.sensitive-access", reason: REASON_SENSITIVE_READ_ASK }
   }
   if (mode === "write" && sensitiveWrite) {
-    return ctx.strictness === "HARD"
-      ? {
-          kind: "deny",
-          rule: flags.critical || flags.credential ? "data.critical-write" : "system.file-override",
-          reason: REASON_SENSITIVE_WRITE_DENY,
-        }
-      : {
-          kind: "ask",
-          rule: flags.critical || flags.credential ? "credentials.sensitive-access" : "system.sensitive-write",
-          reason: REASON_SENSITIVE_WRITE_ASK,
-        }
+    return {
+      kind: "ask",
+      rule: flags.critical || flags.credential ? "credentials.sensitive-access" : "system.sensitive-write",
+      reason: REASON_SENSITIVE_WRITE_ASK,
+    }
   }
   if (mode === "delete" && sensitiveWrite) {
-    return ctx.strictness === "HARD"
-      ? { kind: "deny", rule: "data.critical-delete", reason: REASON_SENSITIVE_DELETE }
-      : { kind: "ask", rule: "data.critical-delete", reason: REASON_SENSITIVE_DELETE }
+    return { kind: "ask", rule: "data.critical-delete", reason: REASON_SENSITIVE_DELETE }
   }
   if (mode === "read" && resolved.foreignHome) {
     return { kind: "ask", rule: "credentials.foreign-home", reason: REASON_FOREIGN_HOME }
@@ -422,15 +426,13 @@ export function classifyPathTarget(raw: string, mode: "read" | "write" | "delete
   if (mode !== "read" && resolved.absolute !== undefined) {
     const norm = resolved.absolute.replaceAll("\\", "/").toLowerCase()
     if (WORKTREE_EXEC_TRIGGERS.some((trigger) => norm.includes(trigger) || norm.endsWith(trigger.replace(/\/$/, "")))) {
-      return ctx.strictness === "HARD"
-        ? { kind: "deny", rule: "persistence.git-hooks", reason: "Writing git hooks is blocked by host policy because it plants code that fires on trusted git commands" }
-        : { kind: "ask", rule: "persistence.git-hooks", reason: "Writing git hooks plants code that fires on trusted git commands and requires review" }
+      return { kind: "ask", rule: "persistence.git-hooks", reason: "Writing git hooks plants code that fires on trusted git commands and requires review" }
     }
   }
   if (mode === "read" && isBroadScanRoot(resolved.absolute)) {
     return { kind: "ask", rule: "filesystem.broad-scan", reason: REASON_BROAD_SCAN }
   }
-  if (mode === "write" && !inside) {
+  if (mode === "write" && !inside && !(looseReadWriteActive() && resolved.absolute !== undefined && isStandardCacheWrite(resolved.absolute, home))) {
     return { kind: "ask", rule: "filesystem.outside-write", reason: REASON_OUTSIDE_WRITE }
   }
   return { kind: "pass" }
@@ -1221,9 +1223,7 @@ export function analyzeSegmentPaths(segment: string, ctx: PathContext): PathFind
       if (flags.critical || flags.credential) {
         finding = escalate(
           finding,
-          ctx.strictness === "HARD"
-            ? { kind: "deny", rule: "data.critical-read", reason: REASON_SENSITIVE_READ_DENY }
-            : { kind: "ask", rule: "credentials.sensitive-access", reason: REASON_SENSITIVE_READ_ASK },
+          { kind: "ask", rule: "credentials.sensitive-access", reason: REASON_SENSITIVE_READ_ASK },
         )
       }
     }
@@ -1250,14 +1250,13 @@ export function analyzeSegmentPaths(segment: string, ctx: PathContext): PathFind
 /**
  * Read/write sensitivity check for segments that are not provably safe.
  * Returns a finding only for sensitive (credential / system / critical)
- * targets in either direction, so HARD mode surfaces DENY for credential
- * reads (e.g. `cat ~/.ssh/id_rsa`) even when the segment is not on the
- * known-safe command list. Non-sensitive outside writes are left to the
- * existing flow, which already asks for them.
+ * targets in either direction, so a credential read (`cat ~/.ssh/id_rsa`)
+ * stays in review even when the segment is not on the known-safe command
+ * list. Non-sensitive outside writes are left to the existing flow, which
+ * already asks for them.
  */
 export function sensitivePathFinding(segment: string, ctx: PathContext): PathFinding | undefined {
   const finding = analyzeSegmentPaths(segment, ctx)
-  if (finding.kind === "deny") return finding
   if (
     finding.kind === "ask" &&
     (finding.rule === "credentials.sensitive-access" ||

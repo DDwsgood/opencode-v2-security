@@ -1,29 +1,42 @@
 // Pure badge-segment logic for the permission/bypass indicator, split out of
 // tui.tsx so it can be unit-tested without the solid-js / @opentui runtime.
+//
+// The user-facing surface is exactly three modes (see permissions.ts):
+// [Read only], [Auto mode, bypassing: ...] and [Bypass mode]. The raw r/w/x
+// triple is never rendered — only its write bit is consulted, to derive the
+// mode against older servers that predate the explicit `mode` field.
+import { securityModeFor, securityModeLabel, type SecurityMode } from "./permissions"
 
 /** Per-session state backing the persistent indicator. */
 export type IndicatorState = {
-  /** Effective triple rendered unix-style ("rwx", "r-x", "--x"). */
+  /** Effective triple rendered unix-style ("rwx", "r-x", "--x"). Kept only to
+   *  derive the mode on older servers; never displayed. */
   permission: string
   /** Bypass categories currently in effect (temporary + permanent). */
   active: string[]
+  /** Explicit user-visible mode from the server; absent on older servers, in
+   *  which case it is derived from `permission` + `active`. */
+  mode?: SecurityMode
+  /** Whether any verbatim custom bypass scope is armed. Only a boolean is
+   *  kept: the raw scope text can be sensitive and is never displayed. */
+  custom?: boolean
   /** Whether the last authoritative snapshot applied. RPC events carry
    *  complete per-field data but are partial overall and ephemeral — only a
    *  full `status` reply marks the entry synced. False (or absent on entries
    *  written by older plugin generations) renders an honest "unknown" badge
-   *  instead of a possibly stale claim like [YOLO ON]. */
+   *  instead of a possibly stale claim like [Bypass mode]. */
   synced?: boolean
 }
 
 /** Structural slice of the reactive theme the indicator reads (kept loose so
- * the entrypoint stays free of runtime imports beyond solid-js). */
+ *  the entrypoint stays free of runtime imports beyond solid-js). */
 export type IndicatorTheme = {
   readonly text: {
     readonly subdued: string
     readonly feedback: {
       readonly success: { readonly subdued: string }
       readonly warning: { readonly default: string }
-      /** Optional danger/error tokens — the ALL-OFF badge prefers the first
+      /** Optional danger/error tokens — the Bypass badge prefers the first
        * present, falling back to warning.default. */
       readonly danger?: { readonly default?: string; readonly subdued?: string }
       readonly error?: { readonly default?: string; readonly subdued?: string }
@@ -33,10 +46,16 @@ export type IndicatorTheme = {
 
 export type Segment = { readonly text: string; readonly fg: string }
 
-/** The `all` kill switch rides the same `active` list as a literal "all"
+/** The `all` kill switch rides the same `active` list as a literal "ALL"
  * entry (RPC schema is closed, so no separate flag field). */
 export function allIsOff(active: readonly string[]): boolean {
-  return active.includes("ALL")
+  return active.includes("ALL") || active.includes("all")
+}
+
+/** Categories that drive the Auto label: the ALL kill switch is a mode, not a
+ * category, so it is excluded. */
+function bypassingCategories(active: readonly string[]): string[] {
+  return active.filter((category) => category !== "ALL" && category !== "all")
 }
 
 export function dangerColor(theme: IndicatorTheme): string {
@@ -49,49 +68,38 @@ export function dangerColor(theme: IndicatorTheme): string {
   )
 }
 
-/** Badge label for the r/w bits. Both bits matter: a "-w-" ceiling is
- * [Write Only], not "Read + Write", and a ceiling without `r` must never
- * render as "Read Only". Combos outside the three named modes fall back to
- * the raw unix-style triple so the indicator never lies. */
-export function permissionLabel(permission: string): string {
-  const r = permission.includes("r")
-  const w = permission.includes("w")
-  if (r && w) return "Read + Write"
-  if (r) return "Read Only"
-  if (w) return "Write Only"
-  return permission || "none"
+/** Effective display mode: the server's explicit `mode` when present, else
+ *  derived from the legacy fields exactly like `securityModeFor` — an
+ *  inherited read-only ceiling wins, then the ALL kill switch means Bypass,
+ *  otherwise Auto. */
+export function modeForState(state: IndicatorState): SecurityMode {
+  if (state.mode) return state.mode
+  return securityModeFor(
+    { r: true, w: state.permission.includes("w"), x: true },
+    allIsOff(state.active),
+  )
 }
 
-/** [Read Only] light green (success.subdued) · [Read + Write,
- * Bypassing Category(ies):...] orange (warning.default) · [YOLO ON, Bypassing
- * all permissions] danger/error · plain [Read + Write] subdued.
- * With the kill switch armed the danger badge REPLACES the bypass label —
- * individual categories are moot while all enforcement is off. */
+/** The single three-mode composer badge. [Read only] light green,
+ *  [Bypass mode] danger/error, [Auto mode, bypassing: ...] orange while any
+ *  category/custom scope is armed and subdued otherwise. Unsynced state
+ *  renders an honest unknown label rather than a possibly stale claim. */
 export function segmentsFor(state: IndicatorState, theme: IndicatorTheme): Segment[] {
   // A badge that cannot prove freshness must not make a confident claim —
-  // e.g. still showing [YOLO ON] after the bypass actually expired is worse
-  // than admitting the state is unknown until the next snapshot lands.
+  // e.g. still showing [Bypass mode] after the bypass actually expired is
+  // worse than admitting the state is unknown until the next snapshot lands.
   if (state.synced !== true) {
     return [{ text: "[Security state unknown]", fg: theme.text.subdued }]
   }
-  const writable = state.permission.includes("w")
-  if (allIsOff(state.active)) {
-    // While the kill switch is armed the badge is just [YOLO ON, Bypassing all
-    // permissions] — category and permission detail is moot while every
-    // enforcement layer is off.
-    return [{ text: "[YOLO ON, Bypassing all permissions]", fg: dangerColor(theme) }]
-  }
-  if (state.active.length > 0) {
-    return [
-      {
-        text: `[${permissionLabel(state.permission)}, Bypassing Category(ies): ${state.active.join(",")}]`,
-        fg: theme.text.feedback.warning.default,
-      },
-    ]
-  }
-  if (!writable) {
-    return [{ text: `[${permissionLabel(state.permission)}]`, fg: theme.text.feedback.success.subdued }]
-  }
-  // A "-w-" ceiling is write-only, not read+write — render the real bits.
-  return [{ text: `[${permissionLabel(state.permission)}]`, fg: theme.text.subdued }]
+  const mode = modeForState(state)
+  const label = securityModeLabel(mode, state.active, state.custom === true)
+  const fg =
+    mode === "readonly"
+      ? theme.text.feedback.success.subdued
+      : mode === "bypass"
+        ? dangerColor(theme)
+        : state.custom === true || bypassingCategories(state.active).length > 0
+          ? theme.text.feedback.warning.default
+          : theme.text.subdued
+  return [{ text: label, fg }]
 }

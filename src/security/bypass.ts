@@ -89,8 +89,6 @@ const RULE_EXACT: ReadonlyArray<readonly [string, RequiredCategories | undefined
   // delete, and overwrite alike — the object's own filesystem mechanics are
   // not a second owner.
   ["data.critical-delete", required("secret")],
-  ["data.critical-read", required("secret")],
-  ["data.critical-write", required("secret")],
   // Staging a credential into a compressed or backup copy is a secret
   // judgment: the destination's ordinary filesystem effect stays its own
   // rule/category when it is a genuinely independent object.
@@ -104,7 +102,6 @@ const RULE_EXACT: ReadonlyArray<readonly [string, RequiredCategories | undefined
   ["infrastructure.privileged-container", required("privilege")],
   // Overwriting or deleting sensitive system files is a filesystem effect,
   // not a running-state one.
-  ["system.file-override", required("filesystem")],
   ["system.sensitive-write", required("filesystem")],
   // Destructive SQL runs against a local database file: filesystem family,
   // not shared remote state.
@@ -125,13 +122,6 @@ const RULE_EXACT: ReadonlyArray<readonly [string, RequiredCategories | undefined
   // hop is the remote operation's intrinsic channel, not a second kind.
   ["execution.remote-pipe", required("remote")],
   ["network.destructive-api", required("remote")],
-  // HARD-mode policy rules follow the filesystem category they enforce.
-  ["hard.forced-recursive-delete", required("filesystem")],
-  ["hard.temp-target-delete", required("filesystem")],
-  ["hard.named-temp-delete", required("filesystem")],
-  ["hard.backup-delete", required("filesystem")],
-  ["hard.backup-target-delete", required("filesystem")],
-  ["hard.local-temp-delete", required("filesystem")],
   // Recycle-bin permanent deletion is filesystem-destroying behavior and is
   // explicitly covered by the filesystem bypass (user spec: stop all
   // filesystem checks); classifier.ts gates it with the same category.
@@ -150,8 +140,8 @@ const RULE_EXACT: ReadonlyArray<readonly [string, RequiredCategories | undefined
 
 const EXACT_MAP = new Map<string, RequiredCategories | undefined>(RULE_EXACT)
 
-/** True when `rule` is one of the unconditional floor rules no bypass category
- * (and no escalation) can ever clear. Use this instead of a bare
+/** True when `rule` is one of the unconditional floor rules no bypass
+ * category can ever clear. Use this instead of a bare
  * `ruleRequiredCategories(rule) === undefined` check: that returns undefined
  * for BOTH the floor and for ordinary rules that simply have no mapping, so
  * treating it as "floor" is unsafe. */
@@ -159,7 +149,7 @@ export function isFloorRule(rule: string): boolean {
   return FLOOR_RULES.has(rule)
 }
 
-/** Rule ids that no escalation or bypass may ever clear: the unconditional
+/** Rule ids that no bypass may ever clear: the unconditional
  * floor plus verdicts emitted directly by the permission ceiling and input
  * guards. Provided for parent-side prechecks. */
 export const TERMINAL_UNBYPASSABLE: ReadonlySet<string> = new Set([
@@ -189,9 +179,9 @@ export function ruleBypassCategory(rule: string): BypassCategory | undefined {
 
 /** Union of the bypass categories the given rules require. Floor rules and
  * rules with no bypass mapping contribute nothing — arming categories cannot
- * clear them, so they should never appear in an escalation hint. Conjunctive
+ * clear them, so they should never appear in a bypass hint. Conjunctive
  * rules contribute every required category (the union is still correct: the
- * escalation reviewer sees the full risk family). */
+ * reviewer sees the full risk family). */
 export function rulesHintCategories(rules: readonly string[]): BypassCategory[] {
   const out = new Set<BypassCategory>()
   for (const rule of rules) {

@@ -5,7 +5,7 @@
 //           Probes bwrap/userns/Landlock once, picks a sandbox path per the
 //           §3.4 decision table, execs bwrap with the RO/RW floor argv ending
 //           in this binary re-invoked as --stage2.
-//   stage2  opencode-sandbox --stage2 --mode ro|rw [--no-landlock]
+//   stage2  opencode-sandbox --stage2 --mode ro|rw|workspace [--no-landlock]
 //                                 [--af-unix-block] --real-bash <path>
 //                                 -- bash -c <cmd>
 //           prctl(NO_NEW_PRIVS) -> seccomp floor -> (RO) Landlock ruleset ->
@@ -14,7 +14,7 @@
 //           (seccomp needs NNP without CAP_SYS_ADMIN); RO always keeps it.
 //
 // Environment contract (stage1; stage2 inherits):
-//   OPENCODE_SANDBOX_MODE          ro|rw        (default rw)
+//   OPENCODE_SANDBOX_MODE          ro|rw|workspace (default rw; "ww" alias)
 //   OPENCODE_SANDBOX_SCRATCH       abs path     (default /tmp/opencode)
 //   OPENCODE_REAL_BASH             abs path     (default /bin/bash)
 //   OPENCODE_SANDBOX_BWRAP         bwrap path   (then /usr/bin/bwrap, then PATH)
@@ -30,6 +30,33 @@
 //   OPENCODE_SANDBOX_RW_NETWORK    1|0          (default 1; 0 -> --unshare-net
 //                                  on the RW floor too; AF_UNIX still works,
 //                                  so WSL interop survives)
+//   OPENCODE_SANDBOX_MODE=workspace: workspace-write profile. Root filesystem
+//                                  is --ro-bind, writable = scratch +
+//                                  OPENCODE_SANDBOX_WRITE_ROOTS. Requires a
+//                                  bwrap path: on the landlock-only fallback
+//                                  the helper refuses (exit 125) because deny
+//                                  lists, WSL masking and write-root binds
+//                                  are mount features. Landlock ABI >= 3 is
+//                                  applied additionally as a soft
+//                                  defense-in-depth layer (failures warn,
+//                                  never weaken the mount floor).
+//   OPENCODE_SANDBOX_WRITE_ROOTS   colon list   (workspace only; absolute
+//                                  existing canonical non-symlink paths
+//                                  pinned via --bind-fd over the ro root.
+//                                  Missing paths, symlinks, "..", "/", or
+//                                  >64 entries fail the spawn — no host
+//                                  creation, no parent-dir widening. A
+//                                  trailing "/" asserts directory intent.
+//                                  Emitted BEFORE masks and deny lists so
+//                                  floors still shadow a write root.)
+//   OPENCODE_SANDBOX_WORKSPACE_NETWORK 1|0      (workspace only, default 0;
+//                                  0 -> --unshare-net + Landlock TCP deny;
+//                                  1 = host granted network for this call)
+//   OPENCODE_SANDBOX_DENY_*        strict under workspace: a deny entry that
+//                                  is non-absolute, missing, non-canonical,
+//                                  or a symlink fails the spawn — an
+//                                  unexpressible deny is never skipped.
+//   OPENCODE_SANDBOX_MASK_WSL_INTEROP applies to workspace too (default 1).
 //   OPENCODE_SANDBOX_ALLOW_SUDO    1|0          (default 0; RW only: runs
 //                                  stage2 host-direct — NO bwrap at all:
 //                                  no userns, socket masks, deny lists or
@@ -64,12 +91,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <dirent.h>
 #include <unistd.h>
+
+#ifndef SYS_close_range
+#define SYS_close_range 436
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Landlock raw interface (linux/landlock.h NOT required)              */
@@ -116,11 +149,12 @@ struct ll_path_beneath_attr {
 #define LL_SCOPE_ABSTRACT_UNIX_SOCKET (1ULL << 0) /* ABI >= 6 */
 #define LL_SCOPE_SIGNAL               (1ULL << 1)
 
-/* File-only Landlock rights: valid on any object type.
- * Directory-only rights (MAKE_*, REMOVE_DIR) may only appear on rules
- * whose target is a directory; the kernel returns EINVAL otherwise. */
+/* File-only Landlock rights: valid on any object type. Verified on kernel
+ * ABI 7 (local probe): REMOVE_FILE and REFER on a file target fail with
+ * EINVAL — they are directory-scoped rights enforced via the parent dir.
+ * Only WRITE_FILE and TRUNCATE are legal on files. */
 #define LL_FS_FILE_ONLY_MASK \
-	(LL_FS_WRITE_FILE | LL_FS_REMOVE_FILE | LL_FS_TRUNCATE)
+	(LL_FS_WRITE_FILE | LL_FS_TRUNCATE)
 
 static int landlock_abi(void)
 {
@@ -185,11 +219,18 @@ static int ll_add_path_rule(int ruleset_fd, const char *path,
 	return 0;
 }
 
-/* Build and apply the RO Landlock ruleset. Fatal exits on hard failure.
- * scratch must already exist (stage1 mkdir -p's it; callers of bare
- * stage2 are responsible for it too — a missing scratch is skipped so a
- * degraded environment still gets the write freeze). */
-static void landlock_apply_ro(int abi, const char *scratch, int net_on)
+/* Build and apply a Landlock write allow-list ruleset.
+ *
+ * RO path (soft=0): fatal exits on hard failure. scratch must already exist
+ * (stage1 mkdir -p's it; callers of bare stage2 are responsible for it too —
+ * a missing scratch is skipped so a degraded environment still gets the
+ * write freeze).
+ *
+ * Workspace path (soft=1): the mount floor (ro-bind root + writable binds)
+ * already enforces the boundary; Landlock is an OPTIONAL second layer, so a
+ * failure warns and continues rather than killing the spawn. */
+static void landlock_apply(int abi, char *const *writable, size_t n_writable,
+			   int net_on, uint64_t scope, int soft)
 {
 	struct ll_ruleset_attr attr;
 	memset(&attr, 0, sizeof(attr));
@@ -197,7 +238,7 @@ static void landlock_apply_ro(int abi, const char *scratch, int net_on)
 	if (abi >= 4 && !net_on)
 		attr.handled_access_net = LL_NET_BIND_TCP | LL_NET_CONNECT_TCP;
 	if (abi >= 6)
-		attr.scoped = LL_SCOPE_ABSTRACT_UNIX_SOCKET | LL_SCOPE_SIGNAL;
+		attr.scoped = scope;
 
 	int fd = syscall(SYS_LANDLOCK_CREATE_RULESET, &attr, sizeof(attr), 0);
 	if (fd < 0) {
@@ -214,25 +255,35 @@ static void landlock_apply_ro(int abi, const char *scratch, int net_on)
 			fprintf(stderr,
 				"opencode-sandbox: landlock_create_ruleset: %s\n",
 				strerror(errno));
+			if (soft)
+				return;
 			exit(125);
 		}
 	}
 
 	uint64_t fs_mask = ll_fs_handled_mask(abi);
 
-	/* The only writable hierarchy. */
-	struct stat st;
-	if (stat(scratch, &st) == 0 && S_ISDIR(st.st_mode)) {
-		if (ll_add_path_rule(fd, scratch, fs_mask, abi) < 0) {
+	/* The writable hierarchies. A missing path is skipped (stage1 created
+	 * real roots; a dropped rule widens nothing). File roots are legal —
+	 * ll_add_path_rule intersects FILE_ONLY_MASK for non-directories. */
+	for (size_t i = 0; i < n_writable; i++) {
+		struct stat st;
+		if (stat(writable[i], &st) < 0)
+			continue;
+		if (ll_add_path_rule(fd, writable[i], fs_mask, abi) < 0) {
 			fprintf(stderr,
 				"opencode-sandbox: landlock rule %s: %s\n",
-				scratch, strerror(errno));
+				writable[i], strerror(errno));
+			if (soft) {
+				close(fd);
+				return;
+			}
 			exit(125);
 		}
 	}
 
 	/* Device files: writable so git/tar/shell redirections keep working.
-	 * /dev/null missing is fatal. */
+	 * /dev/null missing is fatal (soft: the ruleset is dropped instead). */
 	static const char *devs[] = {
 		"/dev/null", "/dev/zero", "/dev/full",
 		"/dev/random", "/dev/urandom", "/dev/tty",
@@ -245,12 +296,17 @@ static void landlock_apply_ro(int abi, const char *scratch, int net_on)
 				fprintf(stderr,
 					"opencode-sandbox: landlock rule /dev/null: %s\n",
 					strerror(errno));
+				if (soft) {
+					close(fd);
+					return;
+				}
 				exit(125);
 			}
 			/* optional nodes: skip */
 		}
 	}
-	if (stat("/dev/pts", &st) == 0 && S_ISDIR(st.st_mode)) {
+	struct stat pts_st;
+	if (stat("/dev/pts", &pts_st) == 0 && S_ISDIR(pts_st.st_mode)) {
 		if (ll_add_path_rule(fd, "/dev/pts", dev_mask, abi) < 0)
 			fprintf(stderr,
 				"opencode-sandbox: warning: landlock rule /dev/pts: %s\n",
@@ -260,12 +316,20 @@ static void landlock_apply_ro(int abi, const char *scratch, int net_on)
 	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
 		fprintf(stderr, "opencode-sandbox: prctl(NNP): %s\n",
 			strerror(errno));
+		if (soft) {
+			close(fd);
+			return;
+		}
 		exit(125);
 	}
 	if (syscall(SYS_LANDLOCK_RESTRICT_SELF, fd, 0) < 0) {
 		fprintf(stderr,
 			"opencode-sandbox: landlock_restrict_self: %s\n",
 			strerror(errno));
+		if (soft) {
+			close(fd);
+			return;
+		}
 		exit(125);
 	}
 	close(fd);
@@ -596,14 +660,61 @@ static const char *decide_path(const struct probe *p)
 /* Stage2                                                              */
 /* ------------------------------------------------------------------ */
 
+/* Drop every inherited fd >= 3 before anything else in stage2. Stage1 pins
+ * workspace write roots as O_PATH fds for bwrap's --bind-fd; bwrap mounts
+ * them during setup, but whether it closes them afterwards is undocumented
+ * and version-dependent — we do not rely on it. Stage2 needs only stdio
+ * (its own Landlock ruleset fd is created later, after this sweep), so
+ * closing the whole inherited range is safe: a leaked pin fd must never
+ * survive into the payload, where openat(dirfd, ".") could reopen the
+ * object with host-side rights.
+ * Order: close_range(2) (kernel >= 5.9) → /proc/self/fd scan. Refuse to
+ * execute if neither can prove a complete sweep: inherited descriptors can
+ * exceed a subsequently lowered RLIMIT_NOFILE, so that limit is not enough. */
+static void close_inherited_fds(void)
+{
+	if (syscall(SYS_close_range, 3u, ~0u, 0) == 0)
+		return;
+
+	DIR *d = opendir("/proc/self/fd");
+	if (d) {
+		int dfd = dirfd(d);
+		struct dirent *e;
+		for (;;) {
+			errno = 0;
+			e = readdir(d);
+			if (!e) {
+				int scan_error = errno;
+				if (closedir(d) < 0)
+					die("stage2 close fd enumeration");
+				if (scan_error) {
+					errno = scan_error;
+					die("stage2 enumerate inherited fds");
+				}
+				return;
+			}
+			char *end;
+			long n = strtol(e->d_name, &end, 10);
+			if (end != e->d_name && *end == '\0' &&
+			    n >= 3 && n != dfd && close((int)n) < 0 &&
+			    errno != EBADF)
+				die("stage2 close inherited fd");
+		}
+	}
+	die("stage2 cannot enumerate inherited fds");
+}
+
 static int stage2(int argc, char **argv)
 {
+	close_inherited_fds();
+
 	const char *mode = getenv("OPENCODE_SANDBOX_MODE");
 	const char *real_bash = env_or("OPENCODE_REAL_BASH", "/bin/bash");
 	/* Trusted-config caveat: bwrap --setenv from extraArgs reaches this
-	 * environment, so a config author can widen the RO Landlock writable
-	 * hierarchy via OPENCODE_SANDBOX_SCRATCH — same trust level as mode
-	 * "full". Unlike mode/real_bash there is no argv override for scratch. */
+	 * environment, so a config author can widen the writable set via
+	 * OPENCODE_SANDBOX_SCRATCH / OPENCODE_SANDBOX_WRITE_ROOTS — same trust
+	 * level as mode "full". Unlike mode/real_bash there is no argv
+	 * override for scratch. */
 	const char *scratch = env_or("OPENCODE_SANDBOX_SCRATCH", "/tmp/opencode");
 	int no_landlock = 0;
 	int af_block_forced = 0;
@@ -643,18 +754,23 @@ static int stage2(int argc, char **argv)
 	}
 
 	int ro = (mode && strcmp(mode, "ro") == 0);
+	int ws = (mode && (strcmp(mode, "workspace") == 0 ||
+			   strcmp(mode, "ww") == 0));
 	int af_unix_block =
 		af_block_forced ||
 		(ro && env_bool("OPENCODE_SANDBOX_RO_AF_UNIX_BLOCK", 1));
 
 	/* Load-bearing: neutralises setuid/sudo inside the sandbox.
 	 * RW + OPENCODE_SANDBOX_ALLOW_SUDO=1 skips BOTH NNP and the seccomp
-	 * floor (a seccomp install requires NNP or CAP_SYS_ADMIN). stage1
+	 * floor (a seccomp install requires NNP or CAP_SYS_ADMIN); stage1
 	 * also routed this spawn host-direct — no bwrap at all — since
 	 * bwrap sets NNP unconditionally and would defeat the flag anyway.
 	 * RO never reaches this branch: a read-only session with working
-	 * sudo is a contradiction, so allowSudo is RW-scoped. */
-	int allow_sudo = !ro && env_bool("OPENCODE_SANDBOX_ALLOW_SUDO", 0);
+	 * sudo is a contradiction, so allowSudo is RW-scoped. The workspace
+	 * profile also never takes the host-direct route — a privilege-
+	 * needing call is refused upstream instead of silently losing the
+	 * floor, so NNP + seccomp always apply here too. */
+	int allow_sudo = !ro && !ws && env_bool("OPENCODE_SANDBOX_ALLOW_SUDO", 0);
 	if (!allow_sudo) {
 		if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
 			die("stage2 prctl(NO_NEW_PRIVS)");
@@ -672,7 +788,41 @@ static int stage2(int argc, char **argv)
 		}
 		int net_on = strcmp(env_or("OPENCODE_SANDBOX_RO_NETWORK", "off"),
 				    "on") == 0;
-		landlock_apply_ro(abi, scratch, net_on);
+		char *writable[] = { (char *)scratch };
+		landlock_apply(abi, writable, 1, net_on,
+			       LL_SCOPE_ABSTRACT_UNIX_SOCKET | LL_SCOPE_SIGNAL,
+			       0);
+	}
+
+	if (ws && !no_landlock) {
+		/* Optional second layer over the mount floor: writable set =
+		 * scratch + WRITE_ROOTS; signal scope only (abstract-socket
+		 * scope would break local IPC the mounts deliberately keep).
+		 * Soft: failures warn; the bwrap binds already enforce the
+		 * write boundary. */
+		int abi = landlock_abi();
+		if (abi >= 3) {
+			char *writable[66];
+			size_t n = 0;
+			writable[n++] = (char *)scratch;
+			char *spec = getenv("OPENCODE_SANDBOX_WRITE_ROOTS");
+			if (spec && *spec) {
+				char *copy = strdup(spec);
+				if (copy) {
+					for (char *s = strtok(copy, ":"); s;
+					     s = strtok(NULL, ":")) {
+						if (*s == '/' &&
+						    n < sizeof(writable) / sizeof(writable[0]))
+							writable[n++] = s;
+					}
+				}
+				/* copy leaks into the exec'd image */
+			}
+			int net_on =
+				env_bool("OPENCODE_SANDBOX_WORKSPACE_NETWORK", 0);
+			landlock_apply(abi, writable, n, net_on,
+				       LL_SCOPE_SIGNAL, 1);
+		}
 	}
 
 	char *bash_argv[] = { (char *)"bash", (char *)"-c",
@@ -720,21 +870,177 @@ static void mask_sockets(struct argv_builder *b, const char *spec)
 	 * freed implicitly at exec */
 }
 
+/* Validate a sandbox path entry: absolute, no "..", resolves to itself
+ * (realpath == canonical spelling → no component is a symlink), and lstat's
+ * to a non-symlink. On success *st receives the lstat result (non-NULL).
+ * Returns 0 ok, -1 on any violation; the diagnostic names `what`. */
+static int validate_sandbox_path(const char *what, const char *p,
+				 struct stat *st)
+{
+	struct stat lst;
+	struct stat *out = st ? st : &lst;
+
+	if (p[0] != '/' || strstr(p, "..")) {
+		fprintf(stderr,
+			"opencode-sandbox: %s must be an absolute "
+			"non-traversal path: '%s'\n", what, p);
+		return -1;
+	}
+	char resolved[PATH_MAX];
+	if (!realpath(p, resolved)) {
+		fprintf(stderr,
+			"opencode-sandbox: %s does not exist: '%s' — the "
+			"workspace profile cannot express a grant for a path "
+			"that is not there\n", what, p);
+		return -1;
+	}
+	if (strcmp(resolved, p) != 0) {
+		fprintf(stderr,
+			"opencode-sandbox: %s must be canonical — '%s' resolves "
+			"to '%s' (symlink components are not accepted)\n",
+			what, p, resolved);
+		return -1;
+	}
+	if (lstat(p, out) < 0 || S_ISLNK(out->st_mode)) {
+		fprintf(stderr,
+			"opencode-sandbox: %s must not be a symlink: '%s'\n",
+			what, p);
+		return -1;
+	}
+	return 0;
+}
+
+/* OPENCODE_SANDBOX_WRITE_ROOTS (workspace profile): colon-separated absolute
+ * paths bound read-write over the ro-bound root.
+ *
+ * Contract — precise, no widening, no host side effects:
+ *   - every entry must exist at spawn time and be canonical (realpath ==
+ *     spelling) with a non-symlink leaf; anything else — a missing file,
+ *     a symlinked component, "..", "/", a non-absolute path, or more than
+ *     64 entries — fails the spawn (exit 125). A not-yet-existing external
+ *     target is intentionally UNSUPPORTED here: the built-in file tools
+ *     gate handles first writes; this helper never creates the approved
+ *     target, never mkdirs ancestors, and never widens to a parent dir.
+ *   - a trailing "/" asserts directory intent: an existing non-directory
+ *     is rejected.
+ *   - each validated root is pinned open (O_PATH|O_NOFOLLOW) and mounted
+ *     with --bind-fd, and the opened object's dev+ino is fstat-checked
+ *     against the validating lstat — a component swap between lstat and
+ *     open fails the spawn instead of pinning a different inode.
+ *     Residual TOCTOU: the validated object itself could still be
+ *     renamed/detached between open() and bwrap's mount; the fd pins the
+ *     inode, so the mount can never land on a *different* object — at
+ *     worst the detached subtree is bound under its old name (a stale
+ *     grant, never a widened one). Strict deny lists stay path-based:
+ *     a pinned fd that leaked into the payload could reopen the frozen
+ *     object via openat(dirfd, "."), undoing the deny — worse than the
+ *     rename window a path bind leaves.
+ *   - scratch itself is redundant and skipped; an entry that IS the
+ *     scratch dir is dropped silently.
+ *
+ * MUST be emitted before mask_sockets, the WSL mask, and the deny lists:
+ * all of those are floors that shadow write roots (a write root on a
+ * masked socket or a denyWrite target must not win). */
+static void emit_write_roots(struct argv_builder *b, const char *spec,
+			     const char *scratch)
+{
+	if (!spec || !*spec)
+		return;
+	char *copy = strdup(spec);
+	if (!copy)
+		die("strdup write roots");
+
+	/* Phase 1: validate every entry, pin each as an fd. */
+	char *roots[64];
+	int fds[64];
+	int n = 0;
+	for (char *s = strtok(copy, ":"); s; s = strtok(NULL, ":")) {
+		if (n >= 64) {
+			fprintf(stderr,
+				"opencode-sandbox: too many write roots (>64)\n");
+			exit(125);
+		}
+		size_t len = strlen(s);
+		int dir_intent = len > 1 && s[len - 1] == '/';
+		char *p = s;
+		if (dir_intent)
+			p[len - 1] = '\0';
+		if (strcmp(p, "/") == 0) {
+			fprintf(stderr,
+				"opencode-sandbox: write root may not be '/'\n");
+			exit(125);
+		}
+		struct stat vst;
+		if (validate_sandbox_path("write root", p, &vst) < 0)
+			exit(125);
+		if (scratch && strcmp(p, scratch) == 0)
+			continue;
+		if (dir_intent && !S_ISDIR(vst.st_mode)) {
+			fprintf(stderr,
+				"opencode-sandbox: write root '%s/' is "
+				"not a directory\n", p);
+			exit(125);
+		}
+		int fd = open(p, O_PATH | O_NOFOLLOW);
+		if (fd < 0)
+			die("pin write root");
+		/* Post-open identity: O_NOFOLLOW only covers the leaf; a
+		 * swapped component between lstat and open could pin a
+		 * different inode. dev+ino must match the validated stat —
+		 * a swap fails the spawn rather than pinning the wrong
+		 * object. */
+		struct stat fst;
+		if (fstat(fd, &fst) < 0 || fst.st_dev != vst.st_dev ||
+		    fst.st_ino != vst.st_ino) {
+			fprintf(stderr,
+				"opencode-sandbox: write root '%s' changed "
+				"between validation and open (path swap); "
+				"refusing\n", p);
+			exit(125);
+		}
+		roots[n] = p;
+		fds[n] = fd;
+		n++;
+	}
+
+	/* Phase 2: emit --bind-fd args referencing the pinned fds. The fds
+	 * stay open (no CLOEXEC) so they survive the execv into bwrap; bwrap
+	 * mounts them during setup. */
+	for (int i = 0; i < n; i++) {
+		char *fdstr;
+		if (asprintf(&fdstr, "%d", fds[i]) < 0)
+			die("asprintf fd");
+		ab_push(b, "--bind-fd");
+		ab_push(b, fdstr);
+		ab_push(b, roots[i]);
+	}
+	/* copy and fd strings intentionally leak into the exec'd image */
+}
+
 /* Colon-separated absolute-path deny lists, emitted AFTER the root bind
- * (same shadowing mechanism as mask_sockets: later mounts win):
+ * (same shadowing mechanism as mask_sockets: later mounts win) and AFTER
+ * the workspace write-root binds:
  *   deny-read  dir  -> --tmpfs <p>   dir still exists but is empty inside
  *   deny-read  file -> --bind /dev/null <p>   contents unreadable
  *   deny-write -> --ro-bind <p> <p>  readable but not writable
+ *     (deliberately path-based even in strict mode: a pinned O_PATH fd
+ *     inherited by the payload could reopen the frozen object via
+ *     openat(dirfd, ".") — the leak risk outweighs the rename window)
  * A path on both lists gets the tmpfs first and then --remount-ro on the
  * same destination: empty AND read-only. (--ro-bind <p> <p> would bind
  * the ORIGINAL contents read-only — bwrap resolves bind sources in the
  * old root, not the staged one — so the remount is required for the
  * composition.) Both-lists file -> --ro-bind /dev/null <p>.
- * Entries must be absolute and exist at spawn time (bwrap cannot mount a
- * destination that isn't there); anything else is skipped. strtok
- * already drops empty ":" elements. */
+ *
+ * strict (workspace profile): a deny that cannot be expressed is a hard
+ * failure — non-absolute, non-existent, non-canonical, or symlink entries
+ * exit 125 instead of silently skipping, because silently skipping a deny
+ * means the payload keeps access the config said it must not have.
+ * Non-strict (legacy ro/rw): non-absolute or non-existent entries are
+ * skipped at spawn time. strtok already drops empty ":" elements. */
 static void emit_deny_lists(struct argv_builder *b,
-			    const char *deny_read, const char *deny_write)
+			    const char *deny_read, const char *deny_write,
+			    int strict)
 {
 	char *read_paths[64];
 	int n_read = 0;
@@ -745,8 +1051,14 @@ static void emit_deny_lists(struct argv_builder *b,
 		if (copy) {
 			for (char *s = strtok(copy, ":"); s;
 			     s = strtok(NULL, ":")) {
-				if (s[0] != '/' || stat(s, &st) < 0)
+				if (strict) {
+					if (validate_sandbox_path(
+						    "deny-read entry", s,
+						    &st) < 0)
+						exit(125);
+				} else if (s[0] != '/' || stat(s, &st) < 0) {
 					continue;
+				}
 				if (S_ISDIR(st.st_mode)) {
 					ab_push(b, "--tmpfs");
 					ab_push(b, s);
@@ -766,8 +1078,17 @@ static void emit_deny_lists(struct argv_builder *b,
 		if (copy) {
 			for (char *s = strtok(copy, ":"); s;
 			     s = strtok(NULL, ":")) {
-				if (s[0] != '/' || stat(s, &st) < 0)
+				if (strict) {
+					if (validate_sandbox_path(
+						    "deny-write entry", s,
+						    &st) < 0)
+						exit(125);
+				} else if (s[0] != '/' || stat(s, &st) < 0) {
 					continue;
+				}
+				/* st now describes THIS entry — the previous
+				 * revision reused the denyRead loop's last
+				 * st, mis-typing every strict deny-write. */
 				int both = 0;
 				for (int k = 0; k < n_read; k++)
 					if (strcmp(read_paths[k], s) == 0) {
@@ -784,6 +1105,13 @@ static void emit_deny_lists(struct argv_builder *b,
 					ab_push(b, "/dev/null");
 					ab_push(b, s);
 				} else {
+					/* Path-based ro-bind is deliberate here,
+					 * unlike write roots: an inherited
+					 * O_PATH fd leaked into the payload
+					 * could be used via openat() to undo
+					 * this very freeze — worse than the
+					 * microscopic rename window the fd
+					 * would have closed. */
 					ab_push(b, "--ro-bind");
 					ab_push(b, s);
 					ab_push(b, s);
@@ -845,9 +1173,10 @@ static int stage1(const char *cmd)
 		       "/run/containerd/containerd.sock");
 	int ro = strcmp(mode, "ro") == 0;
 	int rw = strcmp(mode, "rw") == 0;
-	if (!ro && !rw) {
+	int ws = strcmp(mode, "workspace") == 0 || strcmp(mode, "ww") == 0;
+	if (!ro && !rw && !ws) {
 		fprintf(stderr,
-			"opencode-sandbox: unknown mode '%s' (want ro|rw)\n",
+			"opencode-sandbox: unknown mode '%s' (want ro|rw|workspace)\n",
 			mode);
 		return 125;
 	}
@@ -857,7 +1186,22 @@ static int stage1(const char *cmd)
 			"non-traversal path: '%s'\n", scratch);
 		return 125;
 	}
-	mkdir_p(scratch);
+	if (ws) {
+		struct stat scratch_st;
+		if (strchr(scratch, ':')) {
+			fprintf(stderr, "opencode-sandbox: workspace scratch may not contain ':'\n");
+			return 125;
+		}
+		if (validate_sandbox_path("workspace scratch", scratch,
+					  &scratch_st) < 0)
+			return 125;
+		if (!S_ISDIR(scratch_st.st_mode)) {
+			fprintf(stderr, "opencode-sandbox: workspace scratch must be a directory\n");
+			return 125;
+		}
+	} else {
+		mkdir_p(scratch);
+	}
 
 	/* allowSudo=1 (RW only): route stage2 host-direct — no bwrap at all.
 	 * sudo/setuid require NNP absent, and bwrap sets NNP unconditionally,
@@ -892,10 +1236,22 @@ static int stage1(const char *cmd)
 	if (!getcwd(cwd, sizeof(cwd)))
 		snprintf(cwd, sizeof(cwd), "/");
 
-	char *stage2_mode = ro ? "ro" : "rw";
+	char *stage2_mode = ro ? "ro" : ws ? "workspace" : "rw";
 
-	/* Landlock-only: run stage2 directly on the host. */
+	/* Landlock-only: run stage2 directly on the host. The workspace
+	 * profile refuses this path: its contract — deny lists, WSL-interop
+	 * masking, write-root binds over a read-only root — is enforced by
+	 * mounts, and mounts need bwrap. Running landlock-only would
+	 * silently drop the whole boundary except the write allow-list. */
 	if (strcmp(path, "landlock-only") == 0) {
+		if (ws) {
+			fprintf(stderr,
+				"opencode-sandbox: workspace profile requires "
+				"bwrap (landlock-only cannot enforce deny "
+				"lists, WSL masking, or write-root binds). "
+				"Refusing shell execution.\n");
+			return 125;
+		}
 		char *a[16];
 		int n = 0;
 		a[n++] = (char *)self_path();
@@ -926,15 +1282,16 @@ static int stage1(const char *cmd)
 
 	/* bwrap paths: "full" or "bwrap-only". */
 	int bwrap_only = strcmp(path, "bwrap-only") == 0;
-	/* RO unshares the net by default; RW only when RW_NETWORK=0.
-	 * AF_UNIX is unaffected by --unshare-net, so WSL interop
-	 * (the interop sockets under /run/WSL, unmasked in RW) keeps
-	 * working. */
+	/* RO unshares the net by default; workspace too (the per-call network
+	 * capability arrives as WORKSPACE_NETWORK=1); RW only when
+	 * RW_NETWORK=0. AF_UNIX is unaffected by --unshare-net. */
 	int unshare_net =
 		(ro && strcmp(env_or("OPENCODE_SANDBOX_RO_NETWORK", "off"),
 			      "off") == 0) ||
+		(ws && !env_bool("OPENCODE_SANDBOX_WORKSPACE_NETWORK", 0)) ||
 		(rw && !env_bool("OPENCODE_SANDBOX_RW_NETWORK", 1));
-	int mask_wsl = ro && env_bool("OPENCODE_SANDBOX_MASK_WSL_INTEROP", 1);
+	int mask_wsl =
+		(ro || ws) && env_bool("OPENCODE_SANDBOX_MASK_WSL_INTEROP", 1);
 
 	struct argv_builder b = { 0 };
 	ab_push(&b, p.bwrap);
@@ -962,6 +1319,15 @@ static int stage1(const char *cmd)
 		ab_push(&b, "--bind");
 		ab_push(&b, scratch);
 		ab_push(&b, scratch);
+	} else if (ws) {
+		/* workspace-write: the entire root is read-only; writable
+		 * hierarchies are scratch plus the per-call write roots
+		 * emitted below. /tmp stays real (no tmpfs overlay): scratch
+		 * semantics (default /tmp) are persistent across calls. */
+		ab_push(&b, "--ro-bind");
+		ab_push(&b, "/");
+		ab_push(&b, "/");
+		emit_write_roots(&b, scratch, NULL);
 	} else {
 		ab_push(&b, "--bind");
 		ab_push(&b, "/");
@@ -982,14 +1348,33 @@ static int stage1(const char *cmd)
 	ab_push(&b, "/dev");
 	if (unshare_net)
 		ab_push(&b, "--unshare-net");
+	/* workspace write roots BEFORE all masks and the deny lists: later
+	 * mounts shadow earlier ones, so a privileged-socket mask, the WSL
+	 * mask, and deny entries still override a write root that happens to
+	 * cover their paths. */
+	if (ws)
+		emit_write_roots(&b, getenv("OPENCODE_SANDBOX_WRITE_ROOTS"),
+				 scratch);
 	mask_sockets(&b, mask_spec);
 	if (mask_wsl && path_exists("/run/WSL")) {
 		ab_push(&b, "--tmpfs");
 		ab_push(&b, "/run/WSL");
 	}
+	/* workspace extraArgs could shadow the floor (a trailing --bind /
+	 * --setenv would win over the deny lists), so the profile refuses
+	 * them outright; ro/rw keep the explicit legacy pass-through. */
+	if (ws) {
+		const char *ea = getenv("OPENCODE_SANDBOX_EXTRA_ARGS");
+		if (ea && *ea) {
+			fprintf(stderr,
+				"opencode-sandbox: workspace profile does not "
+				"support OPENCODE_SANDBOX_EXTRA_ARGS\n");
+			return 125;
+		}
+	}
 	emit_deny_lists(&b, getenv("OPENCODE_SANDBOX_DENY_READ"),
-			getenv("OPENCODE_SANDBOX_DENY_WRITE"));
-	if (ro) {
+			getenv("OPENCODE_SANDBOX_DENY_WRITE"), ws);
+	if (ro || ws) {
 		ab_push(&b, "--setenv");
 		ab_push(&b, "TMPDIR");
 		ab_push(&b, scratch);
@@ -1066,7 +1451,7 @@ static void usage(FILE *out)
 		"opencode-sandbox — P4 sandbox helper\n"
 		"  opencode-sandbox -c <command>\n"
 		"  opencode-sandbox --probe\n"
-		"  opencode-sandbox --stage2 --mode ro|rw [--no-landlock]\n"
+		"  opencode-sandbox --stage2 --mode ro|rw|workspace [--no-landlock]\n"
 		"        [--af-unix-block] --real-bash <path> -- bash -c <cmd>\n");
 }
 

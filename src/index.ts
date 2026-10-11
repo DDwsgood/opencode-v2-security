@@ -19,7 +19,11 @@
 //        (ev.env.OPENCODE_REAL_BASH = ev.shell; ev.shell = supervisorPath; Windows only)
 //   5. fail_ask             v1 confirm tool + context.ask -> REMOVED; normalized to fail_close
 //        (Tool.Context has no `ask`; a denial is thrown as a Tool.Error-shaped error)
-//   6. HARD session abort   v1 client.session.abort   -> ctx.session.interrupt({ sessionID })
+//   6. HARD policy + abort  v1 client.session.abort   -> REMOVED entirely: a single LOOSE
+//        policy remains (config rejects strictness != "LOOSE"), so there is no
+//        bypassing interrupt, no rejection-forcing state, and no legacy static
+//        DENY/dynamic-review/escalation pipeline — admission is static ALLOW
+//        (terminal) or JEV effects review inside the native tool wrapper only.
 //   7. Session cleanup      v1 event hook             -> ctx.event.subscribe() consumer loop
 //        (session.deleted wire event: { type, data: { sessionID } }, verified in
 //         packages/schema/src/session-event.ts)
@@ -40,8 +44,8 @@
 // (message preserved) — acceptable, since the block message is what matters.
 
 import { createHash } from "node:crypto"
-import { readFileSync } from "node:fs"
-import { access, appendFile, lstat, mkdir, readFile, realpath } from "node:fs/promises"
+import { realpathSync } from "node:fs"
+import { access, appendFile, lstat, mkdir, readFile } from "node:fs/promises"
 import { homedir, release as osRelease } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -51,15 +55,34 @@ import type { Scope } from "effect"
 import { resolveClassifierShell } from "./shell-dialect"
 import { BypassRpc } from "./bypass-rpc"
 import {
+  BoundaryPreparationError,
+  boundarySessionContext,
+  canonicalBoundaryPath,
+  containsPath,
+  isBoundaryTool,
+  nativeAbsolutePath,
+  planFileBoundary,
+  planShellBoundary,
+  verifyFileBoundaryPlan,
+  type BoundaryInvocation,
+  type FileBoundaryPlan,
+  type NativeBoundaryTool,
+  type ShellBoundaryPlan,
+} from "./tool-boundary"
+import {
   PERM_FULL,
   parsePerm,
+  parseSecurityMode,
+  permEqual,
+  permForMode,
   permIntersect,
   permLabel,
-  permSubset,
-  fallbackPermBit,
   requiredPermBit,
+  securityModeFor,
+  securityModeLabel,
   tightenPerm,
   type Perm,
+  type SecurityMode,
 } from "./permissions"
 import {
   BYPASS_CATEGORIES,
@@ -69,173 +92,57 @@ import {
   type BashClassifierOptions,
   type BypassCategory,
 } from "./config"
+import { classifyBoundaryCommand, classifyShellCommand, type StaticSecurityDecision } from "./security/classifier"
+import { isFloorRule } from "./security/bypass"
 import {
-  classifyShellCommand,
-  isolateDetachedStartCommand,
-  verifyScriptFingerprints,
-  type StaticSecurityDecision,
-} from "./security/classifier"
-import {
-  reviewCommandWithAuditor,
-  normalizeReviewRequest,
-  requestForPolicy,
-  ReviewError,
-  type CloudReviewRequest,
-  type CloudReviewResult,
-  type PreviousFailedCommand,
-  type PreviousRejectedCommand,
-  type ReviewCommandOptions,
-} from "./security/reviewer"
+  adjudicateEffectAnswers,
+  EFFECTS_POLICY_VERSION,
+  EFFECTS_POLICY_VERSION_READONLY,
+  EffectsReviewError,
+  resolveUncollectableEffects,
+  reviewEffects,
+  type EffectReviewRequest,
+  type EffectReviewResult,
+} from "./security/effects-reviewer"
+import type { CloudReviewResult } from "./security/reviewer"
 import { analyzeSlowCommand } from "./security/slow-command"
-import { detectInjection } from "./security/injection-detector"
-import { isFloorRule, ruleRequiredCategories, rulesHintCategories } from "./security/bypass"
-import {
-  CATEGORY_HEADER_PREFIX,
-  ESCALATION_MARKER,
-  JUSTIFICATION_HEADER_PREFIX,
-  parseEscalation,
-  type EscalationRequest,
-} from "./security/escalation"
-import {
-  escalationContextFromMessages,
-  findSimilarFailedEscalation,
-  type FailedEscalationRecord,
-} from "./security/escalation-state"
-import {
-  reviewEscalation,
-  reviewEscalationDetailed,
-  EscalationReviewError,
-  DEFAULT_ESCALATION_REVIEW_TIMEOUT_MS,
-  type EscalationReviewRequest,
-} from "./security/escalation-reviewer"
 import {
   applySandboxCreateBefore,
-  commandNeedsOsPrivilege,
+  DEFAULT_BOUNDARY_WATCH_HELPER,
   createSandboxMarkers,
   extractSandboxMarker,
   insertSandboxMarker,
-  profileForPerm,
   probeLinuxSandbox,
-  assertSandboxAvailable,
-  stripSandboxMarker,
   type SandboxProbeResult,
-  type SandboxProfile,
 } from "./sandbox"
+import { createSessionStateNotices } from "./session-notifications"
+import { globalTempWriteRoots, incidentalWriteRoots, isIncidentalToolWrite, standardCacheWriteRoots } from "./security/automatic-write-roots"
+import { checkPathSensitivity, credentialStoreReadPaths } from "./security/paths"
+import { createApprovalCache, type ApprovalCacheFacts, type ApprovalCacheScope, type ApprovalCacheTarget } from "./security/approval-cache"
+import { createRuntimeBoundaryBroker, currentCacheTargets, targetIdentitiesMatch, runtimeWriteEffect, staticCrossingReview, type RuntimeBoundaryBroker, type RuntimeBoundaryEvent } from "./runtime-boundary"
+import { inspectRegularTextFileSync, inspectionErrorCode } from "./security/inspection"
+import { createSingleFlight } from "./security/single-flight"
 import {
-  attachSessionContextHook,
-  createSessionStateNotices,
-} from "./session-notifications"
-import {
-  AssessmentStore,
-  buildReport,
-  ownersForCategories,
-  reportKeyPayload,
-  type CollectedEvidence,
-} from "./security/assessment"
-import {
-  automaticOutcome,
-  collectBoundedEvidence,
-  terminalOutcomeText,
-  type EvidenceRequest,
-  type RawReviewerDecision,
-} from "./security/automatic"
+  accessErrorNote,
+  runtimeBlockedText,
+  actionBlockedText,
+  blockedText,
+  permissionChangeRejectedText,
+  RECHECK,
+  RETRY_LATER,
+  reviewRefusal,
+  reviewUnavailableReason,
+  WITHIN_MODE,
+  subagentBlockedText,
+} from "./agent-messages"
+import { reportKeyPayload } from "./security/assessment"
+import { collectBoundedEvidence } from "./security/automatic"
 
 // Package root, derived from this module's own URL so relative paths (native
 // supervisor, auditor) resolve no matter where the plugin is installed from.
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 
 const PROMPT_VERSION = "v7-execution-scope"
-const SESSION_STATE_TTL_MS = 30 * 60 * 1000
-const MAX_SESSION_STATES = 512
-const MAX_OUTPUT_TAIL_CHARS = 2000
-
-const BLOCK_SUFFIX =
-  "Skip the step (if unnecessary) or ask for escalation instead of trying alternative methods to bypass the check."
-
-// The escalation-disabled ending: identical guidance minus the escalation
-// pointer — the blocked call ends the same way a terminal refusal does,
-// without ever referencing the header protocol.
-const BLOCK_SUFFIX_NO_ESCALATION =
-  "Skip the step (if unnecessary) or authorize it on the session surface instead of trying alternative methods to bypass the check."
-
-// Terminal ending for denials that cannot be resolved by submitting another
-// escalation request (pending/history saturated/similar denied/unavailable/
-// context failure/session ended/reviewer deny/infra error). Unlike
-// BLOCK_SUFFIX it never says "request escalation": the only remaining route
-// is skipping the step.
-const TERMINAL_NO_BYPASS =
-  "do not try to reach the same effect through other commands, wrappers, or scripts."
-
-// permission.write denials are a hard refuse from the permission ceiling —
-// an independent layer that comment-based escalation can never relax. They
-// carry neither BLOCK_SUFFIX (which points at escalation) nor the full guide.
-// The ceiling is session-level state; nothing in the command path can change
-// it, so the message states the boundary instead of routing to a human.
-const PERM_WRITE_SUFFIX =
-  "This is the session permission ceiling, an independent check that escalation cannot override. " +
-  "It only moves when the session's permission surface changes; until then, skip the step."
-const PERM_WRITE_SUFFIX_NO_ESCALATION =
-  "This is the session permission ceiling, an independent check that cannot be overridden per call. " +
-  "It only moves when the session's permission surface changes; until then, skip the step."
-
-/** Rules that make an escalation request terminally unrunnable regardless of
- * any reviewer verdict, beyond the unconditional floor (isFloorRule): the
- * permission ceiling and the two unreviewable input states. `input.opaque`
- * arrives with an ASK verdict — the command is exactly what cannot be
- * reviewed locally — so these are checked on the rules, not the verdict. */
-const TERMINAL_ESCALATION_RULES = new Set(["permission.write", "input.empty", "input.opaque"])
-
-function terminalAuthorize(categories: readonly string[], options: { skip?: boolean } = {}): string {
-  const bypass =
-    categories.length > 0
-      ? ` for categories ${categories.join(", ")}`
-      : ""
-  const lead = options.skip === false ? " Authorization for it" : " Skip this step if it is not required; authorization for it"
-  return `${lead} can only come from the session surface (e.g. an armed bypass${bypass}); ${TERMINAL_NO_BYPASS}`
-}
-
-// Categories a `# - REQUIRE_ESCALATION` request may ask the reviewer to
-// grant (fix F1): `dynamic` and `slow` are deliberately absent — a grant
-// that disables the review layer itself (or the slow-command layer) is not
-// something the reviewer may ever authorize. `sandbox` stays grantable.
-const ESCALATION_GRANTABLE_CATEGORIES = BYPASS_CATEGORIES.filter(
-  (category) => category !== "dynamic" && category !== "slow",
-)
-
-const ESCALATION_GUIDANCE =
-  ` To escalate for one execution, resubmit the command once with this exact prefix:\n` +
-  `${ESCALATION_MARKER}\n` +
-  `${CATEGORY_HEADER_PREFIX} <category>[,<category>...]\n` +
-  `${JUSTIFICATION_HEADER_PREFIX} <one-line reason>\n` +
-  `<real command starting on line 4>\n` +
-  `A single call is reviewed by an independent reviewer: allow_once runs the command once ` +
-  `(no session state is armed); collect_evidence triggers one automatic bounded evidence pass ` +
-  `and one resubmit; deny records the outcome, and a similar command ` +
-  `cannot be escalated again in this session — authorization then only comes from the session surface.\n` +
-  `Categories: filesystem (local file changes), host (processes, services, and running-system state), ` +
-  `privilege (crossing permission or isolation boundaries: sudo/doas/su/pkexec/sudoedit, ownership and capability changes, ` +
-  `kernel parameters, namespaces, privileged containers — a call that needs privilege runs without the OS ` +
-  `sandbox for that call, or is refused loudly when the sandbox cannot be removed), ` +
-  `secret (credentials and sensitive files), network (network access and transfers), ` +
-  `remote (remote code and remote-state changes), indirection (scripts, wrappers, encoded or ` +
-  `dynamic execution), sandbox (skip the OS sandbox for this call). ` +
-  `Only these categories are grantable. Request only the categories the command actually needs.`
-
-type SessionState = {
-  version: number
-  touchedAt: number
-  lastRejected?: { value: PreviousRejectedCommand; generation: number }
-  lastFailed?: { value: PreviousFailedCommand; generation: number; consumedBy?: string }
-  /** The most recent dynamic DENY (or HARD bypassing interrupt) in this
-   * session. The risk categories the denial judged are replayed to the
-   * escalation reviewer as `previousDenial` so it can verify the requested
-   * categories actually cover what was denied. */
-  lastDynamicDenial?: {
-    command: string
-    riskCategories: string[]
-    at: number
-  }
-}
 
 // --- v2 hook event shapes ---------------------------------------------------
 // Local mirrors of the promise shapes in @opencode-ai/plugin/promise/*. The
@@ -259,10 +166,31 @@ type ExecuteAfterEvent = ExecuteBeforeEvent & {
   readonly status?: "completed" | "error"
   readonly result?: {
     readonly output?: unknown
-    readonly content?: unknown
+    // Mutable: the host reads it back after the hook (tool result channel).
+    content?: unknown
     readonly metadata?: Record<string, unknown>
   }
   readonly error?: unknown
+}
+
+const notYetCreated = Symbol("session not yet created")
+
+/** The content parts the host would derive from a completed result (its
+ *  normalizeContent): an absent or empty content falls back to the output. */
+function toolResultContent(result: NonNullable<ExecuteAfterEvent["result"]>): unknown[] {
+  const { content, output } = result
+  if (typeof content === "string") return [{ type: "text", text: content }]
+  if (Array.isArray(content) && content.length > 0) return [...content]
+  let text: string
+  if (typeof output === "string") text = output
+  else {
+    try {
+      text = JSON.stringify(output) ?? String(output)
+    } catch {
+      text = String(output)
+    }
+  }
+  return [{ type: "text", text }]
 }
 
 // ctx.shell.hook("create.before"): all fields mutable, fired before spawn.
@@ -281,28 +209,46 @@ function rejectionError(message: string): Error & { readonly _tag: "Tool.Error" 
   return Object.assign(new Error(message), { _tag: "Tool.Error", _op: "TaggedError" })
 }
 
+// Pre-execution refusals share one envelope so the agent always learns two
+// facts: the call was blocked, and nothing of it ran. This shape is ONLY for
+// denials raised before the original executor starts (boundary preflight,
+// permission hook, argument validation) — errors that surface after launch
+// (OS access failures, tool-internal errors) keep their raw message and must
+// never claim "the whole command was not run". The wording lives in
+// agent-messages.ts (blockedText).
+function blockedRejection(reason: string, advice?: string): Error & { readonly _tag: "Tool.Error" } {
+  return rejectionError(blockedText(reason, advice))
+}
+
 // `Effect.tryPromise`'s `catch` must always return the same shape. The
-// execute.before body already throws `rejectionError` for every block, so a
-// thrown Tool.Error-shaped error is passed through unchanged; any other thrown
-// value (an unexpected non-block exception) is normalized into one so the host's
-// `catchTag("Tool.Error")` still routes it to a tool-call error instead of a
-// step-killing defect.
+// execute.before / wrapper bodies already throw a Tool.Error-shaped error for
+// every deliberate block, so a thrown Tool.Error-shaped value is passed
+// through unchanged; any other thrown value (an unexpected non-block
+// exception raised during preflight) is normalized into the same "Command
+// blocked" envelope so the host's `catchTag("Tool.Error")` still routes it to
+// a tool-call error instead of a step-killing defect.
 function toRejection(error: unknown): Error & { readonly _tag: "Tool.Error" } {
   if (error instanceof Error && (error as { _tag?: string })._tag === "Tool.Error") {
     return error as Error & { readonly _tag: "Tool.Error" }
   }
-  return rejectionError(error instanceof Error ? error.message : String(error))
-}
-
-// Agent-facing reason for a failed dynamic review: configuration defects are
-// folded to a generic phrase (internal field names mean nothing to the model;
-// the verbatim message is already in the reviewer trace). Runtime errors —
-// timeouts, exits, protocol violations — pass through unchanged.
-function agentFacingReviewReason(reason: string): string {
-  if (/\b(?:dynamicReview|apiKeyEnv|api key)\b|is not configured/i.test(reason)) {
-    return "dynamic review unavailable or invalid review configuration"
+  // Some pre-spawn helpers return the same centralized text as a plain
+  // Error (their API is also used by create.before's deny-command rewrite).
+  if (error instanceof Error && error.message.startsWith("Command blocked: ") &&
+    error.message.includes("The whole command was not run.")) {
+    return rejectionError(error.message)
   }
-  return reason
+  // A boundary-prep drift is a typed source, not an internal failure: the
+  // agent-facing reason comes from the error (changed → resubmit advice).
+  if (error instanceof BoundaryPreparationError) {
+    return blockedRejection(error.agentReason, error.changed ? RECHECK : undefined)
+  }
+  if (error instanceof EffectsReviewError) {
+    if (error.kind === "aborted") return blockedRejection("the call was cancelled before it started")
+    return blockedRejection(reviewUnavailableReason(error.kind), RETRY_LATER)
+  }
+  return blockedRejection(
+    `the security check failed with an internal error (${error instanceof Error ? error.message : String(error)})`,
+  )
 }
 
 function conciseReason(reason: string, limit = 160) {
@@ -316,128 +262,18 @@ function conciseReason(reason: string, limit = 160) {
   return (value || "Blocked by policy").slice(0, limit)
 }
 
-// The risk-family line appended to classifier blocks so the agent knows which
-// categories to request instead of guessing (category-fix design §2).
-// `armed` carries the categories already authorized for this call (session
-// leases plus this call's allow_once grant): re-advertising one would point a
-// retry at an already-approved label instead of the outstanding risk. The
-// filter is presentation-only — the recorded denial (lastDynamicDenial) keeps
-// the full judged set, and the DENY itself is never lifted by it.
-function riskCategoryHint(categories: readonly string[], armed?: ReadonlySet<string>): string {
-  const outstanding = armed ? categories.filter((category) => !armed.has(category)) : categories
-  if (outstanding.length === 0) return ""
-  return ` Risk categories: ${outstanding.join(", ")} — request escalation with these categories.`
-}
-
-// Static rules name the categories that would clear the static layer; the
-// reviewer's own categories name the families IT judged. The union is the
-// conservative hint — arming an extra category is harmless, arming too few
-// guarantees a second denial.
-function denialHintCategories(
-  rules: readonly string[],
-  review?: { categories?: string[]; secondary_categories?: string[] },
-): string[] {
-  const out = new Set<string>(rulesHintCategories(rules))
-  if (review) {
-    for (const category of review.categories ?? []) out.add(category)
-    for (const category of review.secondary_categories ?? []) out.add(category)
-  }
-  return [...out]
-}
-
-// `guidance` is the escalation-usage text appended after BLOCK_SUFFIX. The
-// plugin passes a per-session, per-context-cycle claim so the full format is
-// shown only on the first classifier block of a cycle (see
-// claimEscalationGuidance); the default keeps standalone callers on the full
-// text.
-function blockMessage(
-  type: "static" | "dynamic" | "policy",
-  reason: string,
-  strict: boolean,
-  rules: string[] = [],
-  command = "",
-  guidance: string = ESCALATION_GUIDANCE,
-  escalationEnabled = true,
-  riskHint = "",
-) {
-  // A static permission.write deny comes from the permission ceiling, not a
-  // bypassable classifier rule: it must not point at escalation nor consume
-  // the per-cycle guide slot (the caller's claim helper skips it too).
-  if (type === "static" && rules.includes("permission.write")) {
-    const suffix = escalationEnabled ? PERM_WRITE_SUFFIX : PERM_WRITE_SUFFIX_NO_ESCALATION
-    return rejectionError(`Blocked by static classifier: ${conciseReason(reason, 120)}. ${suffix}`)
-  }
-  const suffix = escalationEnabled ? BLOCK_SUFFIX : BLOCK_SUFFIX_NO_ESCALATION
-  // With the escalation channel configured off, the agent must never learn
-  // it exists — the risk-category hint points at escalation, so it is
-  // suppressed alongside the format guide (claimEscalationGuidance).
-  const hint = escalationEnabled ? riskHint : ""
-  // Dynamic denials no longer carry a reviewer reason: "Denied by policy"
-  // read like a refusal of the agent's intent and misled operators. The
-  // classifier label plus the risk-category hint is the whole message.
-  if (type === "dynamic") {
-    return rejectionError(`Blocked by dynamic classifier.${hint} ${suffix}${guidance}`)
-  }
-  return rejectionError(
-    `Blocked by ${type} classifier: ${conciseReason(reason, 120)}.${hint} ${suffix}${guidance}`,
-  )
-}
-
 function softSlowMessage(reason: string) {
-  // Soft interception for high-cost but optimizable commands: no BLOCK_SUFFIX, no DO NOT retry
-  return rejectionError(conciseReason(reason, 300))
+  // This interception happens before launch too. The reason may suggest a
+  // cheaper equivalent, but must not imply the original command ran.
+  return blockedRejection(conciseReason(reason, 300))
 }
 
-// failPolicy has no interactive mode in v2 (there is no human-confirmation
-// channel): config normalizes the legacy "fail_ask" spelling to fail_close at
-// resolve time, so a reviewer outage always takes the deny path.
-function failClosedBlock(
-  reason: string,
-  strict: boolean,
-  rules: string[] = [],
-  command = "",
-  guidance: string = ESCALATION_GUIDANCE,
-  escalationEnabled = true,
-) {
-  const suffix = escalationEnabled ? BLOCK_SUFFIX : BLOCK_SUFFIX_NO_ESCALATION
-  return rejectionError(
-    `Blocked by policy classifier: ${conciseReason(reason, 120)}. ${suffix}${guidance}`,
-  )
-}
-
-function applyPatchDeleteBlock() {
-  return rejectionError(
-    "patch cannot delete files. Use a shell command so the classifier and OpenCode permission layer can review the deletion.",
-  )
-}
-
-// --- small helpers (ported unchanged) ---------------------------------------
-
-async function canonicalOrResolved(value: string) {
-  const resolved = path.resolve(value)
-  try {
-    return await realpath(resolved)
-  } catch {
-    return resolved
-  }
-}
+// --- small helpers ----------------------------------------------------------
 
 function commandFromArgs(args: unknown) {
   if (!args || typeof args !== "object" || Array.isArray(args)) return
   const command = (args as Record<string, unknown>).command
   return typeof command === "string" ? command : undefined
-}
-
-function workdirFromArgs(args: unknown) {
-  if (!args || typeof args !== "object" || Array.isArray(args)) return
-  const workdir = (args as Record<string, unknown>).workdir
-  return typeof workdir === "string" ? workdir : undefined
-}
-
-function sanitizeOutputTail(output: string) {
-  const trimmed = (output ?? "").replace(/\0/g, "").trim()
-  if (!trimmed) return ""
-  return trimmed.slice(-MAX_OUTPUT_TAIL_CHARS).replace(/\s+/g, " ").trim()
 }
 
 /**
@@ -569,13 +405,13 @@ function isValidCategoryList(value: unknown): value is string[] {
 }
 
 // The 1.1.0 reviewer output contract: {decision, categories?,
-// secondary_categories?, bypassing?(HARD), reason?(legacy)}. `reason` is
+// secondary_categories?, reason?(legacy)}. `reason` is
 // tolerated for older auditors but is no longer required; a DENY without a
 // usable category falls back to ["indirection"] (mutated onto the record).
 // `collect_evidence` is the newer indecision verdict: it validates like a
 // DENY shape (categories optional) and is resolved by the automatic
 // collection path, never by asking a human.
-export function isValidReviewResult(value: unknown, strict: boolean): value is CloudReviewResult {
+export function isValidReviewResult(value: unknown, _legacyStrict = false): value is CloudReviewResult {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
   const record = value as Record<string, unknown>
   for (const key of Object.keys(record)) {
@@ -600,7 +436,8 @@ export function isValidReviewResult(value: unknown, strict: boolean): value is C
     if (!ok) return false
   }
   if (record.reason !== undefined && typeof record.reason !== "string") return false
-  if (strict && typeof record.bypassing !== "boolean") return false
+  // The former strict-policy field no longer selects or validates a policy.
+  delete record.bypassing
   // `assessment` must be an object when present (reviewer.ts synthesizes a
   // default when absent); a non-object value is a protocol error.
   if (
@@ -683,21 +520,9 @@ interface EffectPluginContext {
     readonly interrupt: (input: { sessionID: string; continue?: boolean }) => Effect.Effect<unknown, unknown>
     /** Durable session transcript (`{ data: SessionMessage.Info[] }`, everything
      *  since the last compaction). Used to extract the reviewer-facing user
-     *  context for escalation requests. Optional so older hosts still load the
-     *  plugin — escalation then fails closed instead of allowing blind. */
+     *  context for effects reviews. Optional so older hosts still load the
+     *  plugin — the review then fails closed instead of allowing blind. */
     readonly context?: (input: { sessionID: string }) => Effect.Effect<unknown, unknown>
-    /** Session context hook (packages/plugin/src/effect/session.ts
-     *  SessionDomain.hook → ModelHooks<SessionHooks>). The "context" callback
-     *  fires while the host is already building a model request; mutating
-     *  `event.system` ships state without a wake. Optional — older hosts lack
-     *  it and notices are simply unavailable there. */
-    readonly hook?: (
-      name: "context",
-      callback: (event: {
-        readonly sessionID: string
-        system: Array<{ type: "text"; text: string; metadata?: Record<string, unknown> }>
-      }) => Effect.Effect<void>,
-    ) => Effect.Effect<unknown, never, Scope.Scope>
     readonly synthetic: (input: {
       sessionID: string
       text: string
@@ -710,6 +535,13 @@ interface EffectPluginContext {
        * so a host default change cannot silently alter notification semantics. */
       delivery?: "steer" | "queue"
     }) => Effect.Effect<unknown, unknown>
+    /** Session hooks (packages/plugin/src/effect/session.ts). Only "prompt"
+     *  is used: it runs while the host prepares a real user prompt, before
+     *  that prompt is admitted. Optional so older hosts still load. */
+    readonly hook?: (
+      name: "prompt",
+      callback: (event: { readonly sessionID: string; readonly delivery?: string }) => Effect.Effect<void, never>,
+    ) => Effect.Effect<unknown, never, Scope.Scope>
   }
   // Event-only RPC used to push bypass state changes to the TUI companion.
   // See src/bypass-rpc.ts for why a session message cannot carry this.
@@ -742,11 +574,12 @@ type CommandDraft = {
 // mirrored structurally: `add` takes a Tool.Info-shaped record whose `execute`
 // returns an Effect, `update` mutates an existing tool in place.
 type ToolInfoMirror = {
+  id?: string
   name?: string
   description?: string
   input?: unknown
   options?: Record<string, unknown>
-  execute?: (input: unknown, context: { sessionID: string }) => Effect.Effect<unknown, unknown>
+  execute?: (input: unknown, context: BoundaryInvocation) => Effect.Effect<unknown, unknown>
 }
 type ToolEditorMirror = {
   add(tool: ToolInfoMirror): void
@@ -761,6 +594,7 @@ type PermissionEvalEvent = {
   readonly agent?: string
   readonly action: string
   readonly resources: readonly string[]
+  readonly source?: { type: "tool"; messageID: string; id: string }
   effect: "allow" | "deny" | "ask"
   message?: string
 }
@@ -813,22 +647,10 @@ async function resolveStartup(rawOptions: unknown) {
   for (const warning of resolved.bypassWarnings) {
     console.warn(`[opencode-v2-security] ${warning}`)
   }
-  // v2's Tool.Context has no `ask`, so human-in-the-loop approval cannot be
-  // implemented. `failPolicy` has no "fail_ask" value: resolvePluginConfig
-  // normalizes the legacy spelling to "fail_close" — an unavailable or failed
-  // reviewer becomes a denial, never a question.
-  const effectiveFailPolicy = resolved.failPolicy
-  const configuredShell = resolved.shell
-  const strictPolicy = resolved.strictness === "HARD"
-  let supervisorActive = false
-  if (resolved.supervisorEnabled && process.platform === "win32") {
-    try {
-      await access(resolved.supervisorPath)
-      supervisorActive = true
-    } catch {
-      supervisorActive = false
-    }
+  for (const warning of resolved.dynamicReviewWarnings) {
+    console.warn(`[opencode-v2-security] ${warning}`)
   }
+  const configuredShell = resolved.shell
   // P4: Linux sandbox probe. Skipped entirely when the sandbox is disabled or
   // forced "full" (no helper exec needed); a missing/failed helper reports
   // unavailable with a sanitized reason — the §4.3 fail mode is applied per
@@ -840,17 +662,16 @@ async function resolveStartup(rawOptions: unknown) {
       console.warn(
         `[opencode-v2-security] OS sandbox unavailable (${sandboxProbe.reason ?? "unknown reason"}) — ` +
           (resolved.sandbox.onUnavailable === "degrade"
-            ? "onUnavailable=degrade: running classifier-only"
-            : "onUnavailable=fail_close: non-full shell profiles will be denied"),
+            ? "onUnavailable=degrade: calls that still use the sandbox run classifier-only"
+            : "onUnavailable=fail_close: read-only calls that still require the OS sandbox " +
+              "will be denied; reviewed read-write calls run host-direct " +
+              "and are unaffected"),
       )
     }
   }
   return {
     resolved,
-    effectiveFailPolicy,
     configuredShell,
-    strictPolicy,
-    supervisorActive,
     sandboxProbe,
   }
 }
@@ -858,6 +679,9 @@ async function resolveStartup(rawOptions: unknown) {
 const plugin: Plugin = {
   id: "opencode-v2-security",
   effect: (ctx: EffectPluginContext) => Effect.gen(function* () {
+    // This backend is deliberately Linux-only. Do not register hooks,
+    // commands, permission tools, or Windows supervisor behavior elsewhere.
+    if (process.platform !== "linux") return
     // Capture the ambient context so `ctx.session.*` Effects (which need host
     // services despite their narrowed plugin-facing type) run with those
     // services — a bare `Effect.runPromise` would lose them. Mirrors the
@@ -865,51 +689,31 @@ const plugin: Plugin = {
     // no `Effect.runtime`/`Runtime.runPromise`; context capture is the beta
     // API for this.
     const context = yield* Effect.context<never>()
-    const run = <A>(effect: Effect.Effect<A, unknown>): Promise<A> =>
-      Effect.runPromiseWith(context)(effect as Effect.Effect<A, unknown, never>)
+    const run = <A>(effect: Effect.Effect<A, unknown>, signal?: AbortSignal): Promise<A> =>
+      Effect.runPromiseWith(context)(effect as Effect.Effect<A, unknown, never>, signal ? { signal } : undefined)
 
     const {
       resolved,
-      effectiveFailPolicy,
       configuredShell,
-      strictPolicy,
-      supervisorActive,
       sandboxProbe,
     } = yield* Effect.promise(() => resolveStartup(ctx.options))
 
-    // v2 ctx has no `directory`/`worktree`; resolve them per session from
-    // ctx.session.get(...).location.directory (cached, bounded, TTL-bounded),
-    // falling back to process.cwd().
-    const sessions = new Map<string, SessionState>()
-    // Whole-assessment report cache: replaces the allow/deny verdict caches.
-    // A report records the full context (command, cwd, fingerprints, perm,
-    // policy version) and replays only on an identical canonical key — a
-    // fact/target/permission change yields a different key, i.e. a NEW
-    // report, never an in-place verdict swap.
-    const assessmentReports = new AssessmentStore()
-    const inflightReviews = new Map<string, Promise<CloudReviewResult>>()
-    const sessionDirectories = new Map<string, { directory: string; worktree: string; at: number }>()
-    let consecutiveDynamicFailures = 0
-    let lastDynamicFailureToastAt = 0
-
-    // --- session state notices (no-wake) -------------------------------------
-    // Bypass/permission reminders ride the session-context hook
-    // (ctx.session.hook("context")) instead of synthetic inbox items: a
-    // synthetic admission can wake an idle Runner, while a system-part update
-    // is only observed by the next model request the host builds anyway.
-    // When the host lacks session.hook the attach returns false and notices
-    // are simply unavailable — the enforcement boundary is unaffected, and
-    // no synthetic fallback is sent (that would re-introduce the wake).
-    const sessionNotices = createSessionStateNotices()
-    const sessionContextHookAttached = yield* attachSessionContextHook(
-      ctx as unknown as import("./session-notifications").SessionContextHookHost,
-      sessionNotices,
+    // --- append-only user-role state notices --------------------------------
+    // No session.context hook and no system/history mutation. A mode change
+    // is only recorded; it becomes a durable transcript item right before the
+    // next real user prompt, so it never starts a model request of its own.
+    const sessionNotices = createSessionStateNotices(
+      (notice) => run(ctx.session.synthetic(notice)),
     )
-    if (!sessionContextHookAttached) {
-      console.warn(
-        "[opencode-v2-security] host does not expose ctx.session.hook(\"context\"); " +
-          "bypass/permission reminders are disabled (enforcement unchanged)",
-      )
+    if (ctx.session.hook) {
+      // Re-verify the ancestry first: an earlier lookup may have failed
+      // transiently (or run before the session existed server-side), and its
+      // stale "verification unavailable" notice must not ride this prompt.
+      yield* ctx.session.hook("prompt", (event) =>
+        Effect.promise(async () => {
+          await hydratePermAncestry(event.sessionID)
+          await sessionNotices.deliverWithPrompt(event.sessionID, event.delivery)
+        }))
     }
 
     // --- temporary bypass state (fixed-expiry lease) ------------------------
@@ -921,7 +725,18 @@ const plugin: Plugin = {
     // Subagent children inherit the armed categories so a bypass armed on
     // the root session covers its spawned subagents doing the actual shell
     // work.
-    type BypassLease = { categories: Set<BypassCategory>; expiresAt: number; all?: boolean }
+    type BypassLease = {
+      categories: Set<BypassCategory>
+      expiresAt: number
+      /** Bypass mode (kill switch): all plugin checks skipped for the call. */
+      all?: boolean
+      custom?: string[]
+      /** Baseline this session had before Bypass mode lifted it to r/w;
+       *  restored verbatim (intersected with any concurrent tighten) when
+       *  the lease ends — so a TTL expiry can never permanently widen a
+       *  previously read-only baseline. */
+      restoreBaseline?: Perm
+    }
     const bypassLeases = new Map<string, BypassLease>()
     // child → parent links (session lifetime, NOT lease lifetime): written on
     // session.created, cleared on session.deleted only.
@@ -930,49 +745,6 @@ const plugin: Plugin = {
     let bypassRpc:
       | { readonly events: { readonly emit: (...args: unknown[]) => Effect.Effect<void, unknown> } }
       | undefined
-
-    // --- single-call escalation memory (ask_user / deny) --------------------
-    // Session-lifetime record of escalation requests the dedicated reviewer
-    // turned down. A later semantically similar request in the same session is
-    // denied outright without another reviewer call. Deliberately NOT cleared
-    // by /bypass: the user arming categories directly is the escape route, and
-    // "no similar re-request in this session" must survive it. Cleared on
-    // session.deleted and plugin unload; bounded per session and globally.
-    const MAX_ESCALATION_FAILURES_PER_SESSION = 8
-    const MAX_ESCALATION_FAILURE_SESSIONS = 512
-    const escalationFailures = new Map<string, FailedEscalationRecord[]>()
-    const escalationPending = new Map<string, object>()
-
-    // --- per-context-cycle full escalation guidance ------------------------
-    // The full escalation format is attached only to the FIRST classifier
-    // block (static/dynamic/policy) a session receives in the current context
-    // cycle; later blocks carry only BLOCK_SUFFIX because the full text is
-    // already in the visible context. A completed compaction starts a new
-    // cycle (the compacted context no longer contains the earlier guide);
-    // session.deleted and plugin unload clear the state, so a plugin reload
-    // naturally starts fresh. The claim is a synchronous check-and-set at
-    // block-message construction, so it maps 1:1 to the Tool.Error the agent
-    // actually receives, an allowed command never consumes it, and two
-    // concurrent blocks of the same session cannot both claim. Paths that
-    // block without guidance (soft slow, permission deny, patch delete)
-    // never touch this state.
-    const escalationGuideShown = new Set<string>()
-    function claimEscalationGuidance(sessionID: string, rules?: readonly string[]): string {
-      // When the escalation channel is configured off the agent never learns
-      // it exists: no format guide, no claim slot consumed.
-      if (!resolved.escalationEnabled) return ""
-      // permission.write is a permission-ceiling hard refuse, independent of
-      // escalation: it must not consume the cycle's one full-guide slot.
-      if (rules?.includes("permission.write")) return ""
-      if (escalationGuideShown.has(sessionID)) return ""
-      escalationGuideShown.add(sessionID)
-      return ESCALATION_GUIDANCE
-    }
-
-    function recordEscalationFailure(sessionID: string, record: FailedEscalationRecord) {
-      const failures = escalationFailures.get(sessionID)
-      if (failures && failures.length < MAX_ESCALATION_FAILURES_PER_SESSION) failures.push(record)
-    }
 
     // --- session rwx permission layer ---------------------------------------
     // Tighten-only capability ceiling: a session's baseline {r,w,x} intersects
@@ -984,15 +756,33 @@ const plugin: Plugin = {
     // Immutable ancestry, hydrated at execution boundaries or via events.
     const permParent = new Map<string, string>()
     // Declared permission waiting for an authoritative execute.after childID.
-    const permStash = new Map<string, { parentSessionID: string; perm: Perm; at: number }>()
+    // `declared` marks a real agent-supplied ceiling (vs. the default
+    // PERM_FULL bookkeeping entry) — a declared child may not inherit an
+    // ancestor's Bypass mode.
+    const permStash = new Map<string, { parentSessionID: string; perm: Perm; at: number; declared?: boolean }>()
+    // session.created observation times: a pending stash entry can only
+    // belong to a child created after it was recorded (entry.at <=
+    // createdAt). An unknown creation time applies every entry
+    // (conservative tightening).
+    const permCreatedAt = new Map<string, number>()
     const permBoundChildren = new Set<string>()
     const permKnownRoots = new Set<string>()
     const permUnresolved = new Set<string>()
+    /** Per-level inheritance barrier against Bypass mode: sessions whose
+     *  non-Bypass surface was explicitly asserted — by an agent declaration
+     *  (subagent `permission`, set_permission) OR by the user's own
+     *  Auto/ReadOnly/perm selection. allBypassed walks the ancestor chain
+     *  level by level; a barrier level stops the walk, so a barriered parent
+     *  also shields its whole subtree from an armed grandparent kill switch.
+     *  The user's own armed lease on the barriered session still wins (own
+     *  lease is checked first) — the barrier is never deleted, so expiry
+     *  falls back to the declared mode, never to an ancestor's Bypass. */
+    const explicitNoBypass = new Set<string>()
 
     // Session.get reads the durable record, unlike the asynchronous event
     // consumer. Cache immutable ancestry only; failed reads are retried on the
     // next boundary. An incomplete/cyclic chain loses writes, not RO reads.
-    async function hydratePermAncestry(sessionID: string): Promise<void> {
+    async function hydratePermAncestry(sessionID: string, now?: number): Promise<void> {
       const seen = new Set<string>()
       let cursor: string | undefined = sessionID
       try {
@@ -1002,7 +792,17 @@ const plugin: Plugin = {
           if (permKnownRoots.has(cursor)) break
           let parent = permParent.get(cursor)
           if (!parent) {
-            const info = await run(ctx.session.get({ sessionID: cursor }).pipe(Effect.timeout("2 seconds")))
+            const lookup = cursor
+            const info = await run(ctx.session.get({ sessionID: lookup }).pipe(Effect.timeout("2 seconds"))).catch((error) => {
+              // The TUI creates sessions optimistically and pulls their status
+              // before the server has the record. A session that does not
+              // exist yet has no ancestry to fail: retry on the next boundary.
+              if (lookup === sessionID && seen.size === 1 && (error as { _tag?: unknown })?._tag === "Session.NotFoundError") {
+                return notYetCreated
+              }
+              throw error
+            })
+            if (info === notYetCreated) return
             if (!info || typeof info !== "object") throw new Error("Missing session record")
             const value = (info as { parentID?: unknown }).parentID
             if (value != null && (typeof value !== "string" || !value)) throw new Error("Invalid parentID")
@@ -1010,31 +810,53 @@ const plugin: Plugin = {
             if (parent) permParent.set(cursor, parent)
             else permKnownRoots.add(cursor)
           }
+          if (parent && resolved.bypassPropagateToSubagents) bypassParent.set(cursor, parent)
           cursor = parent
         }
         for (const id of seen) permUnresolved.delete(id)
       } catch {
         permUnresolved.add(sessionID)
       }
+      // Discovering inheritance (or resolving a previously unknown chain) is
+      // itself a state transition. Append its notice, never edit model context.
+      syncSecurityNotice(sessionID, now)
     }
 
     /** Effective permission includes ancestor baselines and temporary spawn
-     * declarations. Boundaries hydrate ancestry before relying on this value. */
-    function effectivePerm(sessionID: string): Perm {
+     * declarations. Boundaries hydrate ancestry before relying on this value.
+     * Expired bypass leases are pruned first: a lapsed Bypass lease must not
+     * leave its lifted baseline in force until the next sweep. `now` is the
+     * shared clock capture used by RPC snapshots — one payload always
+     * describes one instant. */
+    function effectivePerm(sessionID: string, now: number = Date.now()): Perm {
+      pruneExpiredLeases(sessionID, now)
       let perm = { ...resolved.permission.defaultPerm }
       const seen = new Set<string>()
       let cursor: string | undefined = sessionID
       while (cursor && !seen.has(cursor)) {
         seen.add(cursor)
+        // Expire leases along the PERMISSION chain too, not only the bypass
+        // chain: with bypassPropagateToSubagents=false the two chains can
+        // differ, and a dead ancestor lease's lifted baseline must be
+        // restored before it is intersected — shared `now`, no extra reads.
+        const lease = bypassLeases.get(cursor)
+        if (lease && lease.expiresAt <= now) expireLease(cursor, lease, now)
         const baseline = sessionPerms.get(cursor)
         if (baseline) perm = permIntersect(perm, baseline)
         if (permUnresolved.has(cursor)) perm.w = false
         const parent = permParent.get(cursor)
         // Do not guess which concurrent spawn produced this child. These
-        // temporary ceilings disappear when its own call binds authoritatively.
+        // temporary ceilings disappear when its own call binds
+        // authoritatively. Creation time gates applicability: a stash
+        // recorded AFTER this child was created belongs to a different
+        // spawn and must not tighten it; an unknown creation time
+        // intersects every entry (conservative).
         if (parent && !permBoundChildren.has(cursor)) {
+          const createdAt = permCreatedAt.get(cursor)
           for (const entry of permStash.values()) {
-            if (entry.parentSessionID === parent) perm = permIntersect(perm, entry.perm)
+            if (entry.parentSessionID !== parent) continue
+            if (createdAt !== undefined && entry.at > createdAt) continue
+            perm = permIntersect(perm, entry.perm)
           }
         }
         cursor = parent
@@ -1047,8 +869,8 @@ const plugin: Plugin = {
       const seen = new Set<string>([sessionID])
       let cursor = permParent.get(sessionID)
       // Same 64-node bound as hydratePermAncestry: ancestry beyond it is
-      // treated as unresolved there, so consumers (incl. the escalation
-      // failure union) must not see a deeper chain either.
+      // treated as unresolved there, so consumers must not see a deeper
+      // chain either.
       while (cursor && !seen.has(cursor) && chain.length < 64) {
         seen.add(cursor)
         chain.push(cursor)
@@ -1061,44 +883,29 @@ const plugin: Plugin = {
       return permAncestors(sessionID).includes(ancestorID)
     }
 
-    const PERM_ACTIVE_REMINDER = (perm: Perm) => {
-      const label = permLabel(perm)
-      // Describe the concrete label instead of one fixed gloss: e.g. under
-      // --x there is no read-only shell exemption to promise, and under rwx
-      // nothing is restricted.
-      const detail =
-        !perm.r && !perm.w
-          ? "all tool actions that require r or w are denied; only the shell tool remains usable for read-only commands"
-          : perm.r && perm.w
-            ? "no plugin permission restriction is active"
-            : perm.w
-              ? "write actions are available but actions that require r are denied"
-              : "read actions are available but write actions are denied; the shell tool remains usable for read-only commands"
-      return [
-        "This session's permission ceiling changed.",
-        `Current permission: ${label} (r=read actions, w=write/edit/delete actions; ${detail}; x cannot be set; it is always on and only shown in the label).`,
-        "If a required action lacks permission, it stays denied until the session's permission surface grants it; do not route around the ceiling.",
-      ].join("\n")
+    /** Whether any link in the session's permission chain failed to
+     *  hydrate (a parent session record the plugin could not verify).
+     *  An unresolved chain fails closed — writes stay blocked — but the
+     *  state is a temporary verification failure, not a user-selected
+     *  [Read only] mode, so notices and denials must say so instead of
+     *  claiming a persistent limit. */
+    function ancestryUnresolved(sessionID: string): boolean {
+      const seen = new Set<string>()
+      let cursor: string | undefined = sessionID
+      while (cursor && !seen.has(cursor)) {
+        if (permUnresolved.has(cursor)) return true
+        seen.add(cursor)
+        cursor = permParent.get(cursor)
+      }
+      return false
     }
 
-    /** Publish the current effective permission to the no-wake notice
-     * channel. The helper compares against what it last published, so callers
-     * can invoke this on every transition without re-announcing the same
-     * state; a default-permission state publishes `undefined` (clearing any
-     * stale notice) rather than noise about an unrestricted session. */
+    /** Publish the current effective permission to the append-only notice
+     * channel. Thin alias for the merged single-slot notice — see
+     * syncSecurityNotice (kept so the many permission-mutation call sites
+     * read naturally). */
     function syncPermReminder(sessionID: string) {
-      // While the ALL kill switch is armed the model hears NOTHING but the
-      // [ALL OFF] notice — permission notices stay cleared until restore.
-      const effective = effectivePerm(sessionID)
-      const isDefault =
-        effective.r === resolved.permission.defaultPerm.r &&
-        effective.w === resolved.permission.defaultPerm.w &&
-        effective.x === resolved.permission.defaultPerm.x
-      if (allBypassed(sessionID) || isDefault) {
-        sessionNotices.setPerm(sessionID, undefined)
-        return
-      }
-      sessionNotices.setPerm(sessionID, PERM_ACTIVE_REMINDER(effective))
+      syncSecurityNotice(sessionID)
     }
 
     /** Report a failed RPC event push. Only the error constructor name and a
@@ -1115,12 +922,18 @@ const plugin: Plugin = {
 
     function emitPermChanged(sessionID: string, reason: string) {
       if (!bypassRpc) return
-      const effective = effectivePerm(sessionID)
+      // One shared clock capture per payload: mode, ceiling and lease state
+      // must describe the same instant (same contract as emitBypassChanged).
+      const now = Date.now()
+      const effective = effectivePerm(sessionID, now)
       void run(
         bypassRpc.events.emit("permission", {
           sessionID,
           reason,
           permission: permLabel(effective),
+          // The user-visible three-way mode; the raw triple stays only for
+          // compatibility and is not what the TUI badge renders.
+          mode: securityModeFor(effective, allBypassed(sessionID, now)),
         }),
       ).catch((error) => reportRpcEmitFailure("permission", error))
     }
@@ -1158,50 +971,8 @@ const plugin: Plugin = {
       return { ok: true }
     }
 
-    // Agent-facing bypass/permission state rides the no-wake session-context
-    // hook (session-notifications.ts): a synthetic inbox admission can wake
-    // an idle Runner, while a `context.system` part is only seen by the next
-    // real model request. The notices always carry the CURRENT effective
-    // state (undefined clears), so transitions/expiry need no append log.
-    /** Exact per-category layer notes (kept compact — reminders enter the
-     *  model context). Every note states that the non-bypassed layers —
-     *  other classifier categories, the permission ceiling, and the
-     *  unconditional safety floor — still apply. `slow` never reaches the
-     *  agent channel. */
-    const BYPASS_LAYER_NOTES: Record<string, string> = {
-      filesystem:
-        "filesystem checks are uninspected and unblocked; the permission ceiling, the unconditional safety floor, and all other layers still apply",
-      host: "processes, services, and other running-system state are uninspected and unblocked; the OS sandbox and separate permission ceiling still apply",
-      privilege:
-        "privilege-boundary checks (sudo or ownership/capability changes, kernel parameters, namespaces, privileged containers) are uninspected and unblocked; a call that needs OS privilege runs host-direct without the OS sandbox, or is refused loudly when the sandbox cannot be removed; the permission ceiling and unconditional floor still apply",
-      secret:
-        "sensitive-file and credential-use checks are uninspected and unblocked; moving secret data off-host still requires the network category, and the permission ceiling, the unconditional safety floor, and all other layers still apply",
-      network: "network destinations and transfers are treated as user-trusted; secret and remote-state checks still apply",
-      remote:
-        "remote code and destructive remote-service, database, infrastructure, or repository changes are uninspected and unblocked; all other layers still apply",
-      indirection:
-        "local scripts, wrappers, encoded payloads, and dynamic execution are allowed without static inspection; their visible effects remain subject to other categories",
-      dynamic:
-        "dynamic LLM command review is skipped and commands proceed as if the reviewer were unavailable under fail-open, regardless of the configured failure policy; static checks, sandboxing, and permissions still apply",
-      sandbox: "the operating-system sandbox is removed for shell calls; classifier checks and permissions still apply",
-      slow: "slow-command optimization checks are skipped; all other layers still apply",
-    }
-
-    const BYPASS_ACTIVE_REMINDER = (categories: string[]) =>
-      [
-        "The user temporarily allowed some sensitive commands.",
-        "Categories:",
-        ...categories.map((c) => `- ${c}: ${BYPASS_LAYER_NOTES[c] ?? "the corresponding checks are uninspected and unblocked"}.`),
-        "You may retry your previous blocked command and continue because the user authorized these categories; be careful with your authorized scope and the changes you make.",
-      ].join("\n")
-    // The ALL kill switch is much broader than a category bypass, so its
-    // notice is terse but explicit about enforcement being OFF.
-    const BYPASS_ALL_REMINDER = () =>
-      [
-        "The user temporarily removed all opencode-v2-security enforcement for this session (/bypass ALL).",
-        "You may retry the previously blocked command and continue within the user's authorization; be careful with your authorized scope and the changes you make.",
-        "The user can restore enforcement with /bypass off. Positive timeouts expire at their deadline; zero or negative timeouts have no natural expiry.",
-      ].join("\n")
+    // Agent-facing state changes append a user-role notice with resume:false;
+    // earlier notices remain chronological history and are never rewritten.
 
     /** Ancestors of a session (nearest first), bounded by cycle guard. */
     function bypassAncestors(sessionID: string): string[] {
@@ -1218,12 +989,14 @@ const plugin: Plugin = {
 
     /** Absolute expiry for a new/updated lease. `timeoutSec` is the optional
      *  /bypass trailing argument in seconds: undefined → the configured
-     *  bypassLeaseTtlMs default; <= 0 → never expires on its own (Infinity);
+     *  bypassLeaseTtlMs default (0 = no expiry); <= 0 → never expires on its
+     *  own (Infinity);
      *  a positive value → exactly now + timeoutSec seconds, clamped to the
      *  safe-integer range so huge values cannot overflow into the past. */
     function bypassExpiry(timeoutSec?: number): number {
       if (timeoutSec !== undefined && timeoutSec <= 0) return Infinity
       const ms = timeoutSec === undefined ? resolved.bypassLeaseTtlMs : timeoutSec * 1000
+      if (ms <= 0) return Infinity
       const expiresAt = Date.now() + ms
       return Number.isSafeInteger(expiresAt) ? expiresAt : Number.MAX_SAFE_INTEGER
     }
@@ -1287,14 +1060,48 @@ const plugin: Plugin = {
       return active
     }
 
-    /** Whether the `all` kill switch is active for a session: any live lease
-     * along the ancestor chain with the flag set (same lease + propagation
-     * rules as categories; never armable via config). */
-    function allBypassed(sessionID: string, now: number = Date.now()): boolean {
-      return [sessionID, ...bypassAncestors(sessionID)].some((target) => {
+    function activeCustomBypass(sessionID: string, now: number = Date.now()): string[] {
+      return [...new Set([sessionID, ...bypassAncestors(sessionID)].flatMap((target) => {
         const lease = bypassLeases.get(target)
-        return lease !== undefined && lease.all === true && lease.expiresAt > now
-      })
+        return lease && lease.expiresAt > now ? lease.custom ?? [] : []
+      }))]
+    }
+
+    /** Whether this (unbound) child is still covered by a parent's pending
+     *  declared spawn: a stash entry recorded before this child's creation
+     *  is conservatively treated as its declaration until execute.after
+     *  binds the authoritative childID. During that window the child must
+     *  not inherit an ancestor's Bypass mode either — the pending
+     *  declaration is already an inheritance barrier. */
+    function pendingDeclaredSpawn(sessionID: string): boolean {
+      if (permBoundChildren.has(sessionID)) return false
+      const parent = permParent.get(sessionID)
+      if (!parent) return false
+      const createdAt = permCreatedAt.get(sessionID)
+      for (const entry of permStash.values()) {
+        if (entry.parentSessionID !== parent || !entry.declared) continue
+        if (createdAt === undefined || entry.at <= createdAt) return true
+      }
+      return false
+    }
+
+    /** Whether Bypass mode (the kill switch) is active for a session —
+     *  per-level inheritance barrier semantics: walk self → ancestors. A
+     *  level's own live `all` lease wins immediately (the user's own arm
+     *  always outranks a declared barrier, without deleting it — the
+     *  barrier reasserts on expiry). Otherwise an explicit no-Bypass
+     *  declaration or a pending declared spawn at that level stops the
+     *  walk: nothing above it — a grandparent's armed Bypass included — is
+     *  observable through it. Expired leases are pruned first so the
+     *  deadline is never observed late. */
+    function allBypassed(sessionID: string, now: number = Date.now()): boolean {
+      pruneExpiredLeases(sessionID, now)
+      for (const target of [sessionID, ...bypassAncestors(sessionID)]) {
+        const lease = bypassLeases.get(target)
+        if (lease !== undefined && lease.all === true && lease.expiresAt > now) return true
+        if (explicitNoBypass.has(target) || pendingDeclaredSpawn(target)) return false
+      }
+      return false
     }
 
     /** RPC-facing active list: the real categories plus the literal "all"
@@ -1304,34 +1111,6 @@ const plugin: Plugin = {
       const active = [...activeBypass(sessionID, now)].sort()
       if (allBypassed(sessionID, now)) active.push("ALL")
       return active
-    }
-
-    /** The session's sandbox profile: "full" (no wrap) when the `all` kill
-     * switch or the `sandbox` category is armed — the kernel layer only;
-     * classifier and permission layers keep running. */
-    function sessionSandboxProfile(
-      sessionID: string,
-      callBypass?: ReadonlySet<BypassCategory>,
-    ): SandboxProfile {
-      if (allBypassed(sessionID) || callBypass?.has("sandbox") || activeBypass(sessionID).has("sandbox")) return "full"
-      return profileForPerm(effectivePerm(sessionID), resolved.sandbox)
-    }
-
-    /** Whether the kernel sandbox will actually enforce the RO write
-     * boundary for THIS call — the same inputs the wrap path uses: the
-     * session's resolved profile is "ro" (which already folds in
-     * mode:full, sandbox/`all` bypass, and the perm), and the probe
-     * reported a usable route. fail_close with an unavailable probe
-     * denies the call before it matters, and degrade runs bare — either
-     * way the classifier must keep its static gates, so false. */
-    function roKernelEnforcedForCall(
-      sessionID: string,
-      callBypass?: ReadonlySet<BypassCategory>,
-    ): boolean {
-      const perm = effectivePerm(sessionID)
-      if (perm.w) return false
-      if (sessionSandboxProfile(sessionID, callBypass) !== "ro") return false
-      return sandboxProbe?.available === true
     }
 
     /** Push a bypass state change to the TUI companion (best effort). The TUI
@@ -1351,66 +1130,155 @@ const plugin: Plugin = {
       // fails the host schema's optional-presence check, and the host then
       // drops the whole event — an "off"/"expired" transition would never
       // reach the TUI badge.
-      const payload: Record<string, unknown> = { sessionID, reason, active, temporary, permanent }
+      const payload: Record<string, unknown> = {
+        sessionID,
+        reason,
+        mode: securityModeFor(effectivePerm(sessionID, now), allBypassed(sessionID, now)),
+        active,
+        temporary,
+        permanent,
+      }
+      const custom = activeCustomBypass(sessionID, now)
+      if (custom.length > 0) payload.custom = custom
       const expiresAt = leaseExpiryForRpc(sessionID, now)
       if (expiresAt !== undefined) payload.expiresAt = expiresAt
       void run(bypassRpc.events.emit("changed", payload)).catch(
         // A dead TUI channel must not block command handling, but it must not
         // vanish silently either: log the error type/message only (the
-        // payload never carries credentials).
+        // never log the payload: a custom authorization can contain credentials).
         (error) => reportRpcEmitFailure("changed", error),
       )
     }
 
-    /** Append a bypass reminder to the session as a synthetic (user-role)
-     * input. `resume:false` keeps it from waking the session; no `description`
-     * keeps it out of the user's chat transcript. Fire-and-forget: a failed
-     * reminder must never affect command handling. */
-    function appendAgentReminder(sessionID: string, text: string) {
-      void run(
-        ctx.session.synthetic({
-          sessionID,
-          // Natural sender prefix: the message lands as a plain user-role
-          // line, so it names the plugin instead of looking injected.
-          text: `opencode-v2-security: ${text}`,
-          metadata: { source: "opencode-v2-security-bypass" },
-          resume: false,
-          delivery: "steer",
-        }),
-      ).catch(() => {})
-    }
-
-    /** Whether any live (unexpired) temporary lease applies to the session. */
-    function hasLiveLease(sessionID: string): boolean {
-      const now = Date.now()
-      return [sessionID, ...bypassAncestors(sessionID)].some((target) => {
-        const lease = bypassLeases.get(target)
-        return lease !== undefined && lease.expiresAt > now
-      })
-    }
-
-    /** Publish the agent's bypass notice in line with the effective state:
-     * the no-wake channel always carries the CURRENT effective text (or
-     * clears it), never a transition log — a lease expiring while the session
-     * is idle simply produces an empty snapshot on the next model request.
+    /** The single merged security-state notice: ONE clock capture and ONE
+     *  effective-mode computation produce the whole text (the previous
+     *  two-slot pair could show ReadOnly and Auto/Bypass simultaneously).
      *
-     * `slow` is deliberately excluded from the agent-facing set: the
-     * slow-command classifier is a soft deterrent, not a security boundary, so
-     * arming/disarming it must not teach the model that a slow-bypass is an
-     * escape hatch (the TUI indicator still shows it to the user). The `all`
-     * kill switch gets its own loud ALL-OFF notice. */
+     *  Category handling: only the seven static risk categories are listed
+     *  as review authorizations — `dynamic`/`sandbox`/`slow` are extra
+     *  layer switches, not effects authorizations. `dynamic` gets its own
+     *  line because it switches review off; `sandbox` changes no route
+     *  worth announcing (and under an RO cap it is not removed at all);
+     *  `slow` never reaches the agent channel. */
+    function securityNotice(sessionID: string, now: number = Date.now(), includeDefault = false): string | undefined {
+      const effective = effectivePerm(sessionID, now)
+      const all = allBypassed(sessionID, now)
+      const mode = securityModeFor(effective, all)
+      const active = activeBypass(sessionID, now)
+      const categories = [...active]
+        .filter((category) => (STATIC_BYPASS_CATEGORIES as readonly BypassCategory[]).includes(category))
+        .sort()
+      const dynamic = active.has("dynamic")
+      const custom = activeCustomBypass(sessionID, now)
+      const authorizationLines = [
+        ...(categories.length
+          ? [
+              `The user authorized these categories for this session: ${categories.join(", ")}. ` +
+                "The safety review treats effects in these categories as authorized; all other checks still apply.",
+              "You may retry a previously blocked command if these authorizations cover it; " +
+                "be careful with your authorized scope and the changes you make.",
+            ]
+          : []),
+        ...(dynamic ? ["- dynamic: commands that are not proven safe run without the safety review."] : []),
+        ...(custom.length
+          ? [
+              "The user also gave these custom authorizations, quoted exactly. They cover only what they state:",
+              ...custom,
+            ]
+          : []),
+      ]
+      if (mode === "bypass") {
+        // Full Bypass skips every check — category/custom authorization
+        // notes would be noise (nothing is left for them to authorize).
+        return [
+          "Security mode: [Bypass mode].",
+          "The user temporarily removed security review and OS sandboxing for this session.",
+          "You may retry the previously blocked command and continue within the user's authorization; " +
+            "be careful with your authorized scope and the changes you make.",
+          "Positive timeouts expire at their deadline; zero or negative timeouts have no natural expiry.",
+        ].join("\n")
+      }
+      if (mode === "readonly" && ancestryUnresolved(sessionID)) {
+        // A w=false produced by an unverified ancestor chain is a temporary
+        // verification failure, not the user's ReadOnly selection — the
+        // notice must not claim a persistent limit.
+        return [
+          "Session permission verification is temporarily unavailable: this session's permission chain could not be verified.",
+          "Write actions are blocked for now. This is not a mode the user selected. You may retry later.",
+        ].join("\n")
+      }
+      if (mode === "readonly") {
+        const lines = [
+          "Security mode: [Read only].",
+          effective.r
+            ? "You may read files and run shell commands that only read. Do not write, edit, move, or delete " +
+              "files with any tool; native write tools and shell commands that may write are blocked."
+            : "Native file tools are blocked, including reads. Do not write, edit, move, or delete files " +
+              "with any tool; shell commands that may write are blocked.",
+          "You cannot change or work around this limit.",
+        ]
+        // An armed kill switch outranked by the read-only ceiling must say
+        // so — otherwise the notice reads like a plain /perm ro.
+        if (all) {
+          lines.push("Bypass mode was selected, but it does not apply here because the read-only limit takes precedence.")
+        }
+        if (authorizationLines.length) {
+          lines.push(...authorizationLines)
+          lines.push("These authorizations do not lift the read-only limit.")
+        }
+        return lines.join("\n")
+      }
+      // Auto: a fully default surface stays silent (nothing restricted,
+      // nothing bypassed). The default check compares r/w only — x is a
+      // display bit no action maps to.
+      const isDefault =
+        effective.r === resolved.permission.defaultPerm.r &&
+        effective.w === resolved.permission.defaultPerm.w
+      if (isDefault && authorizationLines.length === 0 && !includeDefault) return undefined
+      const parts = [
+        `Security mode: ${securityModeLabel("auto", categories, custom.length > 0)}.`,
+        !resolved.sandbox.enabled || resolved.sandbox.mode === "full"
+          ? "Shell commands run directly on the host."
+          : dynamic
+            ? "Shell commands run under a runtime observer; the automatic safety review is skipped."
+            : "Shell commands run under a runtime observer. An operation that crosses the workspace boundary is checked " +
+              "statically first; if that cannot prove it safe, it gets an automatic safety review with no manual approval step.",
+        "OS errors such as permission denied are real results, not plugin blocks.",
+      ]
+      // The only non-default r/w combo that still reads Auto is a
+      // write-only ceiling (r=false, w=true) — name the concrete block
+      // instead of printing the rwx label.
+      if (!effective.r) parts.push("Native file read tools are blocked in this session.")
+      parts.push(...authorizationLines)
+      return parts.join("\n")
+    }
+
+    /** Publish the merged notice into the single `perm` slot (the `bypass`
+     *  slot stays cleared so the two slots can never disagree). The notice
+     *  channel dedups identical text, so callers can refresh freely. */
+    function syncSecurityNotice(sessionID: string, now: number = Date.now()) {
+      // Once a restrictive/bypass notice is in history, returning to the
+      // default must append an explicit Auto notice, not merely clear a map.
+      const includeDefault = sessionNotices.snapshot(sessionID) !== undefined
+      sessionNotices.setPerm(sessionID, securityNotice(sessionID, now, includeDefault))
+      sessionNotices.setBypass(sessionID, undefined)
+      const currentSnapshot = securitySnapshotFor(sessionID, now)
+      // A mode/lease change must revoke already-running monitored calls too,
+      // not just future permissions. Observer EOF stops its process tree.
+      for (const authorization of boundaryCalls.values()) {
+        if (authorization.sessionID !== sessionID || !authorization.runtimeBroker) continue
+        if (authorization.securitySnapshot === currentSnapshot) continue
+        authorization.runtimeBlocked = "the session's security mode or authorization changed while the command was running"
+        authorization.runtimeBlockedPhase ??= "unknown" // revoked mid-run: never "not performed"
+        void authorization.runtimeBroker.close()
+      }
+    }
+
+    /** Refresh the merged agent notice in line with the effective state.
+     *  Thin alias for syncSecurityNotice (kept so bypass-mutation call
+     *  sites read naturally). */
     function syncAgentReminder(sessionID: string) {
-      if (allBypassed(sessionID)) {
-        sessionNotices.setBypass(sessionID, BYPASS_ALL_REMINDER())
-        return
-      }
-      const facing = new Set(activeBypass(sessionID))
-      facing.delete("slow")
-      if (facing.size === 0) {
-        sessionNotices.setBypass(sessionID, undefined)
-        return
-      }
-      sessionNotices.setBypass(sessionID, BYPASS_ACTIVE_REMINDER([...facing].sort()))
+      syncSecurityNotice(sessionID)
     }
 
     /** Remove leases whose TTL elapsed and re-sync the agent reminder. Called on
@@ -1420,40 +1288,222 @@ const plugin: Plugin = {
       const now = Date.now()
       for (const [sessionID, lease] of [...bypassLeases]) {
         if (lease.expiresAt > now) continue
-        bypassLeases.delete(sessionID)
-        syncAgentReminder(sessionID)
-        // Lease expiry can lift the ALL kill switch too — re-announce the
-        // permission ceiling if one was silenced while ALL was armed.
-        if (!allBypassed(sessionID)) syncPermReminder(sessionID)
-        if (activeBypass(sessionID).size === 0) emitBypassChanged(sessionID, "expired")
+        expireLease(sessionID, lease)
+        // Lease expiry can lift Bypass mode (and restore a stashed RO
+        // baseline) — one merged notice covers mode and ceiling together.
+        syncSecurityNotice(sessionID)
+        syncBypassDescendants(sessionID)
+        syncPermDescendants(sessionID)
+        if (activeBypass(sessionID).size === 0 && activeCustomBypass(sessionID).length === 0 && !allBypassed(sessionID))
+          emitBypassChanged(sessionID, "expired")
         else emitBypassChanged(sessionID, "updated")
       }
     }
 
+    // --- user security-mode transitions -------------------------------------
+    // One transition entry for /perm's mode tokens and the /bypass kill
+    // switch (all/*/ALL/yolo). The Bypass transition stashes the session's
+    // pre-mode baseline and lifts it to read-write; disarm/expiry/another
+    // mode restores the stash so a lease timeout can never leave the earlier
+    // read-only ceiling permanently widened. Ancestor baselines still cap
+    // the effective set — an RO ancestor clamps Bypass to effective ReadOnly.
+
+    /** The effective user-facing mode: an armed kill switch reads as Bypass
+     *  only when the effective ceiling can actually write — an inherited or
+     *  restored read-only cap reports ReadOnly (the RO ceiling outranks the
+     *  mode selection). */
+    function effectiveMode(sessionID: string, now: number = Date.now()): SecurityMode {
+      return securityModeFor(effectivePerm(sessionID, now), allBypassed(sessionID, now))
+    }
+
+    /** Single canonical snapshot of everything an admitted call depends on:
+     *  the effective r/w ceiling (ancestors included), the armed bypass set,
+     *  verbatim custom scopes, the kill switch, and the derived mode. Review
+     *  and admission bind to this exact string — a mid-review permission or
+     *  mode change makes a stale admission fail instead of running under
+     *  authority the user already revoked. Expired leases are pruned first so
+     *  a lapsed Bypass lease cannot survive between its deadline and the
+     *  next timer sweep. */
+    function securitySnapshotFor(sessionID: string, now: number = Date.now()): string {
+      pruneExpiredLeases(sessionID, now)
+      const perm = effectivePerm(sessionID, now)
+      const basis = JSON.stringify({
+        r: perm.r,
+        w: perm.w,
+        mode: securityModeFor(perm, allBypassed(sessionID, now)),
+        categories: [...activeBypass(sessionID, now)].sort(),
+        custom: activeCustomBypass(sessionID, now),
+        all: allBypassed(sessionID, now),
+      })
+      const previous = securityBases.get(sessionID)
+      if (previous !== basis) {
+        securityBases.set(sessionID, basis)
+        securityEpochs.set(sessionID, (securityEpochs.get(sessionID) ?? 0) + 1)
+        if (previous !== undefined) approvalCache.clear(sessionID)
+      }
+      // Auto→RO→Auto is a new authority generation, even when the final bits
+      // equal their old values; a revoked approval cannot resurrect.
+      return JSON.stringify([securityEpochs.get(sessionID), basis])
+    }
+
+    /** Restore the baseline recorded when Bypass mode was armed. Applied as
+     *  an intersection with the current baseline so a concurrent tighten can
+     *  never be widened back open. Emits the permission event when the
+     *  baseline actually moved. */
+    function restoreStashedBaseline(sessionID: string, lease: BypassLease | undefined) {
+      const stashed = lease?.restoreBaseline
+      if (!stashed) return
+      const current = sessionPerms.get(sessionID) ?? { ...resolved.permission.defaultPerm }
+      const restored = permIntersect(current, stashed)
+      sessionPerms.set(sessionID, restored)
+      if (!permEqual(restored, current)) emitPermChanged(sessionID, "restored")
+    }
+
+    /** End a lease: delete it and restore the stashed pre-bypass baseline
+     *  (if the Bypass transition raised it). The stash is consumed either way
+     *  so a later expiry can never resurrect an earlier ceiling. */
+    function expireLease(sessionID: string, lease: BypassLease, now?: number) {
+      bypassLeases.delete(sessionID)
+      restoreStashedBaseline(sessionID, lease)
+      // Lazy expiry can happen on a status/permission read before the timer.
+      // Announce after the current synchronous transition finishes, avoiding
+      // recursive effective-state reads and intermediate contradictory notices.
+      // A read-path expiry reuses its caller's clock capture.
+      queueMicrotask(() => {
+        syncSecurityNotice(sessionID, now)
+        syncBypassDescendants(sessionID)
+        syncPermDescendants(sessionID)
+      })
+    }
+
+    /** Arm/disarm the Bypass kill switch on the session's own lease.
+     *  Arming stashes the current baseline so the (r,w) lift the Bypass
+     *  transition performs can be rolled back exactly; an already-armed
+     *  lease keeps its original stash (a second arm is not a new baseline). */
+    function setBypassKillSwitch(sessionID: string, arm: boolean, timeoutSec?: number) {
+      const existing = bypassLeases.get(sessionID)
+      if (arm) {
+        bypassLeases.set(sessionID, {
+          categories: existing ? new Set(existing.categories) : new Set(),
+          custom: existing?.custom,
+          all: true,
+          expiresAt: bypassExpiry(timeoutSec),
+          // A repeated arm keeps the ORIGINAL stashed baseline — the stash
+          // belongs to the first transition, not to the latest re-arm.
+          restoreBaseline: existing?.all === true
+            ? existing.restoreBaseline
+            : sessionPerms.get(sessionID) ?? { ...resolved.permission.defaultPerm },
+        })
+        // Every arm channel (/perm bypass too, not only /bypass) must wake
+        // the sweep so the new deadline is observed.
+        wakeBypassSweep()
+        return
+      }
+      if (!existing) return
+      restoreStashedBaseline(sessionID, existing)
+      const lease: BypassLease = { ...existing, all: false, restoreBaseline: undefined }
+      if (lease.categories.size === 0 && !(lease.custom?.length)) {
+        bypassLeases.delete(sessionID)
+      } else {
+        bypassLeases.set(sessionID, lease)
+      }
+      wakeBypassSweep()
+    }
+
+    /** Re-announce descendants whose effective bypass set moved with an
+     *  ancestor lease (links are child→parent, so scan the map). */
+    function syncBypassDescendants(parentID: string, seen: Set<string> = new Set([parentID])) {
+      for (const [child, parent] of bypassParent) {
+        if (parent !== parentID || seen.has(child)) continue
+        seen.add(child)
+        syncSecurityNotice(child)
+        syncBypassDescendants(child, seen)
+      }
+    }
+
+    /** Lazily end expired leases on this session's chain (the timer sweep
+     *  covers idle sessions; every state read prunes first so a stale
+     *  `all`-flag or stashed baseline is never observed). */
+    function pruneExpiredLeases(sessionID: string, now: number = Date.now()) {
+      for (const target of [sessionID, ...bypassAncestors(sessionID)]) {
+        const lease = bypassLeases.get(target)
+        if (lease && lease.expiresAt <= now) expireLease(target, lease, now)
+      }
+    }
+
+    /** Refresh the state notices and emit both RPC snapshots after any
+     *  user-side mutation (lease, baseline, or both). */
+    function notifySecurityState(sessionID: string, bypassReason: string, permReason: string) {
+      syncSecurityNotice(sessionID)
+      syncBypassDescendants(sessionID)
+      syncPermDescendants(sessionID)
+      emitBypassChanged(sessionID, bypassReason)
+      emitPermChanged(sessionID, permReason)
+    }
+
+    /** The single user-side security-mode transition shared by /perm mode
+     *  tokens and the /bypass kill switch. `bypass` stashes and lifts this
+     *  session's own baseline to read-write (ancestors still cap the
+     *  effective set) and arms the kill switch; `readonly`/`auto` disarm the
+     *  local kill switch (restoring any stashed baseline) and assert the
+     *  mode's baseline. Returns the resulting effective mode so callers can
+     *  report a clamp. */
+    function applyUserSecurityMode(target: string, mode: SecurityMode, timeoutSec?: number): SecurityMode {
+      if (mode === "bypass") {
+        setBypassKillSwitch(target, true, timeoutSec)
+        // Bypass asserts read-write on the OWN baseline only; an ancestor
+        // read-only ceiling still clamps the effective set. The no-Bypass
+        // barrier (if any) is NOT deleted: the own lease wins while armed
+        // and the declared surface returns on expiry — never an ancestor's
+        // inherited Bypass.
+        sessionPerms.set(target, { ...permForMode("bypass") })
+        const result = effectiveMode(target)
+        notifySecurityState(target, result === "bypass" ? "armed" : "clamped", "set")
+        return result
+      }
+      setBypassKillSwitch(target, false)
+      sessionPerms.set(target, { ...permForMode(mode) })
+      // Selecting Auto/ReadOnly is itself an explicit no-Bypass assertion:
+      // the barrier blocks any ancestor's armed kill switch for this
+      // session and its descendants.
+      explicitNoBypass.add(target)
+      const result = effectiveMode(target)
+      notifySecurityState(target, "set", "set")
+      return result
+    }
+
     type BypassOp =
       | { kind: "clear" }
-      | { kind: "categories"; action: "arm" | "disarm" | "toggle"; which: "allCategories" | readonly BypassCategory[] }
+      | { kind: "custom"; text: string }
+      | { kind: "categories"; action: "arm" | "disarm" | "toggle"; which: readonly BypassCategory[] }
       | { kind: "killSwitch"; action: "arm" | "disarm" | "toggle" }
 
     /** Parses /bypass arguments into ordered operations plus an optional
-     *  timeout. Case rules: the literal "ALL" (also +ALL/-ALL) is the kill
-     *  switch; everything else is lowercased before matching. Explicit
-     *  `+token` always arms, `-token` always disarms (never toggles); a bare
-     *  token toggles against the pre-command snapshot. Aliases:
-     *  fs→filesystem, 0→off (when it is the only token — see the timeout rule
-     *  below), all→* (the complete category set — lowercase `all` is NOT the
-     *  kill switch).
+     *  timeout. Explicit `+token` always arms, `-token` always disarms (never
+     *  toggles); a bare token toggles against the pre-command snapshot.
+     *  Aliases: fs→filesystem, 0→off (when it is the only token — see the
+     *  timeout rule below). `all`, `*`, `ALL`, `yolo`/`YOLO`, and `bypass`
+     *  are ALL the same user Bypass mode — the kill switch that skips every
+     *  plugin check for the session; they no longer mean "every category".
      *
-      *  Timeout: the LAST token may be a signed number, interpreted as
+     *  Timeout: the LAST token may be a signed number, interpreted as
      *  seconds until the session's lease expires (`/bypass fs 120` arms fs
-      *  for 120s; zero or a negative value arms it without a natural expiry). It is an
+     *  for 120s; zero or a negative value arms it without a natural expiry). It is an
      *  absolute deadline: activity never extends it. A bare `0` ALONE stays
      *  the `off` alias for compatibility — the never-expire spelling is only
-      *  read as a timeout when at least one other token precedes it. A
-      *  number in any non-final position is an invalid
+     *  read as a timeout when at least one other token precedes it. A
+     *  number in any non-final position is an invalid
      *  token, so malformed input rejects atomically without touching the
      *  lease. */
     function parseBypassArguments(text: string): { ops: BypassOp[]; invalid: string[]; timeoutSec?: number } {
+      // The remainder is verbatim. A final number is part of the scope, not a
+      // hidden timeout; custom uses the existing configured lease TTL.
+      const custom = /^\s*custom(?:[ \t]|\r?\n)/i.exec(text)
+      if (custom) {
+        const scope = text.slice(custom[0].length)
+        return scope.trim() ? { ops: [{ kind: "custom", text: scope }], invalid: [] }
+          : { ops: [], invalid: ["custom requires a nonempty scope"] }
+      }
       const ops: BypassOp[] = []
       const invalid: string[] = []
       let timeoutSec: number | undefined
@@ -1475,20 +1525,17 @@ const plugin: Plugin = {
           sign = body[0] as "+" | "-"
           body = body.slice(1)
         }
-        // Kill switch: case-sensitive literal ALL; `yolo`/`YOLO` is the
-        // case-insensitive alias for the same kill switch.
-        if (body === "ALL" || /^yolo$/i.test(body)) {
+        // Bypass mode (the kill switch): ALL/*/all/yolo/bypass all mean the
+        // same user-selected mode — every plugin check skipped, the r/w
+        // ceiling and OS-sandbox floor still apply where they cannot be
+        // relaxed by a category.
+        if (body === "ALL" || /^(?:yolo|all|\*|bypass)$/i.test(body)) {
           ops.push({ kind: "killSwitch", action: sign === "+" ? "arm" : sign === "-" ? "disarm" : "toggle" })
           continue
         }
         const token = body.toLowerCase()
         if (token === "off" || token === "clear" || token === "none" || token === "0") {
           ops.push({ kind: "clear" })
-          continue
-        }
-        // The complete category set: `*` or lowercase `all`.
-        if (token === "*" || token === "all") {
-          ops.push({ kind: "categories", action: sign === "+" ? "arm" : sign === "-" ? "disarm" : "toggle", which: "allCategories" })
           continue
         }
         const categories = expandBypassCategoryToken(token)
@@ -1506,51 +1553,31 @@ const plugin: Plugin = {
     function bypassUsage(invalid: string[]): string {
       return (
         `Unknown bypass categor${invalid.length > 1 ? "ies" : "y"}: ${invalid.join(", ")}.\n` +
-        `Usage: /bypass <${[...BYPASS_CATEGORIES].join("|")}|fs|*|all|ALL|off> — ` +
+        `Usage: /bypass <${[...BYPASS_CATEGORIES].join("|")}|fs|custom|all|*|ALL|yolo|off> — ` +
         `categories space or comma separated; legacy aliases: fs=filesystem, os=host+privilege+indirection, web=network+remote; ` +
-        `* or all = all ${BYPASS_CATEGORIES.length} categories; uppercase ALL or yolo/YOLO = the kill switch (all plugin enforcement off) — prefer specific categories when possible; ` +
-        `off/0 clears everything. +token arms, -token disarms, a bare token toggles. ` +
+        `all, *, ALL, yolo and bypass are the user Bypass mode (all plugin checks skipped for this session — ` +
+        `prefer specific categories when possible); off/0 clears categories, custom scopes and the mode. ` +
+        `/bypass custom <verbatim text> adds an authorization scope using the same lease TTL. +token arms, -token disarms, a bare token toggles. ` +
         `A trailing bare number is the timeout in seconds — an absolute deadline, never extended by activity; ` +
-        `A zero or negative timeout (e.g. "/bypass fs -1") means no natural expiry until /bypass off.\n` +
-        `host = running-system state (processes, services, power, persistence); privilege = crossing permission or ` +
-        `isolation boundaries (sudo/doas/su/pkexec/sudoedit, chown, capabilities, kernel parameters, namespaces) — when privilege is ` +
-        `armed and a call needs it, that call runs host-direct without the OS sandbox, or is refused loudly if the ` +
-        `sandbox cannot be removed (ro profiles); arm the sandbox category as well to remove the OS sandbox entirely.`
+        `a zero or negative timeout (e.g. "/bypass fs -1") means no natural expiry until /bypass off.\n` +
+        `Categories skip their static checks and are passed as authorization to the effects reviewer. ` +
+        `Only the explicit sandbox switch removes OS isolation; privilege/filesystem categories do not imply full access.`
       )
     }
 
     function armBypassLease(sessionID: string, categories: Set<BypassCategory>, timeoutSec?: number) {
       // A new arm keeps an already-armed `all` kill switch: narrowing the
       // category set must not silently re-enable the enforcement layers the
-      // user turned off; only `off`/clear or lease expiry lifts `all`.
-      const all = bypassLeases.get(sessionID)?.all === true
+      // user turned off; only `off`/clear or lease expiry lifts `all`. The
+      // stashed baseline survives with it.
+      const prior = bypassLeases.get(sessionID)
       bypassLeases.set(sessionID, {
         categories: new Set(categories),
         expiresAt: bypassExpiry(timeoutSec),
-        all,
+        all: prior?.all === true ? true : undefined,
+        custom: prior?.custom,
+        restoreBaseline: prior?.all === true ? prior.restoreBaseline : undefined,
       })
-      // Freshly armed session: prior rejection records would keep forcing
-      // dynamic review (and HARD abort semantics) for a bypassed command.
-      const state = sessions.get(sessionID)
-      if (state) {
-        state.lastRejected = undefined
-        state.touchedAt = Date.now()
-        state.version += 1
-      }
-    }
-
-    function armBypassAll(sessionID: string, timeoutSec?: number) {
-      bypassLeases.set(sessionID, {
-        categories: new Set(activeBypass(sessionID)),
-        expiresAt: bypassExpiry(timeoutSec),
-        all: true,
-      })
-      const state = sessions.get(sessionID)
-      if (state) {
-        state.lastRejected = undefined
-        state.touchedAt = Date.now()
-        state.version += 1
-      }
     }
 
     // Detect OS/shell context for the auditor's environment line (an
@@ -1564,8 +1591,8 @@ const plugin: Plugin = {
         if (platform === "linux") {
           let pretty: string | undefined
           try {
-            const osReleaseContent = readFileSync("/etc/os-release", "utf8")
-            pretty = osReleaseContent.match(/^PRETTY_NAME="?([^"\n]+)"?/m)?.[1]
+            const inspected = inspectRegularTextFileSync(realpathSync("/etc/os-release"), 64 * 1024)
+            pretty = inspected.ok ? inspected.text.match(/^PRETTY_NAME="?([^"\n]+)"?/m)?.[1] : undefined
           } catch {
             pretty = undefined
           }
@@ -1594,8 +1621,8 @@ const plugin: Plugin = {
       return environmentLine
     }
 
-    // Reviewer audit trail (logReviewerTrace): one JSONL line per dynamic
-    // review verdict/error and per cache hit, appended to
+    // Reviewer audit trail (logReviewerTrace): request, result/error, and
+    // final outcome are separate events, NOT separate JEV calls. Appended to
     // ~/.opencode/reviewer-trace.jsonl. Fire-and-forget — a logging failure
     // must never alter the review outcome or block a command.
     const reviewerTraceFile = resolved.logReviewerTrace
@@ -1609,311 +1636,6 @@ const plugin: Plugin = {
         .catch(() => {})
     }
 
-    function deleteSessionState(sessionID: string) {
-      sessions.delete(sessionID)
-      sessionDirectories.delete(sessionID)
-      // Review caches are global and context-addressed; TTL eviction covers them.
-    }
-
-    function pruneSessionStates(now: number) {
-      for (const [sessionID, state] of sessions) {
-        if (state.touchedAt + SESSION_STATE_TTL_MS <= now) deleteSessionState(sessionID)
-      }
-      for (const [sessionID, entry] of sessionDirectories) {
-        if (entry.at + SESSION_STATE_TTL_MS <= now) sessionDirectories.delete(sessionID)
-      }
-      // Unbound declarations are security state, not a TTL cache. A failed
-      // spawn may already have prompted a child; retain until parent deletion.
-    }
-
-    function getSessionState(sessionID: string): SessionState {
-      const now = Date.now()
-      pruneSessionStates(now)
-      let state = sessions.get(sessionID)
-      if (!state) {
-        while (sessions.size >= MAX_SESSION_STATES) {
-          const oldest = sessions.keys().next().value
-          if (typeof oldest !== "string") break
-          deleteSessionState(oldest)
-        }
-        state = { version: 0, touchedAt: now }
-        sessions.set(sessionID, state)
-      } else {
-        state.touchedAt = now
-        sessions.delete(sessionID)
-        sessions.set(sessionID, state)
-      }
-      return state
-    }
-
-    async function sessionDirectory(sessionID: string): Promise<{ directory: string; worktree: string }> {
-      const cached = sessionDirectories.get(sessionID)
-      if (cached && cached.at + SESSION_STATE_TTL_MS > Date.now()) return cached
-      try {
-        const info = (await run(ctx.session.get({ sessionID }))) as { location?: { directory?: string } }
-        const raw = info?.location?.directory
-        if (typeof raw === "string" && raw) {
-          const directory = await canonicalOrResolved(raw)
-          while (sessionDirectories.size >= MAX_SESSION_STATES) {
-            let oldestKey: string | undefined
-            let oldestAt = Infinity
-            for (const [key, entry] of sessionDirectories) {
-              if (entry.at < oldestAt) {
-                oldestAt = entry.at
-                oldestKey = key
-              }
-            }
-            if (oldestKey === undefined) break
-            sessionDirectories.delete(oldestKey)
-          }
-          const entry = { directory, worktree: directory, at: Date.now() }
-          sessionDirectories.set(sessionID, entry)
-          return entry
-        }
-      } catch {
-        // Session lookup failed (e.g. already deleted); fall through to cwd.
-      }
-      const directory = await canonicalOrResolved(process.cwd())
-      return { directory, worktree: directory }
-    }
-
-    function reviewerAvailable() {
-      return Boolean(resolved.reviewCommand)
-    }
-
-    function extractHttpStatus(message: string): string | undefined {
-      const m = message.match(/HTTP\s*(\d{3})/i) ?? message.match(/\b(\d{3})\b/)
-      if (m) {
-        const code = m[1]
-        if (code && /^4\d\d$|^5\d\d$/.test(code)) return code
-      }
-      return undefined
-    }
-
-    async function maybeNotifyDynamicConsecutiveFailures(sessionID: string, error: Error) {
-      if (!reviewerAvailable()) return
-      consecutiveDynamicFailures++
-      if (consecutiveDynamicFailures < 3) return
-      const now = Date.now()
-      if (now - lastDynamicFailureToastAt < 60_000) return
-      lastDynamicFailureToastAt = now
-      const status = extractHttpStatus(error.message)
-      const shortMsg = status
-        ? `Dynamic review unavailable (HTTP ${status}), please check endpoint, network and auth`
-        : `Dynamic review unavailable, please check endpoint, network and auth`
-      console.error(`[opencode-v2-security] ${shortMsg}: ${error.message.slice(0, 300)}`)
-      // Best-effort TUI toast via any available UI (server ctx has no ui, but try for future TUI companion)
-      try {
-        const anyCtx = ctx as unknown as { ui?: { toast?: { show?: (o: unknown) => void } } }
-        anyCtx.ui?.toast?.show?.({ message: shortMsg, variant: "error", duration: 5000 })
-      } catch {}
-      // Also surface to the user: a synthetic needs a `description` to render
-      // in the TUI chat. Without it the message would be hidden from the user
-      // while still entering the model context.
-      // resume:false (M11) — a reviewer-outage notice must never auto-resume the session.
-      try {
-        await run(
-          ctx.session.synthetic({
-            sessionID,
-            text: `opencode-v2-security: ${shortMsg}`,
-            description: shortMsg,
-            metadata: { source: "opencode-v2-security-dynamic-review" },
-            resume: false,
-            delivery: "steer",
-          }),
-        )
-      } catch {}
-    }
-
-    function resetDynamicFailureCounter() {
-      consecutiveDynamicFailures = 0
-    }
-
-    function nextGeneration(state: SessionState) {
-      state.touchedAt = Date.now()
-      return ++state.version
-    }
-
-    function recordRejection(state: SessionState, value: PreviousRejectedCommand) {
-      if (!strictPolicy) return undefined
-      const generation = nextGeneration(state)
-      state.lastRejected = { value, generation }
-      return generation
-    }
-
-    function rejectStatic(
-      sessionID: string,
-      state: SessionState,
-      command: string,
-      reason: string,
-      rules: string[] = [],
-      riskHint?: string,
-    ): never {
-      recordRejection(state, { command, reason, classifier: "STATIC" })
-      throw blockMessage(
-        "static", reason, strictPolicy, rules, command,
-        claimEscalationGuidance(sessionID, rules), resolved.escalationEnabled,
-        riskHint ?? riskCategoryHint(rulesHintCategories(rules)),
-      )
-    }
-
-    async function performDynamicReview(request: CloudReviewRequest): Promise<CloudReviewResult> {
-      const reviewFn = resolved.reviewCommand
-      if (!reviewFn) throw new Error("Dynamic review is not configured")
-      const options: ReviewCommandOptions = {
-        endpoint: resolved.dynamicReview.endpoint ?? "",
-        model: resolved.dynamicReview.model ?? "",
-        apiKey: resolved.dynamicReview.apiKey ?? "",
-        maxRounds: resolved.dynamicReview.maxRounds,
-        policy: resolved.strictness,
-        allowFullReadAccess: resolved.dynamicReview.allowFullReadAccess,
-        python: resolved.dynamicReview.pythonPath,
-        auditorPath: resolved.dynamicReview.auditorPath,
-        reviewer: resolved.dynamicReview.reviewer,
-        jev: resolved.dynamicReview.jev?.available
-          ? {
-              endpoint: resolved.dynamicReview.jev.endpoint,
-              model: resolved.dynamicReview.jev.model,
-              apiKey: resolved.dynamicReview.jev.apiKey ?? "",
-            }
-          : undefined,
-        timeout: resolved.dynamicReview.timeoutMs,
-      }
-      return reviewFn(request, options)
-    }
-
-    /** Automatic collect_evidence resolution for the dynamic reviewer: one
-     *  bounded evidence pass over the command's uninspected references, one
-     *  resubmit. A still-indecisive or denied retry returns a DENY whose
-     *  limitation names what could not be collected — never an ask, never a
-     *  silent allowance. */
-    async function resolveCollectEvidence(
-      sessionID: string,
-      script: string,
-      staticDecision: StaticSecurityDecision,
-      reviewRequest: CloudReviewRequest,
-      base: { cwd: string; worktree: string },
-      needsEvidence: readonly string[] = [],
-    ): Promise<{ result: CloudReviewResult; evidence: CollectedEvidence[]; missing: string[] }> {
-      const subjects: EvidenceRequest[] = [
-        // Reviewer-named evidence needs take priority, then everything the
-        // static layer flagged but could not inspect.
-        ...needsEvidence.map((subject) => ({ subject })),
-        ...(staticDecision.reviewContext?.uninspectedLocalScripts ?? []).map((subject) => ({ subject })),
-        ...(staticDecision.reviewContext?.uninspectedTargetDirectories ?? []).map((subject) => ({ subject })),
-        ...(staticDecision.reviewContext?.referencedPaths ?? []).map((subject) => ({ subject })),
-      ]
-      const { evidence, missing } = await collectBoundedEvidence(subjects, {
-        ...base,
-        allowFullReadAccess: resolved.dynamicReview.allowFullReadAccess,
-      })
-      const syntheticAssessment = (categories: string[]) => ({
-        categories,
-        strongReasons: [],
-        needsEvidence: missing.slice(0, 8),
-        decisionSource: missing.length > 0 ? "evidence_limited" : "model",
-      })
-      if (evidence.length === 0) {
-        writeReviewerTrace({
-          kind: "review_verdict",
-          sessionID,
-          command: script,
-          decision: "DENY",
-          source: "evidence_limited",
-          missing: missing.slice(0, 8),
-        })
-        return {
-          evidence,
-          missing,
-          result: {
-            decision: "DENY",
-            categories: ["indirection"],
-            assessment: syntheticAssessment(["indirection"]),
-            reason:
-              missing.length > 0
-                ? `reviewer asked for evidence that is not collectable automatically (${missing.slice(0, 5).join(", ")})`
-                : "reviewer asked for evidence but nothing further was collectable",
-          },
-        }
-      }
-      // Evidence rides the same request shape; reviewers that do not know
-      // the field ignore it.
-      const retryRequest = {
-        ...reviewRequest,
-        collectedEvidence: evidence.map((e) => ({
-          kind: e.kind,
-          subject: e.subject,
-          excerpt: e.excerpt,
-          truncated: e.truncated,
-        })),
-      } as CloudReviewRequest
-      try {
-        const raw = (await performDynamicReview(retryRequest)) as CloudReviewResult & {
-          decision?: unknown
-        }
-        writeReviewerTrace({
-          kind: "review_verdict",
-          sessionID,
-          command: script,
-          decision: raw.decision,
-          evidence_resubmit: true,
-          engine: raw.engine,
-        })
-        const outcome = automaticOutcome(raw.decision as RawReviewerDecision)
-        if (outcome.kind === "admit") return { result: raw, evidence, missing }
-        const cats =
-          Array.isArray(raw.categories) && raw.categories.length > 0 ? raw.categories : ["indirection"]
-        return {
-          evidence,
-          missing,
-          result: {
-            decision: "DENY",
-            categories: cats,
-            assessment: syntheticAssessment(cats),
-            reason:
-              outcome.kind === "deny"
-                ? "the reviewer denied after seeing the collected evidence"
-                : "the reviewer still requires information that cannot be collected automatically",
-          },
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        writeReviewerTrace({
-          kind: "review_error",
-          sessionID,
-          command: script,
-          error: message.slice(0, 1000),
-          evidence_resubmit: true,
-        })
-        return {
-          evidence,
-          missing,
-          result: {
-            decision: "DENY",
-            categories: ["indirection"],
-            assessment: syntheticAssessment(["indirection"]),
-            reason: "evidence resubmit failed at the reviewer; fail-close",
-          },
-        }
-      }
-    }
-
-    // --- 6. HARD session interrupt (v1 client.session.abort) ----------------
-    async function abortSession(sessionID: string) {
-      try {
-        await run(ctx.session.interrupt({ sessionID }))
-      } catch {
-        // Interrupt failure must not allow the command — the caller still throws.
-      }
-    }
-
-    // Fire-and-forget the interrupt ~100ms AFTER throwing the block. If the
-    // interrupt lands first it rewrites the block reason to STEP_INTERRUPTED,
-    // hiding why the command was denied; scheduling it after the throw keeps the
-    // block message as the visible outcome.
-    function scheduleAbort(sessionID: string) {
-      setTimeout(() => void abortSession(sessionID), 100)
-    }
 
     // S14: the four analyzeSlowCommand call sites share one helper so the
     // enabled/background/explicit-timeout gating stays in sync.
@@ -1945,1669 +1667,1005 @@ const plugin: Plugin = {
 
     // --- P4 sandbox spawn state ----------------------------------------------
     // The create.before event (19271 API) has no sessionID, so a one-shot
-    // nonce marker prepended to input.command by runBefore carries the chosen
-    // profile to spawn time (plan §1.3). The marker is the SOLE authority for
-    // wrapping: user-initiated shells (`!cmd`, host-internal spawns) never
-    // ran execute.before, carry no marker, and run completely untouched —
-    // trusted authority, exactly as they were never classified.
+    // nonce marker prepended to input.command by runBoundaryBefore carries the
+    // chosen profile to spawn time (plan §1.3). The marker is the SOLE
+    // authority for wrapping: user-initiated shells (`!cmd`, host-internal
+    // spawns) never ran the boundary preflight, carry no marker, and run
+    // completely untouched — trusted authority, exactly as they were never
+    // classified.
     const sandboxMarkers = createSandboxMarkers()
 
-    async function applyPostChecks(
-      script: string,
-      input: Record<string, unknown>,
-      decision: StaticSecurityDecision,
-      shell: string,
-      sandboxContext?: {
-        sessionID: string
-        bypassedCategories?: ReadonlySet<BypassCategory>
-        /** Per-call host-direct routing decided by the privilege gate in
-         * runBefore: privilege is in the effective bypass set and the command
-         * needs OS privilege, so the spawn must not be kernel-wrapped. */
-        privilegeHostDirect?: boolean
-      },
-    ) {
-      if (resolved.detachedStartIsolation && !supervisorActive) {
-        const isolated = isolateDetachedStartCommand(script, shell)
-        if (isolated !== script) {
-          input.command = isolated
-        }
-      }
-
-      // Host-direct observability: every runnable path (static ALLOW,
-      // cached allow, dynamic ALLOW, fail_open) funnels through
-      // applyPostChecks, and every upstream denial path (static DENY, the
-      // ro-profile privilege refusal, the availability gate, dynamic DENY,
-      // fail_close) returns or throws before reaching it. The fingerprint
-      // check at the end is the last gate: the reminder and the
-      // privilege_host_direct audit line are written only AFTER it
-      // succeeds, so a call rejected with "Local script changed after
-      // review" is never recorded as having run host-direct.
-      const hostDirectObservability =
-        sandboxContext?.privilegeHostDirect === true &&
-        resolved.sandbox.enabled &&
-        resolved.sandbox.mode !== "full"
-
-      // Marker must wrap the FINAL command text (post detached-start
-      // isolation), so it is inserted here — after isolation — rather than at
-      // the availability gate. Inserting before dynamic review per the §5
-      // table would be silently dropped by the isolation rewrite above.
-      if (sandboxContext) {
-        const profile = sessionSandboxProfile(sandboxContext.sessionID, sandboxContext.bypassedCategories)
-        // The rw host-direct routes — the allowSudo config route, or the
-        // privilege category routing one privilege-needing call out of the
-        // sandbox — need no kernel probe result: the helper runs the payload
-        // directly, so the marker must be inserted even when the probe
-        // reported unavailable.
-        const hostDirectRoute =
-          profile === "rw" && (resolved.sandbox.allowSudo || sandboxContext.privilegeHostDirect === true)
-        if (profile !== "full" && (sandboxProbe?.available || hostDirectRoute)) {
-          const finalCommand = commandFromArgs(input) ?? script
-          input.command = insertSandboxMarker(
-            sandboxMarkers,
-            finalCommand,
-            profile,
-            undefined,
-            undefined,
-            sandboxContext.privilegeHostDirect === true,
-          )
-        } else if (
-          profile === "full" &&
-          (allBypassed(sandboxContext.sessionID) ||
-            sandboxContext.bypassedCategories?.has("sandbox") ||
-            activeBypass(sandboxContext.sessionID).has("sandbox"))
-        ) {
-          // Explicit "full" marker: the sandbox bypass (or `all` kill switch)
-          // is a deliberate unsandboxed claim — carried through the nonce so
-          // create.before leaves this tool shell untouched (and, on Windows,
-          // un-supervisor-wrapped).
-          const finalCommand = commandFromArgs(input) ?? script
-          input.command = insertSandboxMarker(sandboxMarkers, finalCommand, "full")
-        }
-      }
-
-      // Last gate: the local-script fingerprint check. Only when it passes —
-      // the call is finally allowed to run — do the host-direct reminder and
-      // the privilege_host_direct audit line get written (exactly once each,
-      // on the very spawn that takes the host-direct route).
-      const ok = await verifyScriptFingerprints(decision.fingerprints)
-      if (ok && hostDirectObservability && sandboxContext) {
-        const profile = sessionSandboxProfile(sandboxContext.sessionID, sandboxContext.bypassedCategories)
-        appendAgentReminder(
-          sandboxContext.sessionID,
-          `this command needs OS privilege and the privilege category is authorized, so this shell call runs ` +
-            `host-direct without the OS sandbox wrap; classifier checks, the permission ceiling, and the ` +
-            `unconditional safety floor still apply.`,
-        )
-        writeReviewerTrace({
-          kind: "privilege_host_direct",
-          sessionID: sandboxContext.sessionID,
-          command: script,
-          profile,
-          categories: [...(sandboxContext.bypassedCategories ?? [])].sort(),
-        })
-      }
-      return ok
-    }
-
-    // --- 2b. single-call escalation review ------------------------------------
-    // A valid REQUIRE_ESCALATION request goes to the dedicated escalation
-    // reviewer: a direct Python child (bundled escalation-reviewer.py — never
-    // the ordinary auditorPath, never the reviewCommand injection hook). Only
-    // allow_once proceeds, and its categories are merged into the bypass set
-    // for THIS shell call alone. collect_evidence resolves automatically
-    // (bounded pass + one resubmit); deny is recorded for the session
-    // lifetime, so a similar request never reaches the reviewer again.
-    // Config/infra/protocol/timeout failures (and an unreadable session
-    // context) fail closed WITHOUT a permanent record — the agent's remaining
-    // route is the session surface (/bypass armed by the operator).
-
-    /** Inputs the floor pre-check needs to run the static classifier with the
-     * same arguments the post-grant classification in runBefore will use. */
-    type EscalationClassifyContext = {
+    type BoundaryAuthorization = {
+      token: object
+      sessionID: string
+      tool: NativeBoundaryTool
       cwd: string
-      worktree: string
-      shell: string
-      runtimeWorkdir?: string
+      filePlan?: FileBoundaryPlan
+      /** ReadOnly native file call whose every write lands in a global temp
+       *  root: the permission gate does not require the write bit. */
+      tempOnlyWrite?: boolean
+      shellPlan?: ShellBoundaryPlan
+      source: string
+      /** The securitySnapshotFor() value this admission was computed under —
+       *  re-verified before execution (end of preflight and at
+       *  permission.evaluate) so a stale grant can never outlive the state
+       *  that produced it. */
+      securitySnapshot: string
+      /** Spawn route chosen after the review layer admitted the call
+       *  (observability only): "host_direct_reviewed" = the admitted call
+       *  runs on the host without the plugin kernel sandbox;
+       *  "readonly_sandbox"/"kernel_sandbox" = a kernel-isolated route
+       *  (read-only sessions still using a kernel profile). */
+      executionRoute?: "host_direct_reviewed" | "readonly_sandbox" | "kernel_sandbox" | "runtime_boundary_watch"
+      runtimeBroker?: RuntimeBoundaryBroker
+      cacheUpdates?: Array<{ scope: ApprovalCacheScope; facts: ApprovalCacheFacts }>
+      runtimeBlocked?: string
+      /** Phase of the refused crossing. Only "entry" (the helper emitted
+       *  atExit:false — the syscall was still held before execution) may
+       *  claim the boundary operation was not performed. "exit" (recvmsg
+       *  cmsg check), cancels, review failures and anything else map to
+       *  "unknown"→"the command was stopped". */
+      runtimeBlockedPhase?: "entry" | "exit" | "unknown"
+      runtimeStats?: { crossings: number; reviewRequests: number; cacheHits: number; staticAllows: number }
+      background?: boolean
+      /** Set once permission.evaluate has allowed at least one assert of
+       *  this call. Real tools may assert several times (external_directory
+       *  + edit, multi-file patches): after the first allow, earlier steps
+       *  may already have run, so a later denial must not claim the whole
+       *  command never ran (see permissionBlockText). */
+      asserted?: boolean
     }
+    const boundaryCalls = new Map<string, BoundaryAuthorization>()
+    const securityBases = new Map<string, string>()
+    const securityEpochs = new Map<string, number>()
+    const approvalCache = createApprovalCache()
+    const sharedReviews = createSingleFlight<EffectReviewResult>()
+    const digest = (value: string) => createHash("sha256").update(value).digest("hex")
+    let boundaryWatchFingerprint: string | undefined
+    let directSubagent = false
+    const boundaryKey = (call: Pick<BoundaryInvocation, "sessionID" | "messageID" | "id">) =>
+      JSON.stringify([call.sessionID, call.messageID, call.id])
+    const injectedEffectsReview = ctx.options && typeof ctx.options === "object" &&
+      typeof (ctx.options as { reviewCommand?: unknown }).reviewCommand === "function"
+        ? (ctx.options as { reviewCommand: (request: EffectReviewRequest, options: { signal: AbortSignal }) => Promise<EffectReviewResult> }).reviewCommand
+        : undefined
 
-    /** Floor pre-check, run before the escalation reviewer is consulted: it
-     * simulates the best possible grant (the session's live bypasses plus
-     * every requested category plus the full static category set — a
-     * superset of anything the reviewer could ever allow) through the
-     * ordinary static classifier. When the decision
-     * still hits a rule no bypass category can ever clear — an unconditional
-     * floor rule (isFloorRule), the permission ceiling, or unreviewable
-     * input (input.empty/input.opaque) — no reviewer verdict could make the
-     * call runnable. The request is refused terminally here, recorded as a
-     * deny so a similar re-request cannot loop, and the reviewer is never
-     * called. Ordinary rules that merely have no bypass mapping do NOT end
-     * here (that was the pre-rework semantic and it also caught unmapped
-     * ordinary rules); only the floor and the explicit terminal set do.
-     * The rule check runs on the decision's rules regardless of verdict:
-     * input.opaque is ASK, not DENY, and it must still short-circuit. */
-    async function precheckEscalationFloor(
-      sessionID: string,
-      request: EscalationRequest,
-      classifyContext: EscalationClassifyContext,
-    ): Promise<void> {
-      // Arm every static category, not just the requested ones: the floor is
-      // immune to all categories, so a terminal rule that still fires under a
-      // full arm can never be cleared by any grant. Arming only the requested
-      // categories let an unrequested non-floor rule shadow a floor rule in
-      // decision.rules (same segment), and let an earlier segment's
-      // bypassable denial stop the walk before the floor segment was seen.
-      const hypothetical = activeBypass(sessionID)
-      for (const category of STATIC_BYPASS_CATEGORIES) hypothetical.add(category)
-      for (const category of request.categories) hypothetical.add(category as BypassCategory)
-      const decision = await classifyShellCommand({
-        script: request.command,
-        cwd: classifyContext.cwd,
-        worktree: classifyContext.worktree,
-        shell: classifyContext.shell,
-        strictness: resolved.strictness,
-        bypassedCategories: hypothetical.size > 0 ? hypothetical : undefined,
-        permScope: effectivePerm(sessionID),
-        roKernelEnforced: roKernelEnforcedForCall(sessionID, hypothetical),
-        roWritableRoots: [resolved.sandbox.scratch],
-        sandboxDenyWrite: resolved.sandbox.denyWrite,
-        runtimeWorkdir: classifyContext.runtimeWorkdir,
-        trustedCommands: resolved.trustedCommands,
+    async function callEffectsReviewer(request: EffectReviewRequest, signal: AbortSignal, readonly = false): Promise<EffectReviewResult> {
+      if (signal.aborted) throw new EffectsReviewError("Effects review was cancelled", "aborted")
+      if (injectedEffectsReview) {
+        const supplied = await injectedEffectsReview(request, { signal })
+        // Test injection still has to return the new complete answer contract.
+        // Old ALLOW/DENY objects cannot bypass floor validation.
+        return adjudicateEffectAnswers(supplied?.answers, readonly)
+      }
+      const jev = resolved.dynamicReview.jev
+      if (!jev?.available) throw new EffectsReviewError("JEV effects review is not configured", "infrastructure")
+      return reviewEffects(request, {
+        endpoint: jev.endpoint,
+        apiKey: jev.apiKey ?? "",
+        timeoutMs: resolved.dynamicReview.timeoutMs,
+        signal,
+        readonly,
       })
-      const terminal = decision.rules.filter((rule) => isFloorRule(rule) || TERMINAL_ESCALATION_RULES.has(rule))
-      if (terminal.length === 0) return
-      // E3: a static floor refusal is NOT a reviewer denial — it is not
-      // recorded in the reviewer/user-decision history, so a classifier
-      // false positive cannot lock out similar requests. Every fresh request
-      // still runs this precheck and execution still runs the normal checks,
-      // so the floor itself is unchanged; only the inaccurate memory is gone.
-      writeReviewerTrace({
-        kind: "escalation_floor_precheck",
-        sessionID,
-        command: request.command,
-        categories: [...request.categories],
-        rules: decision.rules,
-        reason: decision.reason,
-      })
-      const ending = decision.rules.includes("permission.write")
-        ? ` ${PERM_WRITE_SUFFIX}`
-        : `; ${TERMINAL_NO_BYPASS}`
-      throw rejectionError(
-        `Escalation refused: this command cannot be escalated — it is denied by rule(s) that no bypass category ` +
-          `can ever override (${terminal.join(", ")}), so the escalation cannot go over the hard floor. The ` +
-          `escalation reviewer was not consulted and the command was not run — any resubmission hits the ` +
-          `same static check${ending}`,
-      )
     }
 
-    /** The reviewed-facts snapshot an allow_once binds to: the static
-     *  classification + context the P0 inspection actually saw. Admission
-     *  re-verifies the same facts are still true before honoring the grant —
-     *  a script that changed mid-review can never ride the stale approval. */
-    type ReviewedFacts = {
-      decision: StaticSecurityDecision
-      cwd: string
-      worktree: string
-      permLabel: string
-      /** Identity snapshots of evidence objects the reviewer consumed on a
-       *  collect_evidence resubmit (path + dev/ino + size/mtime at read
-       *  time). Admission re-stats them: an approval stays bound to exactly
-       *  the file objects that produced the verdict. */
-      evidenceIdentities?: readonly {
-        resolvedPath: string
-        dev: number
-        ino: number
-        size: number
-        mtimeMs: number
-      }[]
+    /** Digest-only audit context for the effects-review trace events. Never
+     *  carries the command text, user_request, custom bypass scopes, file
+     *  contents, provider error bodies, or credentials — the trace is a
+     *  user-readable verdict log, not a payload dump. */
+    type BoundaryReviewAudit = {
+      sessionID: string
+      callID: string
+      commandSha256: string
+      tool: NativeBoundaryTool
+      staticRules: readonly string[]
+      eventID?: number
+      /** Non-sensitive crossing shape so review volume can be attributed
+       *  without replaying commands: no argv, paths or command text. */
+      boundary?: { kind: string; syscall: string; operation: string; executable?: string }
+      stats?: BoundaryAuthorization["runtimeStats"]
     }
 
-    type EscalationGrant = {
-      categories: readonly BypassCategory[]
-      facts: ReviewedFacts
-    }
-
-    async function reviewEscalationRequest(
-      sessionID: string,
-      request: EscalationRequest,
-      classifyContext: EscalationClassifyContext,
-    ): Promise<EscalationGrant> {
-      if (escalationPending.has(sessionID)) {
-        // The in-flight review may still produce an allow_once: waiting is a
-        // real option, so it is named before the user-authorization route.
-        throw rejectionError(
-          `Escalation already pending in this session; the command was not run. ` +
-            `Wait for the pending request's result, or${terminalAuthorize(request.categories, { skip: false })}`,
-        )
-      }
-      const failures = escalationFailures.get(sessionID) ?? []
-      if (failures.length >= MAX_ESCALATION_FAILURES_PER_SESSION ||
-          (!escalationFailures.has(sessionID) && escalationFailures.size >= MAX_ESCALATION_FAILURE_SESSIONS)) {
-        throw rejectionError(
-          `Escalation history capacity reached; the command was not run.${terminalAuthorize(request.categories)}`,
-        )
-      }
-      // A denied request retried verbatim from a child (subagent) session
-      // must hit the same memory: the similar check sees the read-only union
-      // of the ancestor chain's failure lists. The session's own list stays
-      // the write target and the capacity base — nothing is copied into it.
-      const inherited: FailedEscalationRecord[] = []
-      for (const ancestor of permAncestors(sessionID)) {
-        const ancestorFailures = escalationFailures.get(ancestor)
-        if (ancestorFailures) inherited.push(...ancestorFailures)
-      }
-        const similar = findSimilarFailedEscalation(
-        request.command,
-        [...failures, ...inherited],
-        request.categories,
-      )
-      if (similar) {
-        const earlier =
-          similar.decision === "ask_user"
-            ? "already ended as an automatic denial for a similar command"
-            : "already denied a similar command"
-        throw rejectionError(
-          `Escalation denied: the escalation reviewer ${earlier} ` +
-            `in this session (recorded command: ${similar.command.slice(0, 120)}). A similar escalation request cannot ` +
-            `be submitted again in this session. The command was not run.${terminalAuthorize(request.categories)}`,
-        )
-      }
-
-      // Reserve both review and history capacity before the first await. One
-      // review per session also prevents dissimilar requests racing saturation.
-      const pending = {}
-      escalationPending.set(sessionID, pending)
-      escalationFailures.set(sessionID, failures)
-      try {
-        // Floor pre-check: refuse terminally (recorded as a deny) before any
-        // reviewer call when no grantable category set could ever let the
-        // static layer pass this command.
-        await precheckEscalationFloor(sessionID, request, classifyContext)
-        // P0 fact binding: classify the real command under the CURRENT
-        // bypass set (not the hypothetical grant) BEFORE the reviewer sees
-        // it. The verdict is pinned to exactly these fingerprints/context —
-        // admission re-verifies them afterwards instead of trusting time.
-        const reviewedFacts: ReviewedFacts = {
-          decision: await classifyShellCommand({
-            script: request.command,
-            cwd: classifyContext.cwd,
-            worktree: classifyContext.worktree,
-            shell: classifyContext.shell,
-            strictness: resolved.strictness,
-            bypassedCategories: activeBypass(sessionID),
-            permScope: effectivePerm(sessionID),
-            roKernelEnforced: roKernelEnforcedForCall(sessionID, activeBypass(sessionID)),
-            roWritableRoots: [resolved.sandbox.scratch],
-            sandboxDenyWrite: resolved.sandbox.denyWrite,
-            runtimeWorkdir: classifyContext.runtimeWorkdir,
-            trustedCommands: resolved.trustedCommands,
-          }),
-          cwd: classifyContext.cwd,
-          worktree: classifyContext.worktree,
-          permLabel: permLabel(effectivePerm(sessionID)),
-        }
-        return await performEscalationReview(sessionID, request, failures, pending, classifyContext, reviewedFacts)
-      } finally {
-        if (escalationPending.get(sessionID) === pending) {
-          escalationPending.delete(sessionID)
-          if (failures.length === 0) escalationFailures.delete(sessionID)
-        }
-      }
-    }
-
-    async function performEscalationReview(
-      sessionID: string,
-      request: EscalationRequest,
-      failures: FailedEscalationRecord[],
-      pending: object,
-      classifyContext: EscalationClassifyContext,
-      facts: ReviewedFacts,
-    ): Promise<EscalationGrant> {
-      const dynamic = resolved.dynamicReview
-      if (!dynamic.available || !dynamic.endpoint || !dynamic.model || !dynamic.apiKey) {
-        // Config-field detail is logged, not shown: the agent cannot fix the
-        // plugin config, so the agent-facing reason stays generic.
-        if (dynamic.reason) console.error(`[opencode-v2-security] escalation review unavailable: ${dynamic.reason}`)
-        throw rejectionError(
-          `Escalation review is unavailable (dynamic review unavailable or invalid review configuration); ` +
-            `the command was not run.${terminalAuthorize(request.categories)}`,
-        )
-      }
-
-      // The reviewer must see what the user actually asked for. A context
-      // read failure leaves the request without user intent — that can never
-      // justify an escalation, so it fails closed (without a permanent
-      // record).
-      const perm = effectivePerm(sessionID)
-      let reviewRequest: EscalationReviewRequest
-      try {
-        if (typeof ctx.session.context !== "function") {
-          throw new Error("session.context is not available on this host")
-        }
-        const payload = await run(ctx.session.context({ sessionID }))
-        const messages = Array.isArray(payload)
-          ? payload
-          : payload && typeof payload === "object" && Array.isArray((payload as { data?: unknown }).data)
-            ? (payload as { data: unknown[] }).data
-            : undefined
-        if (!messages) throw new Error("session context payload has no message array")
-        const { currentUserInput, recentContext, recentUserInputs } =
-          escalationContextFromMessages(messages)
-        reviewRequest = {
-          command: request.command,
-          categories: request.categories,
-          justification: request.justification,
-          currentUserInput,
-          recentUserInputs,
-          recentContext,
-          cwd: classifyContext.cwd,
-          worktree: classifyContext.worktree,
-          permScope: { r: perm.r, w: perm.w, x: perm.x },
-          previousFailedEscalations: failures,
-        }
-        // When this command was denied by the dynamic reviewer earlier in the
-        // session, the recorded risk categories let the escalation reviewer
-        // verify the requested grant actually covers what was denied (a retry
-        // that only renamed the categories cannot slip the same gap through).
-        const priorDenial = getSessionState(sessionID).lastDynamicDenial
-        if (priorDenial && priorDenial.command === request.command) {
-          reviewRequest.previousDenial = {
-            command: priorDenial.command,
-            riskCategories: priorDenial.riskCategories,
-          }
-        }
-      } catch {
-        throw rejectionError(
-          "Escalation denied: the session context could not be read, so the escalation reviewer cannot see what " +
-            `the user asked for. The command was not run.${terminalAuthorize(request.categories)}`,
-        )
-      }
-
-      try {
-        if (escalationPending.get(sessionID) !== pending) {
-          throw rejectionError(
-            `Escalation session ended before review; the command was not run.${terminalAuthorize(request.categories)}`,
-          )
-        }
-        const jevAvailable = Boolean(
-          dynamic.jev?.available && dynamic.jev.endpoint && dynamic.jev.model && dynamic.jev.apiKey,
-        )
-        const escalationReviewer = resolved.dynamicReview.reviewer ?? "auto"
-        const result = await reviewEscalationDetailed(reviewRequest, {
-          endpoint: dynamic.endpoint,
-          model: dynamic.model,
-          apiKey: dynamic.apiKey,
-          python: dynamic.pythonPath,
-          reviewer: escalationReviewer,
-          jev: jevAvailable
-            ? {
-                endpoint: dynamic.jev.endpoint,
-                model: dynamic.jev.model,
-                apiKey: dynamic.jev.apiKey ?? "",
-              }
-            : undefined,
-          // The escalation reviewer runs with thinking enabled and needs a
-          // much larger budget than the ordinary dynamic reviewer: never let
-          // a small configured dynamicReview.timeoutMs shrink it below the
-          // thinking-sized default.
-          timeout: Math.max(dynamic.timeoutMs, DEFAULT_ESCALATION_REVIEW_TIMEOUT_MS),
-        })
-        if (escalationPending.get(sessionID) !== pending) {
-          throw rejectionError(
-            `Escalation session ended during review; the command was not run.${terminalAuthorize(request.categories)}`,
-          )
-        }
-        const rawDecision = result.decision as string
+    async function reviewBoundaryRequest(
+      request: EffectReviewRequest,
+      subjects: readonly string[],
+      signal: AbortSignal,
+      worktree: string,
+      audit: BoundaryReviewAudit,
+      readonly = false,
+    ): Promise<EffectReviewResult> {
+      const policyVersion = readonly ? EFFECTS_POLICY_VERSION_READONLY : EFFECTS_POLICY_VERSION
+      let round = 0
+      const invoke = async (payload: EffectReviewRequest): Promise<EffectReviewResult> => {
+        round += 1
+        if (audit.stats) audit.stats.reviewRequests++
         writeReviewerTrace({
-          kind: "escalation_review_verdict",
-          sessionID,
-          command: request.command,
-          categories: [...request.categories],
-          justification: request.justification,
-          // Report the engine that actually produced the verdict.
-          endpoint: result.engine === "jev" ? dynamic.jev?.endpoint : dynamic.endpoint,
-          model: result.engine === "jev" ? dynamic.jev?.model : dynamic.model,
-          decision: rawDecision,
-          engine: result.engine,
-          fallback_reason: result.fallback_reason,
+          kind: "effects_review_request",
+          sessionID: audit.sessionID,
+          callID: audit.callID,
+          commandSha256: audit.commandSha256,
+          tool: audit.tool,
+          staticRules: audit.staticRules,
+          reviewer: injectedEffectsReview ? "test_injection" : "jev",
+          ...(audit.eventID !== undefined ? { eventID: audit.eventID, phase: "runtime" } : { phase: "native_preflight" }),
+          ...(audit.boundary ? { boundary: audit.boundary } : {}),
+          round,
+          policyVersion,
         })
-        // Automatic outcomes only: allow_once admits this call; a legacy
-        // ask_user or a collect_evidence verdict is resolved WITHOUT a human
-        // — one bounded evidence pass + one resubmit, then a denial that
-        // names the evidence limitation.
-        const outcome = automaticOutcome(rawDecision as RawReviewerDecision)
-        if (outcome.kind === "admit") {
-          // The parser validated every category against BYPASS_CATEGORIES;
-          // filter() narrows the parsed strings back to the canonical union.
-          return {
-            categories: BYPASS_CATEGORIES.filter((category) => request.categories.includes(category)),
-            facts,
-          }
-        }
-        if (outcome.kind === "recollect") {
-          const retry = await resubmitEscalationWithEvidence(
-            sessionID,
-            request,
-            classifyContext,
-            reviewRequest,
-            pending,
-            dynamic,
-            jevAvailable,
-            escalationReviewer,
-          )
-          if (retry.kind === "admit") {
-            return {
-              categories: BYPASS_CATEGORIES.filter((category) => request.categories.includes(category)),
-              facts: {
-                ...facts,
-                evidenceIdentities: retry.evidence
-                  .map((item) => item.identity)
-                  .filter((identity): identity is NonNullable<typeof identity> => identity !== undefined),
-              },
-            }
-          }
-          recordEscalationFailure(sessionID, {
-            command: request.command,
-            categories: request.categories,
-            justification: request.justification,
-            decision: "deny",
-          })
-          const limitation = retry.limitation ?? "the requested evidence could not be collected"
-          throw rejectionError(
-            `Escalation could not be authorized automatically: ${limitation}; the command was not run. ` +
-              `A similar command cannot request escalation again in this session. ` +
-              `${terminalOutcomeText("evidence")}`,
-          )
-        }
-        recordEscalationFailure(sessionID, {
-          command: request.command,
-          categories: request.categories,
-          justification: request.justification,
-          decision: "deny",
-        })
-        throw rejectionError(
-          `The escalation reviewer denied this one-time request; the command was not run. A similar command ` +
-            `cannot request escalation again in this session.${terminalAuthorize(request.categories)}`,
-        )
-      } catch (error) {
-        if (error instanceof EscalationReviewError) {
+        try {
+          const verdict = await callEffectsReviewer(payload, signal, readonly)
           writeReviewerTrace({
-            kind: "escalation_review_error",
-            sessionID,
-            command: request.command,
-            categories: [...request.categories],
-            endpoint: dynamic.endpoint,
-            model: dynamic.model,
-            error: error.message.slice(0, 1000),
+            kind: "effects_review_result",
+            sessionID: audit.sessionID,
+            callID: audit.callID,
+            commandSha256: audit.commandSha256,
+            reviewer: injectedEffectsReview ? "test_injection" : "jev",
+            ...(audit.eventID !== undefined ? { eventID: audit.eventID } : {}),
+            round,
+            decision: verdict.decision,
+            source: verdict.source,
+            floor: verdict.floor,
+            policyVersion,
           })
-          throw rejectionError(
-            `Escalation review failed (${error.kind}) and the command was not run: ${error.message.slice(0, 200)}. ` +
-              `No escalation failure was recorded — you may retry the same escalation request later, ` +
-              `or${terminalAuthorize(request.categories, { skip: false })}`,
-          )
+          return verdict
+        } catch (error) {
+          // Provider error bodies are intentionally NOT traced: record only
+          // the failure class (aborted/protocol/infrastructure/…).
+          writeReviewerTrace({
+            kind: "effects_review_error",
+            sessionID: audit.sessionID,
+            callID: audit.callID,
+            commandSha256: audit.commandSha256,
+            reviewer: injectedEffectsReview ? "test_injection" : "jev",
+            ...(audit.eventID !== undefined ? { eventID: audit.eventID } : {}),
+            round,
+            errorKind: error instanceof EffectsReviewError ? error.kind : "unknown",
+            policyVersion,
+          })
+          throw error
         }
-        throw error
       }
-    }
-
-    /** Automatic evidence resolution for collect_evidence (and the legacy
-     *  ask_user verdict): collect bounded evidence ONCE — referenced local
-     *  scripts and paths that are inspectable inside the worktree — attach it
-     *  to the request, and resubmit to the reviewer ONCE. An admit resolves
-     *  the call; anything else (another indecision, deny, or a collection
-     *  failure) ends as a named-limitation denial. No human is involved. */
-    async function resubmitEscalationWithEvidence(
-      sessionID: string,
-      request: EscalationRequest,
-      classifyContext: EscalationClassifyContext,
-      reviewRequest: EscalationReviewRequest,
-      pending: object,
-      dynamic: NonNullable<typeof resolved.dynamicReview>,
-      jevAvailable: boolean,
-      escalationReviewer: string,
-    ): Promise<{ kind: "admit"; evidence: CollectedEvidence[] } | { kind: "deny"; limitation: string }> {
-      // Evidence subjects: what the reviewer referenced that was never
-      // inspected. The static classifier already records which local scripts
-      // it could not fingerprint — reclassify the same command to reuse that
-      // list (read-only, no new authority).
-      const redDecision = await classifyShellCommand({
-        script: request.command,
-        cwd: classifyContext.cwd,
-        worktree: classifyContext.worktree,
-        shell: classifyContext.shell,
-        strictness: resolved.strictness,
-        bypassedCategories: activeBypass(sessionID),
-        permScope: effectivePerm(sessionID),
-        runtimeWorkdir: classifyContext.runtimeWorkdir,
-        trustedCommands: resolved.trustedCommands,
-      })
-      const subjects: EvidenceRequest[] = [
-        ...(redDecision.reviewContext?.uninspectedLocalScripts ?? []),
-        ...(redDecision.reviewContext?.uninspectedTargetDirectories ?? []),
-        ...(redDecision.reviewContext?.referencedPaths ?? []),
-      ].map((subject) => ({ subject }))
-      const { evidence, missing } = await collectBoundedEvidence(subjects, {
-        cwd: classifyContext.cwd,
-        worktree: classifyContext.worktree,
+      let result = await invoke(request)
+      if (result.decision !== "collect_evidence") return result
+      const collected = await collectBoundedEvidence([...new Set(subjects)].map((subject) => ({ subject })), {
+        cwd: request.cwd,
+        worktree,
         allowFullReadAccess: resolved.dynamicReview.allowFullReadAccess,
       })
-      if (evidence.length === 0) {
-        return {
-          kind: "deny",
-          limitation:
-            missing.length > 0
-              ? `the reviewer asked for evidence that is not collectable automatically (${missing
-                  .slice(0, 5)
-                  .join(", ")}${missing.length > 5 ? `, and ${missing.length - 5} more` : ""})`
-              : "the reviewer asked for evidence but there was nothing further to collect",
+      if (signal.aborted) throw new EffectsReviewError("Effects review was cancelled", "aborted")
+      if (collected.evidence.length > 0) {
+        const retry: EffectReviewRequest = {
+          ...request,
+          input_facts: [
+            ...request.input_facts,
+            ...collected.evidence.map((item) => `Collected local evidence (not authorization): ${JSON.stringify({
+              path: item.identity?.resolvedPath ?? item.subject,
+              kind: item.kind,
+              excerpt: item.excerpt,
+              truncated: item.truncated,
+            })}`),
+            `Evidence collection is exhausted after this bounded pass; unavailable subjects: ${JSON.stringify(collected.missing)}`,
+          ],
+          files: [...request.files, ...collected.evidence.map((item) => ({
+            path: item.identity?.resolvedPath ?? item.subject,
+            kind: item.kind,
+            role: "collected_evidence",
+            bytes: Buffer.byteLength(item.excerpt, "utf8"),
+          }))],
         }
+        result = await invoke(retry)
       }
-      // Attach the bounded excerpts to the resubmitted request. The field is
-      // additive: reviewers that do not know it ignore it.
-      const retryRequest = {
-        ...reviewRequest,
-        collectedEvidence: evidence.map((e) => ({
-          kind: e.kind,
-          subject: e.subject,
-          excerpt: e.excerpt,
-          truncated: e.truncated,
-        })),
-      } as EscalationReviewRequest
-      const retry = await reviewEscalationDetailed(retryRequest, {
-        endpoint: dynamic.endpoint ?? "",
-        model: dynamic.model ?? "",
-        apiKey: dynamic.apiKey ?? "",
-        python: dynamic.pythonPath,
-        reviewer: escalationReviewer === "jev" || escalationReviewer === "openai" ? escalationReviewer : "auto",
-        jev: jevAvailable && dynamic.jev
-          ? {
-              endpoint: dynamic.jev.endpoint ?? "",
-              model: dynamic.jev.model ?? "",
-              apiKey: dynamic.jev.apiKey ?? "",
-            }
-          : undefined,
-        timeout: Math.max(dynamic.timeoutMs, DEFAULT_ESCALATION_REVIEW_TIMEOUT_MS),
-      })
-      if (escalationPending.get(sessionID) !== pending) {
-        return { kind: "deny", limitation: "the session ended while evidence was being collected" }
-      }
-      writeReviewerTrace({
-        kind: "escalation_review_verdict",
-        sessionID,
-        command: request.command,
-        categories: [...request.categories],
-        justification: request.justification,
-        endpoint: retry.engine === "jev" ? dynamic.jev?.endpoint : dynamic.endpoint,
-        model: retry.engine === "jev" ? dynamic.jev?.model : dynamic.model,
-        decision: retry.decision,
-        engine: retry.engine,
-        evidence_resubmit: true,
-      })
-      if (automaticOutcome(retry.decision as RawReviewerDecision).kind === "admit") {
-        return { kind: "admit", evidence }
-      }
-      return {
-        kind: "deny",
-        limitation:
-          retry.decision === "deny"
-            ? "the reviewer denied the request after seeing the collected evidence"
-            : "the reviewer still requires information that cannot be collected automatically",
+      return resolveUncollectableEffects(result, true, resolved.dynamicReview.onUncollectable)
+    }
+
+    function assertBoundaryDecision(result: EffectReviewResult): void {
+      if (result.decision === "allow") return
+      // Refusal wording lives in agent-messages.ts (floor → evidence → deny
+      // order preserved there); the frozen adjudication itself is untouched.
+      const refusal = reviewRefusal(result)
+      throw blockedRejection(refusal.reason, refusal.advice)
+    }
+
+    /** `tempOnly`: every write of this native file call lands in a ReadOnly
+     *  temp root, so the write bit is not required. */
+    function assertNativeCeiling(tool: NativeBoundaryTool, sessionID: string, writes: readonly string[], tempOnly = false): void {
+      const perm = effectivePerm(sessionID)
+      const bit = tool === "shell" ? (writes.length ? "w" : undefined)
+        : tool === "write" || tool === "edit" || tool === "patch" ? (tempOnly ? undefined : "w") : "r"
+      // NOTE: a shell call whose writes cannot be enumerated (variable,
+      // opaque target) reports writes=[] here — the unconditional
+      // runtime observer catches those writes before the actual syscall;
+      // admission snapshots also re-check the ceiling at execution time.
+      if (bit && !perm[bit]) {
+        // An unverified ancestor chain fails closed but is NOT a
+        // user-selected ReadOnly — say so, and let the call be retried once
+        // the parent sessions hydrate.
+        if (bit === "w" && ancestryUnresolved(sessionID)) {
+          throw blockedRejection(
+            "the plugin could not verify this session's parent sessions, so write actions are blocked for now",
+            RETRY_LATER,
+          )
+        }
+        // ReadOnly gets its own clear reason — the rwx label is not what the
+        // user selected and reads like an internal detail.
+        const mode = securityModeFor(perm, allBypassed(sessionID))
+        throw blockedRejection(
+          mode === "readonly"
+            ? bit === "w"
+              ? "this session is in [Read only] mode: writes outside temporary directories are blocked"
+              : "this session is in [Read only] mode: native file reads are blocked"
+            : `the session permission ceiling does not allow '${bit}' actions`,
+        )
       }
     }
 
-    // --- 4. shell wrap: Linux OS sandbox (P4) + Windows supervisor -----------
-    // Mutually exclusive per platform. On Linux the nonce marker is the SOLE
-    // authority for the wrap (see applySandboxCreateBefore): marker-less
-    // spawns — user `!cmd` shells and host-internal spawns — are trusted
-    // authority and are returned byte-identical. Marker present → strip,
-    // wrap per profile; "full" returns untouched. On Windows the existing
-    // supervisor wrap is unchanged, and an explicit "full" marker skips it.
+    async function recordCallCacheOutcome(authorization: BoundaryAuthorization, exit: number | undefined): Promise<void> {
+      // A non-zero exit still finished under the approval (`grep` without a
+      // match, `cmd; false`): the objects it wrote are the approved ones.
+      if (exit === undefined || authorization.runtimeBlocked || !authorization.cacheUpdates?.length || !ctx.session.context) return
+      const latest = boundarySessionContext(await run(ctx.session.context({ sessionID: authorization.sessionID })))
+      for (const update of authorization.cacheUpdates) {
+        if (securitySnapshotFor(authorization.sessionID) !== update.scope.securitySnapshot || digest(latest.userRequest) !== update.scope.userAuthorizationDigest) continue
+        approvalCache.recordTargets(update.scope, update.facts, await currentCacheTargets(update.facts.targets).catch(() => []))
+      }
+    }
+
+    async function prepareRuntimeShell(
+      command: string, raw: Record<string, unknown>, call: BoundaryInvocation,
+      authorization: BoundaryAuthorization, cwd: string, roots: string[], preparationSignal: AbortSignal,
+      additionalDenyWrite: readonly string[] = [], readOnlyDenyRead: readonly string[] = [],
+    ): Promise<void> {
+      // Missing observer is a pre-launch block, never permission to silently
+      // run an unreviewed program on the host.
+      await access(DEFAULT_BOUNDARY_WATCH_HELPER, 1).catch(() => {
+        throw blockedRejection("the runtime boundary observer is unavailable, so this shell command cannot start")
+      })
+      // A helper image replaced after this process started must not be
+      // silently executed under old approvals — require a plugin restart.
+      const helperInfo = await lstat(DEFAULT_BOUNDARY_WATCH_HELPER, { bigint: true }).catch(() => undefined)
+      if (!helperInfo) throw blockedRejection("the runtime boundary observer is unavailable, so this shell command cannot start")
+      const helperFingerprint = `${helperInfo.dev}:${helperInfo.ino}:${helperInfo.size}:${helperInfo.mtimeNs}`
+      if (boundaryWatchFingerprint === undefined) boundaryWatchFingerprint = helperFingerprint
+      else if (boundaryWatchFingerprint !== helperFingerprint)
+        throw blockedRejection("the runtime boundary observer binary changed on disk; restart the session before running more commands")
+      const runtimeCwd = await canonicalBoundaryPath(typeof raw.workdir === "string" ? nativeAbsolutePath(cwd, raw.workdir) : cwd)
+      if (typeof raw.workdir === "string") raw.workdir = runtimeCwd
+      const deniedWritePaths = await Promise.all([...resolved.sandbox.denyWrite, ...additionalDenyWrite]
+        .map((target) => canonicalBoundaryPath(target)))
+      const incidentalRoots = incidentalWriteRoots()
+      let eventPhase: "entry" | "exit" | "unknown" = "unknown"
+      // The whole-command static proof is computed at most once per call and
+      // only when a crossing can use it. It never refuses: the two-state
+      // boundary classifier reports DENY-class findings as ASK.
+      let proof: Promise<{ verdict: "ALLOW" | "ASK"; rules: string[] }> | undefined
+      let proofRules: readonly string[] = []
+      const commandProof = () => proof ??= classifyBoundaryCommand({
+        script: command, cwd, worktree: cwd, shell: resolveClassifierShell(configuredShell),
+        ...(runtimeCwd !== cwd ? { runtimeWorkdir: runtimeCwd } : {}),
+        strictness: resolved.strictness,
+        bypassedCategories: activeBypass(call.sessionID),
+        permScope: effectivePerm(call.sessionID),
+        roWritableRoots: effectivePerm(call.sessionID).w ? [resolved.sandbox.scratch] : roots,
+        sandboxDenyWrite: deniedWritePaths,
+        trustedCommands: resolved.trustedCommands,
+      }).then((decision) => {
+        proofRules = decision.rules
+        return { verdict: decision.verdict, rules: decision.rules }
+      }, () => ({ verdict: "ASK" as const, rules: ["static.unavailable"] }))
+      const commandProofRules = () => proofRules
+      const blocked = (reason: string) => {
+        // First refusal reason wins: a downstream broker EOF/cancel must not
+        // rewrite why the crossing was actually denied.
+        authorization.runtimeBlocked ??= reason
+        authorization.runtimeBlockedPhase ??= eventPhase
+        return { action: "deny" as const, reason }
+      }
+      // Name-matched incidental writes (any `__pycache__`/`.pytest_cache`
+      // component) bypass the boundary in EVERY mode — but never inside a
+      // protected control-plane path, a configured denyWrite, or a credential
+      // store: the helper reports protect hits as write events and a
+      // `.pytest_cache` directory inside `~/.aws` must not be exempt. The
+      // target path is already canonicalized by the observer.
+      const incidentalWriteExempt = (target: string): boolean => {
+        if (!isIncidentalToolWrite(target) && !incidentalRoots.some((root) => containsPath(root, target))) return false
+        for (const root of [...deniedWritePaths, path.dirname(broker.socketPath)]) {
+          if (containsPath(root, target)) return false
+        }
+        for (const root of [DEFAULT_BOUNDARY_WATCH_HELPER, PACKAGE_ROOT]) {
+          // protect semantics gate an ancestor write too — a rename/unlink
+          // on a parent swaps the whole subtree.
+          if (containsPath(root, target) || containsPath(target, root)) return false
+        }
+        const sensitivity = checkPathSensitivity(target, { cwd: runtimeCwd, worktree: runtimeCwd })
+        return sensitivity.parseable && !sensitivity.sensitive
+      }
+      const broker = await createRuntimeBoundaryBroker({
+        directory: "/tmp/opencode",
+        onError: (reason) => { blocked(reason) },
+        onBoundary: async (event: RuntimeBoundaryEvent, signal) => {
+          try {
+          authorization.runtimeStats!.crossings++
+          // The helper always emits atExit explicitly; an absent field is
+          // genuinely unknown, never silently "entry".
+          eventPhase = event.details.atExit === true ? "exit"
+            : event.details.atExit === false ? "entry" : "unknown"
+          await hydratePermAncestry(call.sessionID)
+          if (signal.aborted) return blocked("the command was cancelled at its sandbox boundary")
+          if (securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot) {
+            return blocked("the session's security mode or authorization changed")
+          }
+          const permission = effectivePerm(call.sessionID)
+          const canWrite = permission.w
+          if (event.kind === "write" && event.targets.length > 0 &&
+            event.targets.every((target) => incidentalWriteExempt(target.path))) {
+            return { action: "continue" }
+          }
+          // Read-only hard denies: a non-exempt write or a privilege
+          // crossing is an obvious write — refused without a reviewer.
+          // interop/opaque/read/network crossings get the read-only review.
+          if (!canWrite && ["write", "privilege"].includes(event.kind)) {
+            return blocked(ancestryUnresolved(call.sessionID)
+              ? "the session's permission chain could not be verified, so this operation is blocked for now"
+              : "this session is in [Read only] mode: the observed operation exceeds its read-only limit")
+          }
+          if (event.kind === "read" && !permission.r) return blocked("this session does not allow file reads")
+          const bypass = activeBypass(call.sessionID)
+          // Disabling review layers cannot waive the independent RO
+          // conformance check, especially before a full-tree detach.
+          if (canWrite && (!resolved.securityEnabled || bypass.has("dynamic"))) {
+            authorization.source = !resolved.securityEnabled ? "security_disabled" : "bypass_dynamic"
+            if (canWrite) authorization.executionRoute = "host_direct_reviewed"
+            return { action: canWrite ? "allow" : "continue" }
+          }
+          const executable = typeof event.details.executable === "string" ? event.details.executable : undefined
+          const executableInfo = executable ? await lstat(executable, { bigint: true }).catch(() => undefined) : undefined
+          const executableIdentity = executableInfo
+            ? `${executableInfo.dev}:${executableInfo.ino}:${executableInfo.size}:${executableInfo.mtimeNs}`
+            : undefined
+          // argv can carry real secrets (passwords as flags are idiomatic):
+          // the reviewer and every trace/log sees only its digest, count and
+          // completeness — never the raw strings.
+          const rawArgv = event.details.argv
+          const argvDigest = Array.isArray(rawArgv)
+            ? digest(JSON.stringify(rawArgv.map((arg) => typeof arg === "string" ? arg : "")))
+            : undefined
+          const argvIncomplete = event.details.argvIncomplete === true
+          const eventDetails = {
+            ...event.details,
+            ...(argvDigest !== undefined
+              ? { argvDigest, argc: (rawArgv as unknown[]).length }
+              : {}),
+          } as RuntimeBoundaryEvent["details"]
+          delete eventDetails.argv
+          const trustedGitReader = executable !== undefined && ["git", "git-remote-http", "git-remote-https"].includes(path.basename(executable)) &&
+            executableInfo?.isFile() === true && executableInfo.uid === 0 && (executableInfo.mode & 0o022) === 0
+          // Stage 2 of observe → static → dynamic: ALLOW or ASK only. In a
+          // read-only session only the RO-scoped command proof may allow a
+          // crossing statically — no workspaceNetwork/git-reader shortcuts.
+          const staticVerdict = await staticCrossingReview({
+            event, command, trustedGitReader,
+            workspaceNetwork: resolved.sandbox.workspaceNetwork,
+            readonly: !canWrite,
+            commandVerdict: async () => (await commandProof()).verdict,
+          })
+          if (staticVerdict === "ALLOW") {
+            authorization.runtimeStats!.staticAllows++
+            authorization.source = "runtime_static_allow"
+            writeReviewerTrace({ kind: "effects_static_allow", sessionID: call.sessionID, callID: call.id,
+              commandSha256: digest(command), eventID: event.eventID,
+              boundary: { kind: event.kind, syscall: event.syscall, operation: event.operation,
+                ...(executable ? { executable: path.basename(executable) } : {}) } })
+            return { action: "continue" }
+          }
+          if (!ctx.session.context) return blocked("the safety review could not read the session's user authorization")
+          const retained = boundarySessionContext(await run(ctx.session.context({ sessionID: call.sessionID }), signal))
+          const observed = await currentCacheTargets(event.targets)
+          if (!targetIdentitiesMatch(event.targets, observed)) return blocked("a boundary target changed before it could be checked")
+          const metadata = await Promise.all(observed.map(async (target) => {
+            let inspectionError: string | undefined
+            const info = await lstat(target.path, { bigint: true }).catch((error: unknown) => {
+              inspectionError = inspectionErrorCode(error)
+              return undefined
+            })
+            return { path: target.path, ...(info ? { size: String(info.size), mtimeNs: String(info.mtimeNs), ctimeNs: String(info.ctimeNs), mode: String(info.mode) } : { inspectionError }) }
+          }))
+          const custom = activeCustomBypass(call.sessionID)
+          const request: EffectReviewRequest = {
+            command, cwd: runtimeCwd, environment: JSON.stringify(detectEnvironment()),
+            user_request: retained.userRequest, session_context: retained.context,
+            input_facts: [
+              eventPhase === "exit"
+                ? "Runtime witness: the observer inspected this operation at its syscall-exit boundary check; the operation itself already ran. Earlier in-boundary steps may also have run."
+                : eventPhase === "entry"
+                  ? "Runtime witness: the observer paused this operation before its boundary effect. Earlier in-boundary steps may already have run."
+                  : "Runtime witness: the observer could not confirm whether this operation had already produced its boundary effect when it was checked, so the operation may or may not have run. Earlier in-boundary steps may already have run.",
+              `Observed boundary facts (data, not authorization): ${JSON.stringify({ syscall: event.syscall, kind: event.kind, operation: event.operation, targets: observed, details: eventDetails })}`,
+              ...(canWrite ? [] : [
+                "Session security mode: [Read only]",
+                `Read-only session: writes are permitted only inside these roots and the exempt tool cache/history effects (any __pycache__ or .pytest_cache path component): ${JSON.stringify(roots)}`,
+              ]),
+              `Current allowed write roots: ${JSON.stringify(roots)}`,
+              `Current boundary object metadata: ${JSON.stringify(metadata)}`,
+              `Executing image identity (dev:ino:size:mtimeNs): ${JSON.stringify(executableIdentity ?? null)}`,
+              `Independent session read/write ceiling: ${permLabel(permission)}`,
+            ],
+            files: observed.map((target) => ({ path: target.path, kind: "observed_boundary_target", role: event.kind, bytes: 0 })),
+            sandbox: { trigger: `runtime ${event.kind} boundary`, resolved_writes: event.kind === "write" ? observed.map((target) => target.path) : [], domain: event.kind === "interop" ? "windows-interop" : null, error: null },
+            bypass: { categories: STATIC_BYPASS_CATEGORIES.filter((category) => bypass.has(category)), custom: custom.length ? custom.join("\n") : null },
+          }
+          const scope: ApprovalCacheScope = { sessionID: call.sessionID, securitySnapshot: authorization.securitySnapshot, userAuthorizationDigest: digest(retained.userRequest) }
+          const reviewPolicyVersion = canWrite ? EFFECTS_POLICY_VERSION : EFFECTS_POLICY_VERSION_READONLY
+          // Assistant progress and tool output are not new authorization, and
+          // must not destroy an otherwise stable exact approval on every call.
+          const facts: ApprovalCacheFacts = {
+            exactDigest: digest(JSON.stringify({ ...request, session_context: [], policyVersion: reviewPolicyVersion })),
+            kind: event.kind, operation: event.operation, targets: observed,
+            requiresFullApproval: event.details.requiresFullApproval === true,
+            effect: runtimeWriteEffect(event),
+          }
+          const hit = approvalCache.lookup(scope, facts)
+          let result: EffectReviewResult
+          if (hit) {
+            authorization.runtimeStats!.cacheHits++
+            const latest = boundarySessionContext(await run(ctx.session.context({ sessionID: call.sessionID }), signal))
+            const currentTargets = await currentCacheTargets(observed)
+            if (signal.aborted || securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot || digest(latest.userRequest) !== scope.userAuthorizationDigest ||
+              currentTargets.some((target) => target.inspectionError) || !targetIdentitiesMatch(observed, currentTargets)) {
+              return blocked("the boundary authorization or target changed before its cached approval could be used")
+            }
+            authorization.source = `cache:${hit.layer}`
+            writeReviewerTrace({ kind: "effects_cache_hit", sessionID: call.sessionID, callID: call.id,
+              commandSha256: digest(command), eventID: event.eventID, layer: hit.layer, decision: hit.decision })
+            if (hit.decision === "deny") return blocked(hit.result ? reviewRefusal(hit.result).reason : "a previous safety review denied the same operation")
+            if (hit.layer === "L2" || !event.details.requiresFullApproval) {
+              authorization.cacheUpdates ??= []
+              authorization.cacheUpdates.push({ scope, facts })
+              return { action: "continue" }
+            }
+            result = hit.result!
+          } else {
+            try {
+              result = await sharedReviews.run(digest(JSON.stringify([scope, facts.exactDigest])), signal,
+                (sharedSignal) => reviewBoundaryRequest(request, observed.map((target) => target.path), sharedSignal, cwd, {
+                  sessionID: call.sessionID, callID: call.id, commandSha256: digest(command), tool: "shell",
+                  staticRules: commandProofRules(), eventID: event.eventID,
+                  boundary: { kind: event.kind, syscall: event.syscall, operation: event.operation,
+                    ...(executable ? { executable: path.basename(executable) } : {}) },
+                  stats: authorization.runtimeStats,
+                }, !canWrite))
+            } catch (error) {
+              return blocked(reviewUnavailableReason(error instanceof EffectsReviewError ? error.kind : "infrastructure"))
+            }
+            writeReviewerTrace({ kind: "effects_boundary_outcome", sessionID: call.sessionID, callID: call.id,
+              commandSha256: digest(command), eventID: event.eventID, decision: result.decision, source: result.source,
+              floor: result.floor, reviewer: injectedEffectsReview ? "test_injection" : "jev", policyVersion: reviewPolicyVersion })
+          }
+          const latest = boundarySessionContext(await run(ctx.session.context({ sessionID: call.sessionID }), signal))
+          if (signal.aborted || securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot || digest(latest.userRequest) !== scope.userAuthorizationDigest) {
+            return blocked("the session's user authorization changed during the boundary check")
+          }
+          const reviewedTargets = await currentCacheTargets(observed)
+          if (!targetIdentitiesMatch(observed, reviewedTargets)) return blocked("a boundary target changed during the safety review")
+          if (reviewedTargets.some((target, index) => target.inspectionError && !observed[index]?.inspectionError)) {
+            return blocked("the reviewed target identity is now unavailable; it must be checked again with that evidence gap")
+          }
+          // requiresFullApproval (opaque/exec-domain/capability) events never
+          // get a positive cache entry: executable identity + argv still does
+          // not bind the script's indirect, mutable inputs — an unchanged exe
+          // does not make a later effect the same operation. Deny stays
+          // cacheable (a negative verdict is a fact, not a grant). Every
+          // future positive needs a fresh review, while non-opaque L1/L2 keep
+          // their per-object monitoring ('continue', never a tree detach).
+          const storable = result.decision !== "allow" ||
+            !(facts.requiresFullApproval ?? false)
+          if (!hit && storable) approvalCache.store(scope, facts, result)
+          if (result.decision !== "allow") return blocked(reviewRefusal(result).reason)
+          authorization.source = hit ? `cache:${hit.layer}` : result.source
+          authorization.cacheUpdates ??= []
+          authorization.cacheUpdates.push({ scope, facts })
+          if (canWrite) authorization.executionRoute = "host_direct_reviewed"
+          // A reviewed requiresFullApproval crossing (interop/opaque) detaches
+          // the tree in either mode — 'continue' cannot resume it. In a
+          // read-only session the read-only conformance answer stands in for
+          // the write ceiling on everything the tree does next.
+          return { action: canWrite || event.details.requiresFullApproval === true ? "allow" : "continue" }
+          } catch (error) {
+            // Any infrastructure error while judging a crossing still has
+            // to record the refusal: the broker replies 'deny', and without
+            // runtimeBlocked the command would die with a bare 126 and no
+            // reason anywhere (foreground notice AND metadata depend on it).
+            return blocked(`the runtime boundary evidence could not be collected (${inspectionErrorCode(error)})`)
+          }
+        },
+      })
+      if (preparationSignal.aborted) {
+        await broker.close()
+        throw new EffectsReviewError("the call was cancelled before it started", "aborted")
+      }
+      authorization.runtimeBroker = broker
+      authorization.executionRoute = "runtime_boundary_watch"
+      authorization.source = "runtime_boundary_watch"
+      raw.command = insertSandboxMarker(sandboxMarkers, command, "workspace", undefined, undefined, { runtimeWatch: {
+        helperPath: DEFAULT_BOUNDARY_WATCH_HELPER, socketPath: broker.socketPath, token: broker.token,
+        roots, denyRead: [...resolved.sandbox.denyRead, ...readOnlyDenyRead],
+        denyWrite: [...deniedWritePaths, path.dirname(broker.socketPath)],
+        // The broker socket dir, the watcher binary and the package's own
+        // executable code always gate on write — in EITHER direction: a
+        // write inside them or a rename/unlink/chmod on any ancestor swaps
+        // the control plane mid-command. This holds even when the session
+        // workspace IS this repository. Not content review: integrity.
+        protect: [path.dirname(broker.socketPath), DEFAULT_BOUNDARY_WATCH_HELPER,
+          PACKAGE_ROOT],
+        // Read only passes only the global temp roots (see runBoundaryBefore),
+        // so writes there run and every other write is a boundary event the
+        // broker refuses; the helper's all-writes switch would block temp too.
+        readonly: false,
+        // The helper waits at most this long for one decision; the review
+        // path can spend up to two model rounds plus bounded evidence
+        // collection. Cancellation still fails closed (deny), not pass.
+        approveTimeoutMs: resolved.dynamicReview.timeoutMs * 2 + 20_000,
+      } })
+    }
+
+    async function runBoundaryBefore(
+      tool: NativeBoundaryTool,
+      input: unknown,
+      call: BoundaryInvocation,
+      token: object,
+      signal: AbortSignal,
+    ): Promise<{ input: unknown; authorization: BoundaryAuthorization }> {
+      await hydratePermAncestry(call.sessionID)
+      const info = await run(ctx.session.get({ sessionID: call.sessionID }), signal) as { location?: { directory?: unknown } }
+      if (typeof info?.location?.directory !== "string" || !info.location.directory) {
+        throw blockedRejection("the plugin could not get this session's workspace directory from the host")
+      }
+      const directory = info.location.directory
+      // The admission snapshot binds EVERYTHING a granted call relies on —
+      // not just the bypass lease: the effective r/w ceiling (so a mid-review
+      // /perm downgrade cannot leave an admitted write runnable), the derived
+      // mode, categories, custom scopes and the kill switch.
+      const securitySnapshot = securitySnapshotFor(call.sessionID)
+      const raw = structuredClone(input) as Record<string, unknown>
+      const authorization: BoundaryAuthorization = { token, sessionID: call.sessionID, tool, cwd: directory, source: "static_allow", securitySnapshot }
+      // Effective Bypass mode, captured ONCE for the whole admission: the
+      // kill switch is live AND the effective ceiling can write
+      // (securityModeFor reads an armed-but-RO-capped lease as ReadOnly).
+      // Everything below keys off this flag instead of re-reading raw lease
+      // state mid-flight — an armed-but-capped session keeps the slow gate,
+      // classification and effects review like any other non-Bypass call.
+      const bypassEffective = effectiveMode(call.sessionID) === "bypass"
+      if (bypassEffective) {
+        // Every plugin check is skipped for real — canonicalization, static
+        // classification, the slow-command soft gate, the reviewable path
+        // plan + fingerprint binding, and effects review. What stays: a
+        // nonempty command (input executability), the cancel check, and the
+        // admission-snapshot bind — plus the explicit "full" marker so
+        // create.before leaves the spawn unwrapped. The workdir passes
+        // through verbatim: Bypass must not inherit the sandbox planner's
+        // path constraints.
+        authorization.source = "bypass_all"
+        authorization.executionRoute = "host_direct_reviewed"
+        let command: string | undefined
+        if (tool === "shell") {
+          command = commandFromArgs(raw)
+          if (typeof command !== "string" || !command.trim()) {
+            throw blockedRejection("the shell command is empty")
+          }
+        }
+        if (signal.aborted) throw new EffectsReviewError("the call was cancelled before it started", "aborted")
+        if (securitySnapshotFor(call.sessionID) !== securitySnapshot) {
+          throw blockedRejection(
+            "the session's security mode changed while this command was being checked",
+            RECHECK,
+          )
+        }
+        if (tool === "shell") {
+          raw.command = insertSandboxMarker(sandboxMarkers, command ?? "", "full")
+        }
+        boundaryCalls.set(boundaryKey(call), authorization)
+        return { input: raw, authorization }
+      }
+      const absoluteWorkspace = nativeAbsolutePath(directory, ".")
+      const cwd = await canonicalBoundaryPath(absoluteWorkspace)
+      if (cwd !== absoluteWorkspace) {
+        throw blockedRejection("the session's workspace path is not canonical (for example, it goes through a symbolic link), so paths cannot be checked reliably")
+      }
+      if (cwd === path.parse(cwd).root) {
+        throw blockedRejection("the session's workspace is the filesystem root, which this plugin does not support for native tools")
+      }
+      const workspaceIdentity = await lstat(cwd).catch((error: unknown) => {
+        throw new BoundaryPreparationError("Workspace inspection is unavailable", `the session workspace metadata could not be inspected (${inspectionErrorCode(error)})`)
+      })
+      if (!workspaceIdentity.isDirectory()) throw blockedRejection("the session's workspace is not a local directory")
+      const bypass = activeBypass(call.sessionID)
+      const custom = activeCustomBypass(call.sessionID)
+      const scratchRoot = await canonicalBoundaryPath(resolved.sandbox.scratch)
+      if (scratchRoot !== resolved.sandbox.scratch) {
+        throw blockedRejection("the plugin's configured temporary directory is not a canonical path; this is a configuration problem")
+      }
+      // Auto and ReadOnly share the incidental tool cache/history roots
+      // (~/.cache, *.sqlite_history-style files): a read-oriented command's
+      // own history/cache effect is not a boundary crossing. On top of those,
+      // ReadOnly keeps only the global temp directories (scratch, /tmp,
+      // /var/tmp, TMPDIR, WSL's Windows %TEMP%) writable. The workspace stays
+      // read-only even when it lives inside one of them.
+      const readOnly = !effectivePerm(call.sessionID).w
+      const credentialPaths = await Promise.all(credentialStoreReadPaths(homedir()).map((target) => canonicalBoundaryPath(target)))
+      const incidental = incidentalWriteRoots().filter((root) =>
+        !credentialPaths.some((credential) => containsPath(credential, root)) &&
+        !checkPathSensitivity(root, { cwd, worktree: cwd }).sensitive)
+      const tempRoots = readOnly
+        ? [...new Set([...(await globalTempWriteRoots([scratchRoot])), ...incidental])]
+        : []
+      const baseRoots = [cwd, scratchRoot, ...(readOnly ? tempRoots : [...new Set([...standardCacheWriteRoots(), ...incidental])])]
+      const beyondReadOnlyTemp = (writes: readonly string[]) => readOnly
+        ? writes.filter((target) => containsPath(cwd, target) || !tempRoots.some((root) => containsPath(root, target)))
+        : writes
+      if (tool === "shell") {
+        const command = commandFromArgs(raw)
+        if (typeof command !== "string" || !command.trim()) throw blockedRejection("the shell command is empty")
+        if (readOnly) {
+          const launchCwd = await canonicalBoundaryPath(typeof raw.workdir === "string" ? nativeAbsolutePath(cwd, raw.workdir) : cwd)
+          const plan = await planShellBoundary(command, { cwd: launchCwd, shell: resolveClassifierShell(configuredShell), writableRoots: baseRoots })
+          assertNativeCeiling(tool, call.sessionID, beyondReadOnlyTemp(plan.resolvedWrites))
+          // Launch gate under the read-only ceiling: a statically proven
+          // write (permission.write DENY — redirects outside roots, rm/mv/cp,
+          // sed -i, git commit/push, kill, package installs, remote-write
+          // HTTP methods, floor rules) is refused before the command starts
+          // and never reaches the reviewer. Everything else — ASK signals
+          // including permission.exec-unproven, the unproven channel — runs
+          // under the runtime observer, which reviews each crossing.
+          const launch = await classifyShellCommand({
+            script: command, cwd, worktree: cwd, shell: resolveClassifierShell(configuredShell),
+            ...(launchCwd !== cwd ? { runtimeWorkdir: launchCwd } : {}),
+            strictness: resolved.strictness,
+            bypassedCategories: bypass.size ? bypass : undefined,
+            permScope: effectivePerm(call.sessionID),
+            roWritableRoots: tempRoots,
+            sandboxDenyWrite: [...resolved.sandbox.denyWrite, ...credentialPaths, cwd],
+            trustedCommands: resolved.trustedCommands,
+          })
+          if (launch.verdict === "DENY" && launch.rules.some((rule) => rule === "permission.write" || isFloorRule(rule))) {
+            throw blockedRejection(launch.reason, ancestryUnresolved(call.sessionID) ? RETRY_LATER : WITHIN_MODE)
+          }
+        }
+        if (effectivePerm(call.sessionID).w && (!resolved.sandbox.enabled || resolved.sandbox.mode === "full" || bypass.has("sandbox"))) {
+          authorization.source = "sandbox_disabled"
+          authorization.executionRoute = "host_direct_reviewed"
+          raw.command = insertSandboxMarker(sandboxMarkers, command, "full")
+        } else {
+          authorization.runtimeStats = { crossings: 0, reviewRequests: 0, cacheHits: 0, staticAllows: 0 }
+          // The ReadOnly observer gets only the temp roots + incidental
+          // cache/history roots: writes there run; every other write
+          // (including the workspace) is a refused event. Credential stores
+          // the observer's leaf scan does not see (e.g. ~/.aws, ~/.kube) are
+          // added as deny-read so a read becomes a reviewable event instead
+          // of running silently.
+          await prepareRuntimeShell(command, raw, call, authorization, cwd,
+            readOnly ? tempRoots : baseRoots, signal, [...credentialPaths, ...(readOnly ? [cwd] : [])],
+            readOnly ? credentialPaths : [])
+        }
+        boundaryCalls.set(boundaryKey(call), authorization)
+        return { input: raw, authorization }
+      }
+      // A native write tool is itself a proven write, even when aimed at a
+      // temp/cache path. Incidental exemptions belong to observed CLI effects.
+      if (readOnly) assertNativeCeiling(tool, call.sessionID, [])
+      const filePlan = await planFileBoundary(tool, raw, { cwd: directory, writableRoots: baseRoots, bypassCategories: bypass })
+      authorization.filePlan = filePlan
+      const operation = filePlan.command
+      const facts = filePlan.facts
+      const files = filePlan.targets.map((target) => ({ path: target.resolved, kind: "native_file_target", role: target.mode, bytes: target.identity?.size ?? 0 }))
+      const subjects = filePlan.targets.map((target) => target.resolved)
+      const needsReview = filePlan.verdict !== "ALLOW"
+      const tempOnly = readOnly && filePlan.resolvedWrites.length > 0 && beyondReadOnlyTemp(filePlan.resolvedWrites).length === 0
+      assertNativeCeiling(tool, call.sessionID, filePlan.resolvedWrites, tempOnly)
+      if (tempOnly) authorization.tempOnlyWrite = true
+      // RO conformance remains independent of dynamic-review switches.
+      if (needsReview && (readOnly || (resolved.securityEnabled && !bypass.has("dynamic")))) {
+        if (!ctx.session.context) throw blockedRejection("the safety review could not read this session's context, so the command could not be approved")
+        const retained = boundarySessionContext(await run(ctx.session.context({ sessionID: call.sessionID }), signal))
+        const request: EffectReviewRequest = {
+          command: operation,
+          cwd,
+          environment: JSON.stringify(detectEnvironment()),
+          user_request: retained.userRequest,
+          session_context: retained.context,
+          input_facts: [...facts, `Workspace-write base roots: ${JSON.stringify(baseRoots)}`, `Independent session read/write ceiling: ${permLabel(effectivePerm(call.sessionID))}`,
+            ...(readOnly ? [
+              "Session security mode: [Read only]",
+              `Read-only session: writes are permitted only inside these roots and the exempt tool cache/history effects (any __pycache__ or .pytest_cache path component): ${JSON.stringify(tempRoots)}`,
+            ] : [])],
+          files,
+          sandbox: {
+            trigger: `native ${tool} path preflight`,
+            resolved_writes: filePlan.resolvedWrites,
+            domain: null,
+            error: null,
+          },
+          bypass: {
+            categories: STATIC_BYPASS_CATEGORIES.filter((category) => bypass.has(category)),
+            custom: custom.length ? custom.join("\n") : null,
+          },
+        }
+        const audit: BoundaryReviewAudit = {
+          sessionID: call.sessionID,
+          callID: call.id,
+          commandSha256: createHash("sha256").update(operation).digest("hex"),
+          tool,
+          staticRules: [],
+        }
+        const cacheScope: ApprovalCacheScope = { sessionID: call.sessionID, securitySnapshot,
+          userAuthorizationDigest: digest(retained.userRequest) }
+        const cacheFacts: ApprovalCacheFacts = {
+          exactDigest: "",
+          kind: filePlan.resolvedWrites.length ? "write" : "read",
+          operation: filePlan.targets.some((target) => target.mode === "delete") ? "delete"
+            : tool === "patch" && /^\*\*\* Move to:/m.test(String(raw.patchText)) ? "rename" : "modify",
+          targets: await currentCacheTargets(filePlan.targets.map((target) => ({ path: target.resolved,
+            domain: /^\/mnt\/[a-z](?:\/|$)/i.test(target.resolved) ? "drvfs" : "linux", exists: target.identity !== undefined,
+            ...(target.inspectionError ? { inspectionError: target.inspectionError } : {}) }))).then((targets) => targets.map((target, index) => ({
+              ...target, ...(filePlan.targets[index]?.inspectionError ? { inspectionError: filePlan.targets[index]!.inspectionError } : {}),
+            }))),
+          requiresFullApproval: filePlan.resolvedWrites.length > 0 && filePlan.targets.some((target) => target.mode === "read"),
+          // write/edit/patch rewrite the whole file content.
+          ...(filePlan.resolvedWrites.length ? { effect: "replace" as const } : {}),
+        }
+        const fileReviewPolicyVersion = readOnly ? EFFECTS_POLICY_VERSION_READONLY : EFFECTS_POLICY_VERSION
+        cacheFacts.exactDigest = digest(JSON.stringify({ ...request, session_context: [],
+          targetIdentities: cacheFacts.targets, policyVersion: fileReviewPolicyVersion }))
+        const cacheHit = approvalCache.lookup(cacheScope, cacheFacts)
+        let result: EffectReviewResult
+        try {
+          if (cacheHit) {
+            result = cacheHit.result!
+            writeReviewerTrace({ kind: "effects_cache_hit", sessionID: call.sessionID, callID: call.id,
+              commandSha256: audit.commandSha256, layer: cacheHit.layer, decision: cacheHit.decision })
+          } else {
+            result = await sharedReviews.run(digest(JSON.stringify([cacheScope, cacheFacts.exactDigest])), signal,
+              (sharedSignal) => reviewBoundaryRequest(request, subjects, sharedSignal, cwd, audit, readOnly))
+          }
+        } catch (error) {
+          const source = error instanceof EffectsReviewError ? error.kind : "infrastructure"
+          if (source === "aborted") {
+            throw new EffectsReviewError("the call was cancelled before it started", "aborted")
+          }
+          throw blockedRejection(reviewUnavailableReason(source), RETRY_LATER)
+        }
+        const latest = boundarySessionContext(await run(ctx.session.context({ sessionID: call.sessionID }), signal))
+        if (securitySnapshotFor(call.sessionID) !== securitySnapshot || digest(latest.userRequest) !== cacheScope.userAuthorizationDigest) {
+          throw blockedRejection("the session's authorization changed during the boundary check", RECHECK)
+        }
+        await verifyFileBoundaryPlan(filePlan)
+        if (!cacheHit) approvalCache.store(cacheScope, cacheFacts, result)
+        writeReviewerTrace({
+          kind: "effects_boundary_outcome",
+          sessionID: call.sessionID,
+          callID: call.id,
+          commandSha256: audit.commandSha256,
+          reviewer: cacheHit ? "approval_cache" : injectedEffectsReview ? "test_injection" : "jev",
+          decision: result.decision,
+          source: result.source,
+          floor: result.floor,
+          policyVersion: fileReviewPolicyVersion,
+        })
+        assertBoundaryDecision(result)
+        authorization.source = cacheHit ? `cache:${cacheHit.layer}` : result.source
+        authorization.cacheUpdates = [{ scope: cacheScope, facts: cacheFacts }]
+      } else if (needsReview) {
+        // Review-skipping sources on the normal path are only the
+        // fine-grained `dynamic` switch or a fully disabled security layer —
+        // never a raw ALL lease (effective Bypass returned earlier).
+        authorization.source = bypass.has("dynamic") ? "bypass_dynamic" : "security_disabled"
+      }
+      await hydratePermAncestry(call.sessionID)
+      assertNativeCeiling(tool, call.sessionID, filePlan.resolvedWrites, tempOnly)
+      await verifyFileBoundaryPlan(filePlan)
+      if (signal.aborted) throw new EffectsReviewError("the call was cancelled before it started", "aborted")
+      // Re-check the WHOLE admission basis — ceiling and mode, not only the
+      // bypass lease: an opaque/variable command whose writes could not be
+      // enumerated must not survive an Auto→ReadOnly transition that happened
+      // while the reviewer was thinking.
+      if (securitySnapshotFor(call.sessionID) !== securitySnapshot) {
+        throw blockedRejection(
+          "the session's security mode changed while this command was being checked",
+          RECHECK,
+        )
+      }
+      authorization.executionRoute = "host_direct_reviewed"
+      boundaryCalls.set(boundaryKey(call), authorization)
+      return { input: raw, authorization }
+    }
+
+    // The nonce is the authority for Linux wrapping. Marker-less user shells
+    // and host-internal spawns remain untouched; Windows is outside this chain.
     yield* ctx.shell.hook("create.before", (ev: ShellCreateBeforeEvent) =>
       Effect.sync(() => {
-        // Marker extraction runs on every platform: an explicit "full" marker
-        // is the per-call carrier for the `sandbox` bypass category and the
-        // `all` kill switch, and must skip BOTH the bwrap wrap (Linux) and the
-        // supervisor wrap (Windows).
+        if (process.platform !== "linux") return
         const marked = extractSandboxMarker(sandboxMarkers, ev.command)
-        if (process.platform === "linux") {
-          applySandboxCreateBefore(ev, marked, resolved.sandbox, sandboxProbe)
-          return
-        }
-        if (marked.profile) ev.command = marked.command
-        if (marked.profile === "full") return
-        if (!supervisorActive) return
-        // Idempotency: never wrap the supervisor with itself.
-        if (path.resolve(ev.shell) === path.resolve(resolved.supervisorPath)) return
-        ev.env.OPENCODE_REAL_BASH = ev.shell
-        ev.shell = resolved.supervisorPath
+        applySandboxCreateBefore(ev, marked, resolved.sandbox, sandboxProbe)
       }),
     )
 
-    // --- 2. static + LLM review pipeline (v1 tool.execute.before) -----------
+    // --- 2. subagent ceiling bookkeeping (tool.execute.before) --------------
+    // The native wrapper (runBoundaryBefore) owns all shell/file admission;
+    // this hook only handles the subagent `permission` argument — a declared
+    // child ceiling stripped before the host tool sees it and bound to the
+    // spawned child once session.created/execute.after identify it. Agents
+    // can only tighten here (the declared set is intersected); the three
+    // user modes (incl. Bypass) are not agent-settable through this arg —
+    // `bypass`/`all`/`yolo` are not permission spellings and are rejected.
     async function runBefore(ev: ExecuteBeforeEvent): Promise<void> {
       await hydratePermAncestry(ev.sessionID)
-      // `/bypass all` kill switch: no plugin enforcement for this session.
-      // Shell calls still get an explicit "full" marker so create.before
-      // (which has no sessionID) skips the sandbox/supervisor wrap, and the
-      // plugin-added `permission` arg is stripped so the host tool does not
-      // see it. Everything else is untouched.
-      if (allBypassed(ev.sessionID)) {
-        if (ev.tool === "subagent" && resolved.permission.subagentPermission) {
-          delete (ev.input as Record<string, unknown> | undefined)?.permission
-        }
-        if (ev.tool === "shell" || ev.tool === "bash") {
-          const input = ev.input as Record<string, unknown>
-          const command = commandFromArgs(input)
-          if (command !== undefined) {
-            input.command = insertSandboxMarker(sandboxMarkers, command, "full")
-          }
-        }
-        return
-      }
-
-      // Subagent permission parameter: a declared ceiling for the spawned
-      // child session, stripped here (the host tool doesn't know the arg) and
-      // bound when session.created/execute.after identify the child.
-      if (ev.tool === "subagent" && resolved.permission.subagentPermission) {
-        const input = ev.input as Record<string, unknown> | undefined
-        const declared = input?.permission
-        if (typeof declared === "string" && declared.trim()) {
-          const perm = parsePerm(declared)
-          if (!perm) {
-            throw rejectionError(
-              `Invalid subagent permission "${declared}" (expected ro/4, rw/6, w/2, or none/0; x cannot be set; it is always on and only shown in the label)`,
-            )
-          }
-          if (typeof input.sessionID === "string") {
-            await hydratePermAncestry(input.sessionID)
-            if (permParent.get(input.sessionID) !== ev.sessionID) throw rejectionError("Not a direct child session")
-            sessionPerms.set(input.sessionID, permIntersect(sessionPerms.get(input.sessionID) ?? PERM_FULL, perm))
-          } else {
-            permStash.set(ev.id, { parentSessionID: ev.sessionID, perm, at: Date.now() })
-          }
-          delete input.permission
-        } else if (declared !== undefined) {
-          delete input.permission
-        }
-        if (!input?.sessionID && !permStash.has(ev.id)) {
-          permStash.set(ev.id, { parentSessionID: ev.sessionID, perm: PERM_FULL, at: Date.now() })
-        }
-      }
-
-      // apply_patch -> patch. Delete-file patches are blocked statically so the
-      // deletion goes through the shell tool and its permission layer instead.
-      if (ev.tool === "patch" || ev.tool === "apply_patch") {
-        const input = ev.input as Record<string, unknown> | undefined
-        const patchText = typeof input?.patchText === "string" ? input.patchText : undefined
-        if (patchText && /^\*\*\* Delete File:/m.test(patchText)) {
-          throw applyPatchDeleteBlock()
-        }
-        return
-      }
-
-      // bash -> shell (keep accepting "bash" for compatibility).
-      if ((ev.tool !== "shell" && ev.tool !== "bash") || !resolved.securityEnabled) return
-
-      const sessionID = ev.sessionID
-      const sessionState = getSessionState(sessionID)
-      const input = ev.input as Record<string, unknown>
-      const rawScript = commandFromArgs(input)
-      if (!rawScript?.trim()) {
-        rejectStatic(sessionID, sessionState, "", "Empty command")
-      }
-
-      // Single-call escalation (strict three-line prefix). "none" leaves the
-      // command exactly as it was; "malformed" fails closed with the exact
-      // expected format; "valid" strips the three header lines and sends the
-      // real command through the dedicated escalation reviewer. An allowed
-      // request only adds its categories to THIS call's bypass set.
-      // escalationEnabled=false removes the channel entirely: a leading
-      // `# - REQUIRE_ESCALATION` block parses as an ordinary shell comment
-      // and is classified as a normal command — it never reaches the
-      // reviewer and is never recorded as a reviewer decision.
-      const escalationParsed = resolved.escalationEnabled
-        ? parseEscalation(rawScript, ESCALATION_GRANTABLE_CATEGORIES)
-        : { status: "none" as const, command: rawScript }
-      let script = rawScript
-      let escalationGrant: EscalationGrant | undefined
-      if (escalationParsed.status === "malformed") {
-        rejectStatic(sessionID, sessionState, rawScript, `Malformed escalation request: ${escalationParsed.reason}`)
-      }
-      // Session directory/cwd/shell resolution is hoisted above the escalation
-      // branch so the floor pre-check inside reviewEscalationRequest can run
-      // the static classifier with the same inputs the post-grant
-      // classification below uses. cwd stays the verified session directory;
-      // the tool's workdir argument is handed to the classifier as an
-      // unverified runtime base claim.
-      const requestedWorkdir = workdirFromArgs(input)
-      const { directory, worktree } = await sessionDirectory(sessionID)
-      const cwd = await canonicalOrResolved(directory)
-      const shell = resolveClassifierShell(configuredShell)
-      if (escalationParsed.status === "valid") {
-        const request = escalationParsed.request
-        // From here on every consumer (classifier, reviewers, caches, the
-        // tool call itself) sees only the real command.
-        script = request.command
-        input.command = request.command
-        escalationGrant = await reviewEscalationRequest(sessionID, request, {
-          cwd,
-          worktree,
-          shell,
-          runtimeWorkdir: requestedWorkdir,
-        })
-      }
-
-      const bypassed = activeBypass(sessionID)
-      // An allow_once escalation adds its categories for THIS shell call only:
-      // no lease is written, no reminder is sent, nothing survives the call.
-      if (escalationGrant) for (const category of escalationGrant.categories) bypassed.add(category)
-      const bypassedCategories = bypassed.size > 0 ? bypassed : undefined
-      // Bypass leases are fixed-deadline: executing a command here must NOT
-      // renew them, or a user-set timeout would silently become idle-based.
-      //
-      // An ordinary (non-terminal, non-escalated) static DENY is carried to
-      // the dynamic section below by this flag: the refusal stays static,
-      // but the reviewer runs ONCE first so the denial/report names the
-      // command's full minimal risk set, not the first segment's truncated
-      // rule view.
-      let staticDenyPending = false
-
-      const staticDecision: StaticSecurityDecision = await classifyShellCommand({
-        script,
-        cwd,
-        worktree,
-        shell,
-        strictness: resolved.strictness,
-        bypassedCategories,
-        permScope: effectivePerm(sessionID),
-        roKernelEnforced: roKernelEnforcedForCall(sessionID, bypassed),
-        roWritableRoots: [resolved.sandbox.scratch],
-        sandboxDenyWrite: resolved.sandbox.denyWrite,
-        runtimeWorkdir: requestedWorkdir,
-        trustedCommands: resolved.trustedCommands,
-      })
-      if (bypassedCategories && resolved.logReviewerTrace) {
-        writeReviewerTrace({
-          kind: "bypass_active",
-          sessionID,
-          command: script,
-          categories: [...bypassedCategories].sort(),
-        })
-      }
-
-      // Static DENY is absolute — cannot be overridden by approval or
-      // dynamic review. But not every DENY is the same refusal:
-      //
-      //  • Terminal rules (unconditional floor, permission ceiling,
-      //    opaque/empty input) deny immediately — no category can ever
-      //    clear them, so the P0 semantic report would only delay an
-      //    already-final answer.
-      //  • An escalated call whose residual DENY survives the grant is an
-      //    UNCOVERED kind: the report admitted this command's risk set once;
-      //    a rule still firing means the call needs a category the approved
-      //    report did not cover. Admission must never silently admit it.
-      //  • Every other static DENY falls through to one dynamic review so
-      //    the first refusal carries the full minimal risk set (model
-      //    primary footprint ∪ the static rules' own categories) — an
-      //    ordinary compound like `rm -f .env && rm -rf /tmp/docs` denies
-      //    with the complete [filesystem, secret] picture rather than the
-      //    first segment's truncated rule view. The verdict stays the
-      //    static denial: the model completes the report, it never
-      //    overrides it.
-      if (staticDecision.verdict === "DENY") {
-        // Terminality is judged on BOTH this call's classification and the
-        // fully-armed shape — but differently. The unarmed rules carry
-        // every terminal kind (floor, permission ceiling, opaque input);
-        // the armed pass is consulted ONLY for true floor rules, because
-        // floor rules are tagged categories to make the bypass-skip
-        // mechanical and a root-delete can hide behind an earlier
-        // bypassable segment. Armed-only permission.* findings are NOT
-        // terminal here — arming changes how the ceiling masks segments,
-        // it never converts an ordinary deny into an unconditional one.
-        const armedBypass = new Set<BypassCategory>(
-          STATIC_BYPASS_CATEGORIES.map((category) => category as BypassCategory),
-        )
-        const armedDecision = await classifyShellCommand({
-          script,
-          cwd,
-          worktree,
-          shell,
-          strictness: resolved.strictness,
-          bypassedCategories: armedBypass,
-          permScope: effectivePerm(sessionID),
-          roKernelEnforced: roKernelEnforcedForCall(sessionID, armedBypass),
-          roWritableRoots: [resolved.sandbox.scratch],
-          sandboxDenyWrite: resolved.sandbox.denyWrite,
-          runtimeWorkdir: requestedWorkdir,
-          trustedCommands: resolved.trustedCommands,
-        })
-        const armedFloor = armedDecision.rules.filter((rule) => isFloorRule(rule))
-        const terminalRules = new Set(
-          [
-            ...staticDecision.rules.filter(
-              (rule) => isFloorRule(rule) || TERMINAL_ESCALATION_RULES.has(rule),
+      if (!(ev.tool === "subagent" && resolved.permission.subagentPermission)) return
+      const input = ev.input as Record<string, unknown> | undefined
+      const declared = input?.permission
+      if (typeof declared === "string" && declared.trim()) {
+        const mode = parseSecurityMode(declared)
+        if (mode === undefined || mode === "bypass") {
+          // Never echo the raw value — an agent could paste something
+          // sensitive into it. Subagent rejections get their own envelope:
+          // no command was ever going to run here.
+          throw rejectionError(
+            subagentBlockedText(
+              `the permission argument must be "readonly" or "auto" (Bypass mode is a user command and cannot be selected here)`,
             ),
-            ...armedFloor,
-          ],
-        )
-        if (terminalRules.size > 0) {
-          // Name the actual floor when only the armed shape surfaced it —
-          // the first-segment reason would blame the bypassable rule.
-          const reason = armedFloor.length > 0 ? armedDecision.reason : staticDecision.reason
-          rejectStatic(sessionID, sessionState, script, reason, [...terminalRules])
-        }
-        if (escalationGrant) {
-          // Categories this call's remaining DENY rules actually need.
-          const uncovered = new Set<string>()
-          let unmappable = false
-          for (const rule of staticDecision.rules) {
-            const required = ruleRequiredCategories(rule)
-            if (!required || required.length === 0) {
-              unmappable = true
-              continue
-            }
-            for (const category of required) {
-              if (!escalationGrant.categories.includes(category)) uncovered.add(category)
-            }
-          }
-          const reason = unmappable
-            ? `${staticDecision.reason} (residual rule is outside the bypass system and cannot be escalated)`
-            : `${staticDecision.reason} (requires categories outside this call's approved report: ${[...uncovered].sort().join(", ")})`
-          rejectStatic(sessionID, sessionState, script, reason, staticDecision.rules)
-        }
-        staticDenyPending = true
-      }
-
-      // Residual ASK kinds after a grant: the report admitted this call's
-      // risk set once, so a surviving review rule that names a category the
-      // approved report did not cover is an unapproved kind — deny it
-      // instead of riding the stale approval. Rules with no category mapping
-      // (opaque/context-required fallbacks) keep the allow_once semantics:
-      // they were part of what the reviewer saw at P0. Bypass-marker rules
-      // (bypass.static-allow) map to nothing and never gate here.
-      if (escalationGrant && staticDecision.verdict === "ASK") {
-        const uncovered = new Set<string>()
-        for (const rule of staticDecision.rules) {
-          const required = ruleRequiredCategories(rule)
-          if (!required) continue
-          for (const category of required) {
-            if (!escalationGrant.categories.includes(category)) uncovered.add(category)
-          }
-        }
-        if (uncovered.size > 0) {
-          rejectStatic(
-            sessionID,
-            sessionState,
-            script,
-            `${staticDecision.reason} (still requires categories outside this call's approved report: ` +
-              `${[...uncovered].sort().join(", ")})`,
-            staticDecision.rules,
-            riskCategoryHint([...uncovered].sort(), bypassed),
           )
         }
-      }
-
-      // host/privilege ↔ OS sandbox consistency: when the effective bypass
-      // set (session lease ∪ this call's escalation grant) contains
-      // `privilege` and the command needs OS privilege, the call must run
-      // host-direct — bwrap's unconditional NO_NEW_PRIVS and cap-drop would
-      // otherwise make sudo/chown/setcap fail silently at runtime even
-      // though the user authorized exactly that. rw profiles reuse the
-      // existing allowSudo host-direct helper route (the nonce marker carries
-      // the per-call flag); a profile that cannot lose the sandbox (ro
-      // ignores allowSudo) fails loudly instead of running into a
-      // guaranteed silent runtime failure. "full" is already host-direct.
-      const callSandboxProfile = sessionSandboxProfile(sessionID, bypassed)
-      const needsOsPrivilege = commandNeedsOsPrivilege(script, shell)
-      const privilegeHostDirect = bypassed.has("privilege") && needsOsPrivilege
-      // A privilege-needing command must never silently run inside the OS
-      // sandbox: without `privilege` there is no host-direct route (except
-      // the config allowSudo route, which is already host-direct), so refuse
-      // terminally rather than let the call hit bwrap's NO_NEW_PRIVS floor
-      // and die with a confusing runtime error.
-      const rwAllowSudoRoute = callSandboxProfile === "rw" && resolved.sandbox.allowSudo
-      if (needsOsPrivilege && callSandboxProfile !== "full" && !rwAllowSudoRoute) {
-        if (!bypassed.has("privilege")) {
-          const escalationRoute = resolved.escalationEnabled
-            ? `, or the privilege category can be included when escalating this command`
-            : ""
-          throw rejectionError(
-            `Blocked by policy classifier: this command needs OS privilege but the privilege category is not ` +
-              `bypassed for this call, so the OS sandbox's no_new_privs floor would make the privilege step ` +
-              `fail silently at runtime — the command was not run. The privilege bypass category must be armed ` +
-              `for this call to proceed${escalationRoute} ` +
-              `(a rw profile host-direct route also requires sandbox.allowSudo).`,
-          )
-        }
-        if (callSandboxProfile === "ro") {
-          const escalationRoute = resolved.escalationEnabled
-            ? `the sandbox category can be included when escalating privileged commands, `
-            : ""
-          throw rejectionError(
-            `Blocked by policy classifier: this command needs OS privilege and the privilege category is bypassed ` +
-              `for this call, but this call's OS sandbox profile is read-only and cannot run it host-direct — the ` +
-              `sandbox's no_new_privs floor would make the privilege step fail silently at runtime, so the command ` +
-              `was not run. The sandbox bypass category must be armed for this call, ${escalationRoute}` +
-              `or sandbox.allowSudo must be enabled in the plugin config for read-write sessions.`,
-          )
-        }
-      }
-      // The host-direct agent reminder and the privilege_host_direct audit
-      // line are written in applyPostChecks — at the final-allow point,
-      // after every denial path (static DENY, the ro-profile refusal above,
-      // the sandbox availability gate, dynamic DENY, fail_close) and after
-      // the local-script fingerprint check passes — so they never claim a
-      // host-direct run for a call that was never allowed to run.
-
-      // P4 sandbox availability gate: after the static classifier (a static
-      // DENY reports its own reason) and before dynamic review (denying here
-      // saves a reviewer call). Any userspace DENY above short-circuits the
-      // kernel layer; under fail_close a non-full profile with no sandbox
-      // route denies the call outright. rw host-direct routes (allowSudo
-      // config, or the privilege routing above) need no kernel probe result.
-      assertSandboxAvailable(
-        callSandboxProfile,
-        sandboxProbe,
-        resolved.sandbox.onUnavailable,
-        resolved.sandbox.allowSudo || privilegeHostDirect,
-      )
-
-      // Slow-command soft interception for high-cost optimizable commands (S14).
-      if (staticDecision.verdict === "ALLOW") maybeBlockSlow(script, input, shell, cwd, worktree, bypassed)
-
-      // v1's approved-fingerprint path (confirm tool) is gone in v2: there is no
-      // confirmation tool, so no approval can ever be recorded.
-
-      const rejectionAtStart = strictPolicy ? sessionState.lastRejected : undefined
-      const failureAtStart =
-        strictPolicy && sessionState.lastFailed && !sessionState.lastFailed.consumedBy
-          ? sessionState.lastFailed
-          : undefined
-      const forcedByRejection = Boolean(rejectionAtStart)
-      const forcedByFailure = Boolean(failureAtStart)
-      const forced = forcedByRejection || forcedByFailure
-
-      // Escalation admission: a raw allow_once verdict IS this call's
-      // assessment report and its admission — the execution gate does not
-      // re-classify through the ordinary dynamic reviewer, add categories, or
-      // apply a fresh static→ASK pass. The unconditional layers that ran
-      // above (static DENY floor/terminal set, permission ceiling, sandbox
-      // routing, read-only native checks) are untouched: escalation can only
-      // grant bypass categories, never lift the floor. Stored scope
-      // "one_time": the report admits THIS call only and is never replayed.
-      //
-      // Fact binding: the grant was pinned at P0 to the reviewed
-      // classification + context (script fingerprints, local scripts,
-      // referenced/target paths, cwd, worktree, permission scope). The
-      // residual-DENY check above already rejected an uncovered kind; here
-      // the CURRENT classification must still equal the reviewed snapshot —
-      // a script swapped or a path moved between verdict and admission must
-      // not ride the stale approval. Bypass-set drift is deliberately NOT
-      // compared: a lease scope change is not a fact about the command.
-      const admissionGranted = escalationGrant !== undefined
-      if (admissionGranted) {
-        const facts = escalationGrant!.facts
-        let changed =
-          staticDecision.fingerprints.length !== facts.decision.fingerprints.length ||
-          ![...staticDecision.fingerprints.map((f) => f.path)].sort().every(
-            (p, i) => p === [...facts.decision.fingerprints.map((f) => f.path)].sort()[i],
-          ) ||
-          JSON.stringify((staticDecision.reviewContext?.localScripts ?? []).slice().sort()) !==
-            JSON.stringify((facts.decision.reviewContext?.localScripts ?? []).slice().sort()) ||
-          JSON.stringify((staticDecision.reviewContext?.uninspectedLocalScripts ?? []).slice().sort()) !==
-            JSON.stringify((facts.decision.reviewContext?.uninspectedLocalScripts ?? []).slice().sort()) ||
-          JSON.stringify((staticDecision.reviewContext?.referencedPaths ?? []).slice().sort()) !==
-            JSON.stringify((facts.decision.reviewContext?.referencedPaths ?? []).slice().sort()) ||
-          JSON.stringify((staticDecision.reviewContext?.targetDirectories ?? []).slice().sort()) !==
-            JSON.stringify((facts.decision.reviewContext?.targetDirectories ?? []).slice().sort()) ||
-          JSON.stringify((staticDecision.reviewContext?.uninspectedTargetDirectories ?? []).slice().sort()) !==
-            JSON.stringify((facts.decision.reviewContext?.uninspectedTargetDirectories ?? []).slice().sort()) ||
-          cwd !== facts.cwd ||
-          worktree !== facts.worktree ||
-          permLabel(effectivePerm(sessionID)) !== facts.permLabel ||
-          // Verify the t0 (reviewed) fingerprint set is still fresh —
-          // not the t1 re-classification's list: the approval was issued
-          // for the objects the reviewer inspected.
-          !(await verifyScriptFingerprints(facts.decision.fingerprints))
-        // Evidence identities: every object the reviewer consumed on a
-        // collect_evidence resubmit must still be the same file object at
-        // admission — re-stat the resolved path and compare dev/ino plus
-        // the read-time size/mtime. A swapped or rewritten evidence file
-        // invalidates the approval it helped produce.
-        if (!changed && facts.evidenceIdentities) {
-          for (const identity of facts.evidenceIdentities) {
-            const now = await lstat(identity.resolvedPath).catch(() => undefined)
-            if (
-              !now ||
-              now.dev !== identity.dev ||
-              now.ino !== identity.ino ||
-              now.size !== identity.size ||
-              now.mtimeMs !== identity.mtimeMs
-            ) {
-              changed = true
-              break
-            }
+        const perm = permForMode(mode)
+        if (typeof input.sessionID === "string") {
+          await hydratePermAncestry(input.sessionID)
+          if (permParent.get(input.sessionID) !== ev.sessionID) {
+            throw rejectionError(subagentBlockedText("sessionID must name a direct child session"))
           }
+          // Barrier FIRST: the notice/RPC sync below must already observe
+          // the declared mode — a parent's armed Bypass must not show
+          // through while the ceiling lands.
+          explicitNoBypass.add(input.sessionID)
+          sessionPerms.set(input.sessionID, permIntersect(sessionPerms.get(input.sessionID) ?? PERM_FULL, perm))
+          notifySecurityState(input.sessionID, "updated", "set")
+        } else {
+          permStash.set(ev.id, { parentSessionID: ev.sessionID, perm, at: Date.now(), declared: true })
         }
-        if (changed) {
-          rejectStatic(
-            sessionID,
-            sessionState,
-            script,
-            "Command facts changed after the escalation review (script content, referenced paths, " +
-              "working directory, or permission scope no longer match the reviewed snapshot); " +
-              "the approval was not applied",
-            staticDecision.rules,
-          )
-        }
-        maybeBlockSlow(script, input, shell, cwd, worktree, bypassed)
-        if (
-          !(await applyPostChecks(script, input, staticDecision, shell, {
-            sessionID,
-            bypassedCategories: bypassed,
-            privilegeHostDirect,
-          }))
-        ) {
-          rejectStatic(sessionID, sessionState, script, "Local script changed after review", staticDecision.rules)
-        }
-        writeReviewerTrace({
-          kind: "assessment_admission",
-          sessionID,
-          command: script,
-          source: "model_decision",
-          scope: "one_time",
-          categories: [...escalationGrant!.categories].sort(),
-          owners: ownersForCategories(escalationGrant!.categories),
-        })
-        return
+        delete input.permission
+      } else if (declared !== undefined) {
+        delete input.permission
       }
-
-      if (staticDecision.verdict === "ALLOW" && !forced) {
-        if (
-          !(await applyPostChecks(script, input, staticDecision, shell, {
-            sessionID,
-            bypassedCategories: bypassed,
-            privilegeHostDirect,
-          }))
-        ) {
-          rejectStatic(sessionID, sessionState, script, "Local script changed after review", staticDecision.rules)
-        }
-        return
+      if (!input?.sessionID && !permStash.has(ev.id)) {
+        permStash.set(ev.id, { parentSessionID: ev.sessionID, perm: PERM_FULL, at: Date.now() })
       }
-
-      const cacheable = !strictPolicy && !forcedByFailure
-      let cacheKey: string | undefined
-      if (cacheable) {
-        cacheKey = dynamicAllowCacheKey(
-          sessionID,
-          script,
-          cwd,
-          shell,
-          staticDecision,
-          resolved.dynamicReview.endpoint ?? "",
-          resolved.dynamicReview.model ?? "",
-          resolved.strictness,
-          bypassedCategories ? [...bypassedCategories].sort() : undefined,
-          effectivePerm(sessionID),
-        )
-        // Whole-report replay: the stored report admits or denies only when
-        // every canonical input (command text, script fingerprints/mtimes,
-        // cwd, permission scope, bypass set, policy version) is identical —
-        // a changed fact yields a different key and a fresh review.
-        // A pending static DENY never replays a cached allow: the static
-        // verdict is absolute, so only a fresh review (or a cached deny)
-        // can complete its report.
-        const cached = cacheKey ? assessmentReports.get(cacheKey, sessionID) : undefined
-        if (cacheKey && !staticDenyPending && cached?.decision === "allow") {
-          maybeBlockSlow(script, input, shell, cwd, worktree, bypassed)
-          writeReviewerTrace({
-            kind: "cache_allow",
-            sessionID,
-            command: script,
-            cacheKey,
-            source: "replay",
-            owners: cached.owners,
-          })
-          if (
-            !(await applyPostChecks(script, input, staticDecision, shell, {
-              sessionID,
-              bypassedCategories: bypassed,
-              privilegeHostDirect,
-            }))
-          ) {
-            rejectStatic(sessionID, sessionState, script, "Local script changed after review", staticDecision.rules)
-          }
-          return
-        }
-        if (cacheKey && cached?.decision === "deny") {
-          writeReviewerTrace({
-            kind: "cache_deny",
-            sessionID,
-            command: script,
-            cacheKey,
-            reason: cached.reason,
-            source: "replay",
-          })
-          // Refresh the coverage-gate record: a cached DENY replays the
-          // same risk categories a live verdict would, and without this
-          // the escalation reviewer loses previousDenial evidence whenever
-          // the denial came from cache.
-          sessionState.lastDynamicDenial = {
-            command: script,
-            riskCategories: [...cached.categories],
-            at: Date.now(),
-          }
-          throw blockMessage(
-            "dynamic",
-            cached.reason ?? "Denied by policy",
-            strictPolicy,
-            staticDecision.rules,
-            script,
-            claimEscalationGuidance(sessionID),
-            resolved.escalationEnabled,
-            riskCategoryHint(cached.categories, bypassed),
-          )
-        }
-      }
-
-      // v2 tool call id replaces v1's input.callID for failure-consumption tracking.
-      const callID = ev.id
-      if (
-        failureAtStart &&
-        sessionState.lastFailed?.generation === failureAtStart.generation &&
-        !sessionState.lastFailed.consumedBy
-      ) {
-        sessionState.lastFailed.consumedBy = callID
-      }
-
-      const reviewRequest: CloudReviewRequest = {
-        command: script,
-        localScripts: staticDecision.reviewContext?.localScripts ?? [],
-        uninspectedLocalScripts: staticDecision.reviewContext?.uninspectedLocalScripts ?? [],
-        targetDirectories: staticDecision.reviewContext?.targetDirectories ?? [],
-        uninspectedTargetDirectories: staticDecision.reviewContext?.uninspectedTargetDirectories ?? [],
-        referencedPaths: staticDecision.reviewContext?.referencedPaths ?? [],
-        referencedPathsTruncated: staticDecision.reviewContext?.referencedPathsTruncated ?? false,
-        worktree,
-        cwd,
-        permScope: effectivePerm(sessionID),
-      }
-      if (rejectionAtStart) {
-        reviewRequest.previousRejectedCommand = rejectionAtStart.value
-      }
-      if (failureAtStart) {
-        reviewRequest.previousFailedCommand = failureAtStart.value
-      }
-      if (bypassedCategories && bypassedCategories.size > 0) {
-        // Sorted to match the dynamic cache key, so one key always means one
-        // BYPASS_RULE prompt ordering. Only static-rule categories relax the
-        // reviewer's prompt — `dynamic`, `sandbox`, and `slow` bypass layers
-        // the reviewer never sees, so they stay out of `userBypass`.
-        const promptCategories = [...bypassedCategories]
-          .filter((category) => (STATIC_BYPASS_CATEGORIES as readonly string[]).includes(category))
-          .sort()
-        if (promptCategories.length > 0) reviewRequest.userBypass = promptCategories
-      }
-      // Environment awareness is part of every dynamic review, not only
-      // bypassed ones.
-      reviewRequest.environment = detectEnvironment()
-
-      // Evidence the collect_evidence path gathered this call; attached to
-      // deny/allow reports so the record shows what the reviewer actually saw.
-      let collectedEvidence: CollectedEvidence[] = []
-      let missingEvidence: string[] = []
-
-      let cloudReview: CloudReviewResult | undefined
-      let reviewError: Error | undefined
-      // `dynamic` bypass: the reviewer is skipped for this session and the
-      // fail-open route below always applies — the armed bypass overrides the
-      // configured failPolicy (fix F2). A skipped reviewer must never count
-      // as a reviewer "failure" for the consecutive-failure toast.
-      const dynamicBypassed = bypassedCategories?.has("dynamic") === true
-      if (!dynamicBypassed && reviewerAvailable()) {
-        try {
-          // Concurrent identical reviews share one in-flight call instead of
-          // racing duplicate auditor processes at the endpoint.
-          let pending = cacheKey ? inflightReviews.get(cacheKey) : undefined
-          if (!pending) {
-            pending = performDynamicReview(reviewRequest)
-            if (cacheKey) {
-              inflightReviews.set(cacheKey, pending)
-              void pending
-                .catch(() => {})
-                .finally(() => {
-                  if (inflightReviews.get(cacheKey) === pending) inflightReviews.delete(cacheKey)
-                })
-            }
-          }
-          const result: unknown = await pending
-          // `engine`/`fallback_reason` are internal provenance stamped by
-          // reviewer.ts after the verdict parses — they are not part of the
-          // wire contract. Remove them before the strict schema check (which
-          // rejects unknown keys) and re-attach afterwards so trace logging
-          // keeps the fields.
-          let engine: CloudReviewResult["engine"] | undefined
-          let fallbackReason: string | undefined
-          if (result !== null && typeof result === "object" && !Array.isArray(result)) {
-            const record = result as Record<string, unknown>
-            if (record.engine === "jev" || record.engine === "openai") {
-              engine = record.engine
-            }
-            if (typeof record.fallback_reason === "string") {
-              fallbackReason = record.fallback_reason
-            }
-            delete record.engine
-            delete record.fallback_reason
-          }
-          if (!isValidReviewResult(result, strictPolicy)) {
-            // A malformed verdict is a protocol failure (fail-close under
-            // HARD), never a verdict and never routed through fail_open.
-            throw new ReviewError("Dynamic review returned an invalid result", "protocol")
-          }
-          if (engine) result.engine = engine
-          if (fallbackReason) result.fallback_reason = fallbackReason
-          cloudReview = result
-        } catch (error) {
-          reviewError = error instanceof Error ? error : new Error(String(error))
-          writeReviewerTrace({
-            kind: "review_error",
-            sessionID,
-            command: script,
-            endpoint: resolved.dynamicReview.endpoint,
-            model: resolved.dynamicReview.model,
-            error: reviewError.message.slice(0, 1000),
-          })
-        }
-      } else {
-        reviewError = new Error(
-          dynamicBypassed
-            ? "Dynamic review is disabled for this session by a user-armed bypass"
-            : (resolved.dynamicReview.reason ?? "Dynamic review is not configured"),
-        )
-      }
-
-      if (cloudReview) {
-        resetDynamicFailureCounter()
-        writeReviewerTrace({
-          kind: "review_verdict",
-          sessionID,
-          command: script,
-          // Report the engine that actually produced the verdict: a Jev
-          // verdict logged with the OpenAI-compatible endpoint looks like the
-          // fallback engine ran when it did not.
-          endpoint: cloudReview.engine === "jev"
-            ? resolved.dynamicReview.jev?.endpoint
-            : resolved.dynamicReview.endpoint,
-          model: cloudReview.engine === "jev"
-            ? resolved.dynamicReview.jev?.model
-            : resolved.dynamicReview.model,
-          decision: cloudReview.decision,
-          // Only denials carry a reason; logging a deny phrase on ALLOW
-          // makes every allowed verdict look rejected in the trace.
-          reason: cloudReview.decision === "DENY" ? (cloudReview.reason ?? "Denied by policy") : undefined,
-          categories: cloudReview.categories,
-          secondary_categories: cloudReview.secondary_categories,
-          bypassing: cloudReview.bypassing,
-          engine: cloudReview.engine,
-          fallback_reason: cloudReview.fallback_reason,
-        })
-
-        // collect_evidence: the reviewer asked for context before deciding.
-        // Bounded automatic collection (no human, no new authority): ONE
-        // evidence pass over the command's uninspected references + ONE
-        // resubmit. A second indecision or a denied retry ends the call with
-        // a named limitation; a missing-everything collection denies without
-        // burning the second review call.
-        //
-        // Priority rule: an explicit `collect_evidence` DECISION is the only
-        // trigger for a second review. A raw ALLOW whose assessment merely
-        // carries needsEvidence diagnostics ("unclear"/"possible weak" style
-        // soft flags) is a real agreement and admits as-is — metadata on a
-        // verdict never vetoes the verdict. The resubmitted result keeps its
-        // own typed decisionSource (evidence_limited on program truncation),
-        // it is never repainted as a model denial.
-        if ((cloudReview.decision as string) === "collect_evidence") {
-          const resolvedEvidence = await resolveCollectEvidence(
-            sessionID,
-            script,
-            staticDecision,
-            reviewRequest,
-            { cwd, worktree },
-            cloudReview.assessment?.needsEvidence ?? [],
-          )
-          collectedEvidence = resolvedEvidence.evidence
-          missingEvidence = resolvedEvidence.missing
-          cloudReview = resolvedEvidence.result
-        }
-
-        // Ordinary static DENY completion (see the tiered block above): the
-        // reviewer ran for report completeness only — the refusal stays the
-        // static reason. The billed risk set is the model's primary
-        // categories (when it named them) merged with the static rules' own
-        // categories; secondary diagnostic categories never join. The deny
-        // report is keyed to the same canonical inputs so a later identical
-        // escalation or call reads the same verdict history.
-        if (staticDenyPending) {
-          const ruleCats = rulesHintCategories(staticDecision.rules)
-          const riskCategories = [
-            ...new Set([
-              ...(cloudReview.categories.length > 0 ? cloudReview.categories : []),
-              ...ruleCats,
-            ]),
-          ]
-          sessionState.lastDynamicDenial = {
-            command: script,
-            riskCategories,
-            at: Date.now(),
-          }
-          if (cacheKey) {
-            assessmentReports.put(
-              buildReport({
-                key: cacheKey,
-                sessionID,
-                command: script,
-                cwd,
-                worktree,
-                shell,
-                decision: "deny",
-                categories: riskCategories,
-                secondaryCategories: cloudReview.secondary_categories,
-                // The report's judgment is the native static denial; the
-                // model's verdict completed the footprint, it did not issue
-                // the verdict itself — `native_static` keeps that distinct
-                // from an unconditional floor refusal (program_floor).
-                source: "native_static",
-                reason: staticDecision.reason,
-                evidence: collectedEvidence,
-                missingEvidence,
-              }),
-            )
-          }
-          rejectStatic(
-            sessionID,
-            sessionState,
-            script,
-            staticDecision.reason,
-            staticDecision.rules,
-            riskCategoryHint(riskCategories, bypassed),
-          )
-        }
-
-        if (strictPolicy && cloudReview.bypassing === true) {
-          const reason =
-            cloudReview.decision === "DENY"
-              ? (cloudReview.reason ?? "Denied by policy")
-              : "The command appears to bypass a previous rejection"
-          // Minimal categories: only the model's primary categories bill the
-          // denial — secondary_categories are diagnostics and must not widen
-          // the set the escalation reviewer uses for coverage.
-          const riskCategories =
-            cloudReview.categories.length > 0
-              ? cloudReview.categories
-              : denialHintCategories(staticDecision.rules, cloudReview)
-          sessionState.lastDynamicDenial = {
-            command: script,
-            riskCategories,
-            at: Date.now(),
-          }
-          recordRejection(sessionState, { command: script, reason, classifier: "DYNAMIC" })
-          scheduleAbort(sessionID)
-          throw blockMessage(
-            "dynamic", reason, true, staticDecision.rules, script,
-            claimEscalationGuidance(sessionID), resolved.escalationEnabled,
-            riskCategoryHint(riskCategories, bypassed),
-          )
-        }
-
-        if (cloudReview.decision === "DENY") {
-          const reason = cloudReview.reason ?? "Denied by policy"
-          const riskCategories =
-            cloudReview.categories.length > 0
-              ? cloudReview.categories
-              : denialHintCategories(staticDecision.rules, cloudReview)
-          sessionState.lastDynamicDenial = {
-            command: script,
-            riskCategories,
-            at: Date.now(),
-          }
-          recordRejection(sessionState, {
-            command: script,
-            reason,
-            classifier: "DYNAMIC",
-          })
-          if (cacheKey) {
-            assessmentReports.put(
-              buildReport({
-                key: cacheKey,
-                sessionID,
-                command: script,
-                cwd,
-                worktree,
-                shell,
-                decision: "deny",
-                categories: riskCategories,
-                secondaryCategories: cloudReview.secondary_categories,
-                source: "model_decision",
-                reason,
-                evidence: collectedEvidence,
-                missingEvidence,
-              }),
-            )
-          }
-          throw blockMessage(
-            "dynamic",
-            reason,
-            strictPolicy,
-            staticDecision.rules,
-            script,
-            claimEscalationGuidance(sessionID),
-            resolved.escalationEnabled,
-            riskCategoryHint(riskCategories, bypassed),
-          )
-        }
-
-        if (
-          rejectionAtStart &&
-          sessionState.lastRejected?.generation === rejectionAtStart.generation
-        ) {
-          sessionState.lastRejected = undefined
-        }
-        // Re-run slow-command soft check after dynamic ALLOW to avoid FN via static
-        // ASK -> dynamic ALLOW path. Must run before caching so soft-blocked
-        // commands do not pollute the ALLOW cache.
-        maybeBlockSlow(script, input, shell, cwd, worktree, bypassed)
-        if (
-          !(await applyPostChecks(script, input, staticDecision, shell, {
-            sessionID,
-            bypassedCategories: bypassed,
-            privilegeHostDirect,
-          }))
-        ) {
-          rejectStatic(sessionID, sessionState, script, "Local script changed after review", staticDecision.rules)
-        }
-        if (cacheKey) {
-          assessmentReports.put(
-            buildReport({
-              key: cacheKey,
-              sessionID,
-              command: script,
-              cwd,
-              worktree,
-              shell,
-              decision: "allow",
-              categories: cloudReview.categories,
-              secondaryCategories: cloudReview.secondary_categories,
-              source: "model_decision",
-              evidence: collectedEvidence,
-              missingEvidence,
-            }),
-          )
-        }
-        return
-      }
-
-      // Consecutive dynamic review failure tracking for TUI notification (3 times)
-      if (!cloudReview && !dynamicBypassed && reviewerAvailable() && reviewError) {
-        await maybeNotifyDynamicConsecutiveFailures(sessionID, reviewError)
-      }
-
-      const failReason = agentFacingReviewReason(reviewError?.message ?? "Dynamic review failed")
-
-      // Fail routing (HARD only): a protocol-class ReviewError (oversized payload,
-      // bad auditor shape/exit, mandatory-inspection violation) is an UNCONDITIONAL
-      // fail-close — a defensive failure must close the gate regardless of
-      // failPolicy. LOOSE performs no protocol special-casing: the auditor never
-      // enforces mandatory inspection under LOOSE (auditor.py gates that check on
-      // POLICY == "HARD"), and every review failure — protocol or infra — simply
-      // honors the configured failPolicy. An infra-class error (HTTP/network) or
-      // any unknown non-ReviewError honors the configured failPolicy in both modes.
-      const protocolViolation = reviewError instanceof ReviewError && reviewError.kind === "protocol"
-      if (protocolViolation && strictPolicy) {
-        // HARD + protocol: trip the prompt-injection detector when a reviewer
-        // endpoint is configured. The detector is a tripwire on top of the
-        // unconditional deny, not a replacement for it.
-        const endpoint = resolved.dynamicReview.endpoint ?? ""
-        const model = resolved.dynamicReview.model ?? ""
-        const apiKey = resolved.dynamicReview.apiKey ?? ""
-        if (endpoint && model && apiKey) {
-          // Reconstruct the exact JSON the auditor received so the detector judges
-          // the real payload (reviewer.ts stringifies the same requestForPolicy
-          // shape). The recovered transcript is added as secondary context.
-          const reviewJson = JSON.stringify(
-            requestForPolicy(normalizeReviewRequest(reviewRequest), resolved.strictness),
-          )
-          const transcript = reviewError instanceof ReviewError ? reviewError.transcript : undefined
-          let detector: { injection: boolean; evidence?: string } | undefined
-          try {
-            detector = await detectInjection(
-              { reviewJson, transcript },
-              { endpoint, model, apiKey, timeoutMs: resolved.dynamicReview.timeoutMs },
-            )
-          } catch {
-            // The detector never becomes a false allow: treat like fail_close.
-            detector = undefined
-          }
-          if (detector && detector.injection === true) {
-            recordRejection(sessionState, {
-              command: script,
-              reason: "Prompt injection detected in command or review data",
-              classifier: "FAIL_POLICY",
-            })
-            scheduleAbort(sessionID)
-            // Fire-and-forget the alert: awaiting it here could outlast the 100ms
-            // abort delay, letting STEP_INTERRUPTED overwrite this block reason.
-            void run(
-              ctx.session.synthetic({
-                sessionID,
-                text: "opencode-v2-security: prompt injection detected in command or review data; command denied and session interrupted.",
-                description: "Prompt injection detected; command denied and session interrupted.",
-                metadata: { source: "opencode-v2-security-injection-detector" },
-                resume: false,
-                delivery: "steer",
-              }),
-            ).catch(() => {})
-            throw blockMessage(
-              "policy",
-              "Prompt injection detected in command or review data",
-              true,
-              staticDecision.rules,
-              script,
-              claimEscalationGuidance(sessionID),
-              resolved.escalationEnabled,
-            )
-          }
-          if (detector === undefined) {
-            recordRejection(sessionState, {
-              command: script,
-              reason: failReason,
-              classifier: "FAIL_POLICY",
-            })
-            throw failClosedBlock(
-              `${failReason} (injection detector unavailable; fail-close)`,
-              strictPolicy,
-              staticDecision.rules,
-              script,
-              claimEscalationGuidance(sessionID),
-              resolved.escalationEnabled,
-            )
-          }
-          // detector === { injection: false } → still unconditional fail-close.
-        }
-        recordRejection(sessionState, { command: script, reason: failReason, classifier: "FAIL_POLICY" })
-        throw failClosedBlock(
-          failReason,
-          strictPolicy,
-          staticDecision.rules,
-          script,
-          claimEscalationGuidance(sessionID),
-          resolved.escalationEnabled,
-        )
-      }
-
-      // infra ReviewError or unknown non-ReviewError → honor failPolicy —
-      // except a pending static DENY: the static verdict is absolute, so an
-      // unavailable/failed reviewer (and fail_open) can never release it.
-      // Without the model the denial still carries the static rules' own
-      // category footprint — the honest rule-shaped hint, never widened by
-      // guessed categories.
-      if (staticDenyPending) {
-        rejectStatic(
-          sessionID,
-          sessionState,
-          script,
-          staticDecision.reason,
-          staticDecision.rules,
-          riskCategoryHint(rulesHintCategories(staticDecision.rules), bypassed),
-        )
-      }
-
-      // infra ReviewError or unknown non-ReviewError → honor failPolicy.
-      // An armed `dynamic` bypass always behaves as "reviewer unavailable +
-      // fail_open" regardless of the configured failPolicy (fix F2): the
-      // user asked for the layer to be off, so the command proceeds once the
-      // static and permission layers have passed.
-      if (effectiveFailPolicy === "fail_open" || dynamicBypassed) {
-        // Even on fail_open, still soft-enforce slow-command for default-timeout high-resource commands.
-        maybeBlockSlow(script, input, shell, cwd, worktree, bypassed)
-        if (
-          !(await applyPostChecks(script, input, staticDecision, shell, {
-            sessionID,
-            bypassedCategories: bypassed,
-            privilegeHostDirect,
-          }))
-        ) {
-          rejectStatic(sessionID, sessionState, script, "Local script changed after review", staticDecision.rules)
-        }
-        return
-      }
-      // fail_close.
-      recordRejection(sessionState, {
-        command: script,
-        reason: failReason,
-        classifier: "FAIL_POLICY",
-      })
-      throw failClosedBlock(
-        failReason,
-        strictPolicy,
-        staticDecision.rules,
-        script,
-        claimEscalationGuidance(sessionID),
-        resolved.escalationEnabled,
-      )
     }
 
+    // Wrap only the captured executable definitions. No hook-name heuristic
+    // can accidentally pull a codemode/MCP/custom/Windows tool into this chain.
+    if (process.platform === "linux") {
+      if (!ctx.tool.transform) return yield* Effect.die(new Error("Native Linux boundaries require tool.transform"))
+      yield* ctx.tool.transform((editor) => {
+        if (!editor.list) throw new Error("Native Linux boundaries require ToolEditor.list")
+        const entries = editor.list()
+        directSubagent = entries.some((entry) => entry.id === "subagent" && entry.name === "subagent" &&
+          entry.options?.codemode === false && entry.options.namespace === undefined)
+        for (const entry of entries) {
+          if (!isBoundaryTool(entry)) continue
+          editor.update(entry.id!, (tool) => {
+            const original = tool.execute
+            if (!original) throw new Error("Native Linux tool is missing its executor")
+            const name = entry.name as NativeBoundaryTool
+            tool.execute = (input, call) => {
+              const token = {}
+              const key = boundaryKey(call)
+              return Effect.gen(function* () {
+                const prepared = yield* Effect.tryPromise({
+                  try: (signal) => runBoundaryBefore(name, input, call, token, signal),
+                  catch: toRejection,
+                })
+                const result = yield* original(prepared.input, call)
+                const shellResult = result && typeof result === "object" ? (result as { output?: { exit?: number; status?: string } }).output : undefined
+                // Only a runtime-watched shell may keep its authorization +
+                // broker past the tool return: for every other route the
+                // approval stays scoped to this call. Letting a plain
+                // background shell retain `boundaryCalls` would leak an
+                // unrestrained grant.
+                prepared.authorization.background = name === "shell" &&
+                  shellResult?.status === "running" &&
+                  prepared.authorization.runtimeBroker !== undefined
+                if (!prepared.authorization.background) {
+                  yield* Effect.promise(() => recordCallCacheOutcome(prepared.authorization,
+                    name === "shell" ? shellResult?.exit : 0).catch(() => {}))
+                } else {
+                  // A completed Promise also handles very short jobs whose
+                  // terminal notification preceded this background result.
+                  void prepared.authorization.runtimeBroker?.finished.then(async ({ exit }) => {
+                    await recordCallCacheOutcome(prepared.authorization, exit).catch(() => {})
+                    if (boundaryCalls.get(key)?.token === token) boundaryCalls.delete(key)
+                    await prepared.authorization.runtimeBroker?.close()
+                  }).catch(() => {})
+                }
+                if (!result || typeof result !== "object") return result
+                const value = result as { output?: unknown; content?: unknown; metadata?: Record<string, unknown> }
+                const output = value.output && typeof value.output === "object" ? value.output as Record<string, unknown> : undefined
+                // Exclude our own pre-spawn denial text: a nested tool
+                // call's "Command blocked … The whole command was not run."
+                // output must not be dressed up as a post-launch OS error.
+                const runtimeRefusal = prepared.authorization.runtimeBlocked
+                  ? runtimeBlockedText(prepared.authorization.runtimeBlocked,
+                      prepared.authorization.runtimeBlockedPhase === "entry") : undefined
+                const accessError = !runtimeRefusal && name === "shell" && output && output.exit !== 0 &&
+                  typeof output.output === "string" && !output.output.includes("The whole command was not run.") &&
+                  /permission denied|read-only file system|device or resource busy|cross-device link|\bEACCES\b|\bEPERM\b|sudo:|bwrap:|opencode-sandbox:/i.test(output.output)
+                // Post-launch OS errors keep their raw output; the appended
+                // note (agent-messages.ts) only explains that this is an OS
+                // result, not a plugin block — never a retry hint.
+                const notice = runtimeRefusal ?? accessErrorNote(prepared.authorization.executionRoute === "host_direct_reviewed")
+                const appendNotice = !!runtimeRefusal || accessError
+                return {
+                  ...value,
+                  ...(appendNotice ? {
+                    output: { ...output, output: `${output!.output}\n\n${notice}` },
+                    content: typeof value.content === "string" ? `${value.content}\n\n${notice}`
+                      : [...(Array.isArray(value.content) ? value.content : []), { type: "text", text: notice }],
+                  } : {}),
+                  metadata: {
+                    ...value.metadata,
+                    boundary: {
+                      source: prepared.authorization.source,
+                      policyVersion: EFFECTS_POLICY_VERSION,
+                      automaticRuntimeRetry: false,
+                      ...(prepared.authorization.executionRoute
+                        ? { executionRoute: prepared.authorization.executionRoute }
+                        : {}),
+                       ...(accessError ? { runtimeAccessError: true } : {}),
+                       ...(runtimeRefusal ? { runtimeBlocked: true } : {}),
+                       // Copy by value + mark finality: for a background
+                       // command the counters keep mutating under the live
+                       // broker; the host must not stamp mid-flight stats as
+                       // final on the already-returned result.
+                       ...(prepared.authorization.runtimeStats ? { runtimeStats: {
+                           ...prepared.authorization.runtimeStats,
+                           final: !prepared.authorization.background } } : {}),
+                    },
+                  },
+                }
+              }).pipe(Effect.ensuring(Effect.promise(async () => {
+                const authorization = boundaryCalls.get(key)
+                if (authorization?.token !== token) return
+                if (authorization.background) return
+                boundaryCalls.delete(key)
+                await authorization.runtimeBroker?.close()
+              })))
+            }
+          })
+        }
+      })
+    }
     yield* ctx.tool.hook("execute.before", (ev: ExecuteBeforeEvent) =>
-      Effect.tryPromise({ try: () => runBefore(ev), catch: toRejection }),
+      // Admission for native boundary tools lives entirely in the wrapped
+      // executor (runBoundaryBefore); this hook only carries the optional
+      // subagent `permission` ceiling bookkeeping.
+      process.platform === "linux" && directSubagent && ev.tool === "subagent"
+        ? Effect.tryPromise({ try: () => runBefore(ev), catch: toRejection })
+        : Effect.void,
     )
 
     // --- 3. failure recording (v1 tool.execute.after) -----------------------
     // execute.after failure channel is `never`: any exception is swallowed so a
     // post-check error never fails the tool step.
     async function runAfter(ev: ExecuteAfterEvent): Promise<void> {
+      // A mode change during a run reaches the model with the next completed
+      // tool result instead of waiting for the next user prompt. Prepended:
+      // the host truncates long results from the tail.
+      if (ev.status === "completed" && ev.result) {
+        const notice = sessionNotices.takeForToolResult(ev.sessionID)
+        if (notice) ev.result.content = [{ type: "text", text: notice }, ...toolResultContent(ev.result)]
+      }
       // Only the tool result identifies a spawn's child authoritatively.
-      // Finish existing bookkeeping even if the user armed ALL mid-call.
       if (ev.tool === "subagent") {
         const stash = permStash.get(ev.id)
-        if (ev.status === "completed" && stash) {
+        if (stash) {
+          // Consume the stash on EVERY outcome — completed, failed or
+          // cancelled: a leftover declaration would keep tightening (and
+          // barrier-ing) later siblings it was never declared for.
+          permStash.delete(ev.id)
           const rawOutput = ev.result?.output
           const childID =
             (typeof ev.result?.metadata?.sessionID === "string" && ev.result.metadata.sessionID) ||
@@ -3615,66 +2673,31 @@ const plugin: Plugin = {
               ? ((rawOutput as Record<string, unknown>).sessionID as string)
               : undefined)
           if (childID) {
-            // Keep real child restrictions, but never persist a speculative
-            // intersection with a sibling's declaration. Ancestry caps live.
+            // Bind whenever the result names the child — even on a
+            // non-completed status the child exists and was created under
+            // the declared ceiling. Keep real child restrictions, but never
+            // persist a speculative intersection with a sibling's
+            // declaration. Ancestry caps live.
             const childPerm = permIntersect(sessionPerms.get(childID) ?? PERM_FULL, stash.perm)
             sessionPerms.set(childID, childPerm)
             permParent.set(childID, stash.parentSessionID)
             permBoundChildren.add(childID)
-            permStash.delete(ev.id)
-            syncPermReminder(childID)
-            emitPermChanged(childID, "spawned")
+            if (stash.declared) explicitNoBypass.add(childID)
+            notifySecurityState(childID, "updated", "spawned")
+          }
+          // The stash no longer tightens (or barriers) this parent's still-
+          // unbound children — refresh their notices and RPC snapshots so
+          // nothing keeps showing the now-consumed declaration's effects.
+          for (const [child, parent] of permParent) {
+            if (parent !== stash.parentSessionID || permBoundChildren.has(child) || child === childID) continue
+            syncSecurityNotice(child)
+            emitPermChanged(child, "updated")
+            emitBypassChanged(child, "updated")
           }
         }
       }
-      if (allBypassed(ev.sessionID)) return
-      if ((ev.tool !== "shell" && ev.tool !== "bash") || !resolved.securityEnabled) return
-      // A failed tool call carries no result; v1 read undefined metadata and
-      // returned early — same behavior.
-      if (ev.status !== "completed") return
-
-      const sessionID = ev.sessionID
-      const sessionState = getSessionState(sessionID)
-      const metadata = ev.result?.metadata
-
-      // v2 shell result metadata = { truncated, exit?, shellID?, timeout? }
-      // (verified in packages/core/src/tool/plugin/shell.ts). `exitCode` is
-      // kept as a defensive fallback for other shells/v1-shaped metadata.
-      const rawExit = metadata?.exit ?? metadata?.exitCode
-      const exitCode = typeof rawExit === "number" ? rawExit : undefined
-      if (exitCode === undefined) return
-
-      if (exitCode === 0) {
-        if (sessionState.lastFailed?.consumedBy === ev.id) {
-          sessionState.lastFailed = undefined
-        }
-        return
-      }
-
-      if (!strictPolicy) return
-
-      // Strip the sandbox marker (if any) so the stored/displayed command is
-      // the real script, not the instrumented spawn payload.
-      const command = stripSandboxMarker(commandFromArgs(ev.input) ?? "")
-      // H2: v2's result.output is a structured object ({ output, cursor, size,
-      // truncated }), not a bare string — extract the text defensively.
-      const rawOutput = ev.result?.output
-      const outputText =
-        typeof rawOutput === "string"
-          ? rawOutput
-          : rawOutput &&
-              typeof rawOutput === "object" &&
-              typeof (rawOutput as Record<string, unknown>).output === "string"
-            ? ((rawOutput as Record<string, unknown>).output as string)
-            : ""
-      sessionState.lastFailed = {
-        value: {
-          command,
-          exitCode,
-          outputTail: sanitizeOutputTail(outputText),
-        },
-        generation: nextGeneration(sessionState),
-      }
+      // Legacy shell failure caches/HARD interrupts do not participate in the
+      // new pipeline, and excluded tools must not be inspected here.
     }
 
     yield* ctx.tool.hook("execute.after", (ev: ExecuteAfterEvent) =>
@@ -3707,19 +2730,19 @@ const plugin: Plugin = {
             const sessionID = e?.data?.sessionID
             if (e?.type === "session.deleted") {
               if (typeof sessionID === "string") {
-                deleteSessionState(sessionID)
                 bypassLeases.delete(sessionID)
                 bypassParent.delete(sessionID)
                 sessionPerms.delete(sessionID)
                 permParent.delete(sessionID)
+                permCreatedAt.delete(sessionID)
                 permBoundChildren.delete(sessionID)
                 permKnownRoots.delete(sessionID)
                 permUnresolved.delete(sessionID)
-                escalationFailures.delete(sessionID)
-                escalationPending.delete(sessionID)
-                escalationGuideShown.delete(sessionID)
-                sessionNotices.clear(sessionID)
-                assessmentReports.invalidateSession(sessionID)
+                explicitNoBypass.delete(sessionID)
+                 sessionNotices.clear(sessionID)
+                 approvalCache.clear(sessionID)
+                 securityBases.delete(sessionID)
+                 securityEpochs.delete(sessionID)
                 for (const [child, parent] of permParent) {
                   if (parent === sessionID) permParent.delete(child)
                 }
@@ -3734,35 +2757,22 @@ const plugin: Plugin = {
               }
               return
             }
-            // A completed compaction replaces the model-visible context, so
-            // the next classifier block must be able to carry the full
-            // escalation guide again. `session.compaction.ended` is the
-            // durable completion event ({ type, data: { sessionID, reason,
-            // text, recent } }, verified in
-            // packages/schema/src/session-event.ts; published by core
-            // session compaction). `session.compacted` is accepted as a
-            // compatible alias declared in the schema manifest. A failed
-            // compaction does NOT reset — the context was not replaced.
-            if (e?.type === "session.compaction.ended" || e?.type === "session.compacted") {
-              if (typeof sessionID === "string") escalationGuideShown.delete(sessionID)
-              return
-            }
             if (e?.type === "session.created") {
               const parentID = e.data?.parentID
-              if (typeof sessionID === "string" && typeof parentID === "string" && parentID) {
-                permParent.set(sessionID, parentID)
-              }
-              if (
-                resolved.bypassPropagateToSubagents &&
-                typeof sessionID === "string" &&
-                typeof parentID === "string" &&
-                parentID
-              ) {
-                bypassParent.set(sessionID, parentID)
-                // The child is a fresh session without the parent's reminder in
-                // its history; append one so a subagent doing the shell work is
-                // warned too. Link is set first so activeBypass sees the parent.
-                if (hasLiveLease(sessionID)) syncAgentReminder(sessionID)
+              if (typeof sessionID === "string") {
+                // Creation time gates which pending spawn declarations can
+                // belong to this child (effectivePerm/pendingDeclaredSpawn
+                // apply a stash entry only when entry.at <= createdAt).
+                permCreatedAt.set(sessionID, Date.now())
+                if (typeof parentID === "string" && parentID) {
+                  permParent.set(sessionID, parentID)
+                  if (resolved.bypassPropagateToSubagents) bypassParent.set(sessionID, parentID)
+                }
+                // A fresh session has no notice yet — publish its effective
+                // state (inherited lease, pending declared cap, or a clean
+                // default) regardless of the propagate flag. Links are set
+                // first so the effective readers see the parent.
+                syncSecurityNotice(sessionID)
               }
               return
             }
@@ -3778,18 +2788,26 @@ const plugin: Plugin = {
     if (ctx.rpc)
       bypassRpc = yield* ctx.rpc.register(BypassRpc, {
         status: (input: { sessionID: string }) =>
-          Effect.sync(() => {
-            // ONE clock capture for the whole snapshot: active, ALL and
-            // expiresAt must describe the same instant (see emitBypassChanged).
+          Effect.promise(async () => {
+            // Hydrate the chain first: the effective ceiling/mode (and any
+            // inherited clamp) is only accurate once the ancestor links are
+            // known — a status pull must never report a stale-lifted baseline.
+            // ONE clock capture for the whole snapshot, the hydration's notice
+            // sync included: active, ALL and expiresAt must describe the same
+            // instant (see emitBypassChanged).
             const now = Date.now()
+            await hydratePermAncestry(input.sessionID, now)
             const active = activeForRpc(input.sessionID, now)
             const result: Record<string, unknown> = {
               sessionID: input.sessionID,
-              permission: permLabel(effectivePerm(input.sessionID)),
+              permission: permLabel(effectivePerm(input.sessionID, now)),
+              mode: effectiveMode(input.sessionID, now),
               active,
               temporary: active.filter((category) => !resolved.bypassClassifier.has(category as BypassCategory)),
               permanent: [...resolved.bypassClassifier].sort(),
             }
+            const custom = activeCustomBypass(input.sessionID, now)
+            if (custom.length > 0) result.custom = custom
             // Same optional-presence rule as the `changed` event: a present
             // `expiresAt: undefined` fails the output schema; omit the key
             // when no live lease exists, keep `null` for a never-expiring one.
@@ -3798,7 +2816,6 @@ const plugin: Plugin = {
             return result
           }),
       })
-
     // --- 8c. lease expiry sweep ---------------------------------------------
     // Lease pruning is otherwise lazy (activeBypass merely skips expired
     // entries), so without a timer the expiry transition — the agent reminder
@@ -3818,32 +2835,90 @@ const plugin: Plugin = {
     // channel, every tool's action flows through it), the classifier's
     // permScope fallback for write-shaped shell segments, and the
     // set_permission native tool. All transitions are transitions-notified:
-    // the agent sees a synthetic reminder, the user an RPC event.
+    // the agent gets an append-only user notice, the user an RPC event.
 
-    // Action → required bit. A missing bit hard-denies the action before the
-    // tool runs; we never upgrade a computed effect, only tighten it. Actions
-    // absent from the map (MCP tools assert composed `${server}_${tool}`
-    // names) fall back to the write bit unless deliberately ungated — RO
-    // sessions therefore deny the whole MCP class.
+    // Only an active native wrapper may authorize a permission hook. Unknown
+    // actions, MCP, other direct tools, Code Mode and Windows stay untouched.
+    // An explicit host/config deny remains final; ask is resolved without UI.
     if (ctx.permission) {
       yield* ctx.permission.hook("evaluate", (ev: PermissionEvalEvent) =>
         Effect.promise(async () => {
+          if (process.platform !== "linux" || !ev.source) return
+          const authorization = boundaryCalls.get(boundaryKey({ sessionID: ev.sessionID, ...ev.source }))
+          if (!authorization || ev.effect === "deny") return
           await hydratePermAncestry(ev.sessionID)
-          // Kill switch: the permission action gates are part of plugin
-          // enforcement and stay silent while `all` is armed.
-          if (allBypassed(ev.sessionID)) return
-          const required =
-            requiredPermBit(ev.action, resolved.permission.actionPerm) ??
-            (resolved.permission.gateUnknownActions || permUnresolved.has(ev.sessionID)
-              ? fallbackPermBit(ev.action, { ungated: resolved.permission.ungatedActions })
-              : undefined)
-          if (!required) return
+          // A real tool may assert several times in one call
+          // (external_directory + edit, multi-file patches). Once the first
+          // assert was allowed, earlier steps may already have run — a later
+          // denial must not claim the whole command never ran.
+          const deny = (reason: string, advice?: string) => {
+            ev.effect = "deny"
+            ev.message = authorization.asserted ? actionBlockedText(reason) : blockedText(reason, advice)
+          }
+          // Last gate before the action runs: the admission was computed
+          // against a security snapshot (effective r/w ceiling + mode +
+          // bypass lease). If the user reverted it mid-flight — e.g. Auto →
+          // ReadOnly while the review was pending — the wrapped admission is
+          // stale and the action must not run, even when the shell command's
+          // writes were never enumerable.
+          if (securitySnapshotFor(ev.sessionID) !== authorization.securitySnapshot) {
+            deny("the session's security mode changed while this command was being checked", RECHECK)
+            return
+          }
+          const expected = authorization.tool === "shell" ? "shell"
+            : ["write", "edit", "patch"].includes(authorization.tool) ? "edit" : authorization.tool
+          if (ev.action !== expected && ev.action !== "external_directory") {
+            deny(`the tool requested an unexpected permission (${ev.action}) that was not part of this call's check`)
+            return
+          }
+          const required = requiredPermBit(ev.action, resolved.permission.actionPerm)
           const perm = effectivePerm(ev.sessionID)
-          if (perm[required]) return
-          ev.effect = "deny"
-          ev.message =
-            `Session permission ${permLabel(perm)} lacks '${required}' (action: ${ev.action}). ` +
-            `The user can restore it with /perm rw.`
+          // A temp-only ReadOnly file write still passes through the plan's
+          // exact resource check below; the snapshot check above already
+          // rescinds it if the mode changed.
+          const tempOnlyWrite = required === "w" && authorization.tempOnlyWrite === true && ev.action === "edit"
+          if (required && !perm[required] && !tempOnlyWrite) {
+            const unresolved = required === "w" && ancestryUnresolved(ev.sessionID)
+            const mode = securityModeFor(perm, allBypassed(ev.sessionID))
+            deny(
+              unresolved
+                ? "the plugin could not verify this session's parent sessions, so write actions are blocked for now"
+                : mode === "readonly"
+                  ? required === "w"
+                    ? "this session is in [Read only] mode: write, edit, move and delete actions are blocked"
+                    : "this session is in [Read only] mode: native file reads are blocked"
+                  : `the session permission ceiling does not allow '${required}' actions`,
+              unresolved ? RETRY_LATER : undefined,
+            )
+            return
+          }
+          const plan = authorization.filePlan
+          if (plan) {
+            const resources = new Set(plan.targets.flatMap((target) => ev.action === "external_directory"
+              ? [path.join(path.dirname(target.absolute), "*"), path.join(target.absolute, "*")]
+              : [target.absolute, target.resolved, path.relative(authorization.cwd, target.absolute) || "."]))
+            if (ev.action === authorization.tool && plan.searchPattern !== undefined) {
+              resources.clear()
+              resources.add(plan.searchPattern)
+            }
+            if (ev.resources.some((resource) => !resources.has(resource))) {
+              deny("the tool tried to use a path that was not part of this call's check")
+              return
+            }
+            try { await verifyFileBoundaryPlan(plan) } catch (error) {
+              deny(
+                error instanceof BoundaryPreparationError
+                  ? error.agentReason
+                  : "a reviewed target changed after admission; this call's authorization is no longer valid",
+                RECHECK,
+              )
+              return
+            }
+          }
+          // The first allowed assert marks the call partially runnable:
+          // later denies of the same call use the action-level wording.
+          authorization.asserted = true
+          ev.effect = "allow"
         }),
       )
     }
@@ -3857,17 +2932,17 @@ const plugin: Plugin = {
           name: "set_permission",
           options: { codemode: false },
           description: [
-            "Restrict a direct subagent session's permission ceiling.",
-            "The permission string is r/w only: 'ro'/'r--'/4, 'rw'/'rw-'/6, 'w'/2, or 'none'/'0'. x inputs (x/rx/wx/rwx, octal 1/3/5/7) are rejected — x cannot be set; it is always on and only shown in the label.",
-            "The operation only tightens: the new set must be a subset of the child session's current effective set. Use it to lock a spawned subagent down when delegating risky work.",
-            "sessionID must name a direct child session of this session.",
-          ].join("\n"),
+            "Restrict a direct subagent's security mode.",
+            "Use readonly to block its writes, or auto to keep it out of Bypass mode.",
+            "This only tightens; it never widens. Only the user can select Bypass mode.",
+            "sessionID must be a direct child of this session.",
+          ].join(" "),
           input: {
             type: "object",
             properties: {
               permission: {
                 type: "string",
-                description: "Permission ceiling for the child session: 'ro'/4, 'rw'/6, 'w'/2, or 'none'/0.",
+                description: "Security mode for the child session: 'readonly' blocks its writes outside temporary directories; 'auto' keeps it out of Bypass mode. Tighten-only; Bypass mode is user-only.",
               },
               sessionID: {
                 type: "string",
@@ -3880,19 +2955,24 @@ const plugin: Plugin = {
             Effect.gen(function* () {
               const args = input as Record<string, unknown>
               const rawPerm = args.permission
-              const perm = typeof rawPerm === "string" || typeof rawPerm === "number"
-                ? parsePerm(String(rawPerm))
-                : undefined
-              if (!perm) {
+              const mode = typeof rawPerm === "string" ? parseSecurityMode(rawPerm) : undefined
+              if (mode === undefined || mode === "bypass") {
+                // Never echo the raw value back — it could carry something
+                // sensitive the agent pasted by accident.
                 return yield* Effect.fail(
-                  rejectionError(`Invalid permission "${String(rawPerm)}" (expected ro/4, rw/6, w/2, or none/0 — x cannot be set; it is always on and only shown in the label)`),
+                  rejectionError(
+                    permissionChangeRejectedText(
+                      `the permission argument must be "readonly" or "auto" (Bypass mode is user-only)`,
+                    ),
+                  ),
                 )
               }
+              const perm = permForMode(mode)
               const callerID = context.sessionID
               const targetID = typeof args.sessionID === "string" ? args.sessionID.trim() : ""
               if (!targetID) {
                 return yield* Effect.fail(
-                  rejectionError("sessionID is required: name the direct child session (ses_...) to restrict"),
+                  rejectionError(permissionChangeRejectedText("sessionID is required: name the direct child session to restrict")),
                 )
               }
 
@@ -3920,17 +3000,32 @@ const plugin: Plugin = {
                 }
               }
               if (failure === undefined) {
+                // The barrier must be in place BEFORE writeSessionPerm runs:
+                // its notice/RPC sync computes the effective mode, and
+                // without the barrier a parent's armed Bypass would still
+                // show through. Roll it back if the write fails so a
+                // rejected tighten leaves no state behind.
+                const hadBarrier = explicitNoBypass.has(targetID)
+                explicitNoBypass.add(targetID)
                 const result = writeSessionPerm(targetID, perm, false)
-                if (!result.ok) failure = result.error
+                if (!result.ok) {
+                  if (!hadBarrier) explicitNoBypass.delete(targetID)
+                  failure = result.error
+                } else {
+                  // The declared mode masked inherited Bypass: descendants'
+                  // effective state and the TUI badge move too.
+                  syncBypassDescendants(targetID)
+                  emitBypassChanged(targetID, "updated")
+                }
               }
               if (failure) {
-                return yield* Effect.fail(rejectionError(failure))
+                return yield* Effect.fail(rejectionError(permissionChangeRejectedText(failure)))
               }
               return {
                 content: [
                   {
                     type: "text",
-                    text: `Child session ${targetID} permission tightened to ${permLabel(effectivePerm(targetID))}.`,
+                    text: `Subagent ${targetID} is now in ${securityModeLabel(effectiveMode(targetID))}.`,
                   },
                 ],
                 metadata: { sessionID: targetID, permission: permLabel(effectivePerm(targetID)) },
@@ -3952,7 +3047,7 @@ const plugin: Plugin = {
             draft.update(id, (tool) => {
               tool.description =
                 (tool.description ?? "") +
-                "\nOptional `permission` argument ('ro'/4, 'rw'/6, 'w'/2, 'none'/0; x inputs rejected — x cannot be set; it is always on and only shown in the label): clamps the spawned subagent session's r/w ceiling; never widens past the caller's effective permission."
+                "\nOptional permission: readonly or auto. It sets the new subagent's security mode and can only tighten: the subagent never gets more than your current mode, and any declared value keeps it out of Bypass mode. Without it, the subagent inherits your current mode. Only the user can select Bypass mode."
               const input = tool.input
               if (input && typeof input === "object" && !Array.isArray(input)) {
                 const schema = input as { type?: string; properties?: Record<string, unknown> }
@@ -3960,7 +3055,7 @@ const plugin: Plugin = {
                   schema.properties.permission = {
                     type: "string",
                     description:
-                      "Permission ceiling for the spawned session ('ro'/4, 'rw'/6, 'w'/2, 'none'/0; x inputs rejected — x cannot be set; it is always on and only shown in the label). Can only tighten.",
+                      "Security mode for the spawned session: 'readonly' blocks its writes outside temporary directories; 'auto' keeps it out of Bypass mode. Can only tighten; Bypass mode is user-only.",
                   }
                 }
               }
@@ -3973,22 +3068,29 @@ const plugin: Plugin = {
     }
 
     // --- 8f. /perm server command --------------------------------------------
-    // User authority: may tighten or widen the target's baseline; the
-    // ancestor chain still caps the effective set, and an explicit sessionID
-    // must name a descendant. Arguments never reach the model; invalid input
-    // fails the command (the TUI turns it into a usage toast). Transitions
-    // notify via the synthetic agent reminder and the RPC `permission` event.
+    // User authority over the session's security mode and its r/w ceiling.
+    // Mode spellings: readonly|ro|r|read|... → ReadOnly, auto|rw|w|... →
+    // Auto, bypass|all|*|yolo → Bypass — the SAME transition as /bypass all
+    // (stash + lift this session's own baseline, arm the kill switch;
+    // ancestors still cap the effective set, so an RO ancestor clamps it to
+    // ReadOnly). Every other perm write is also a mode assertion: it disarms
+    // a locally armed Bypass mode first so the stashed baseline is restored.
+    // Arguments never reach the model; invalid input fails the command (the
+     // TUI turns it into a usage toast). Transitions append a user notice
+     // without waking the session, plus RPC `permission`/`changed` events.
     yield* ctx.command.transform((draft) => {
       draft.add({
         name: "perm",
         description:
-          "Set this session's permission ceiling: /perm <r|ro|4|w|2|rw|6|none|0> or bit ops +r -r +w -w +rw -rw [sessionID] — user authority (may widen; ancestors still cap)",
+          "Set this session's security mode or permission ceiling: /perm <readonly|ro|auto|rw|bypass|all|*|yolo|none|0> or bit ops +r -r +w -w +rw -rw [sessionID] — user authority (may widen; ancestors still cap)",
         execute: (input) =>
           Effect.gen(function* () {
             const sessionID = input.sessionID
             const tokens = (input.prompt?.text ?? "").split(/\s+/).filter(Boolean)
             const usage =
-              "Usage: /perm <r|ro|4|w|2|rw|6|none|0> or bit ops +r -r +w -w +rw -rw [sessionID] — x cannot be set; it is always on and only shown in the label; /perm rw restores full read/write."
+              "Usage: /perm <readonly|ro|auto|rw|bypass|all|none|0> or bit ops +r -r +w -w +rw -rw [sessionID] — " +
+              "readonly = [Read only], auto = [Auto mode], bypass = [Bypass mode] (same as /bypass all); " +
+              "x cannot be set; it is always on and only shown in the label."
             if (tokens.length === 0) {
               return yield* Effect.fail(new Error(usage))
             }
@@ -3998,6 +3100,7 @@ const plugin: Plugin = {
             let target = sessionID
             let working: Perm | undefined
             let sawPerm = false
+            let sawBypassMode = false
             for (const token of tokens) {
               const lower = token.toLowerCase()
               if (/^[+-][rwx]+$/.test(lower)) {
@@ -4013,14 +3116,17 @@ const plugin: Plugin = {
                 sawPerm = true
                 continue
               }
+              // Bypass-mode tokens are a mode transition, not a ceiling value.
+              if (parseSecurityMode(token) === "bypass") {
+                sawBypassMode = true
+                continue
+              }
               const absolute = parsePerm(token)
               if (absolute) {
-                if (sawPerm && working !== undefined) {
-                  // Mixed absolute+ops: the last operation wins, applied in order.
-                  working = absolute
-                } else {
-                  working = absolute
-                }
+                // The last absolute perm token wins (mixed absolute+ops apply
+                // in order). readonly/auto spellings land here — they are
+                // exactly permForMode(readonly|auto).
+                working = absolute
                 sawPerm = true
                 continue
               }
@@ -4032,17 +3138,42 @@ const plugin: Plugin = {
               // Anything else is a candidate sessionID.
               target = token
             }
-            if (!sawPerm || working === undefined) {
+            if (sawBypassMode && sawPerm) {
               return yield* Effect.fail(new Error(usage))
             }
+            // Hydrate the target's ancestry so the descendant check (and the
+            // clamp the transition observes) is authoritative.
+            yield* Effect.promise(() => hydratePermAncestry(target))
             if (target !== sessionID && !isPermDescendant(sessionID, target)) {
               return yield* Effect.fail(new Error(`Session ${target} is not a descendant of this session`))
             }
+            if (sawBypassMode) {
+              applyUserSecurityMode(target, "bypass")
+              return
+            }
+            if (!sawPerm || working === undefined) {
+              return yield* Effect.fail(new Error(usage))
+            }
+            // An explicit perm write is an assertion of a non-Bypass surface:
+            // disarm a locally armed kill switch first so the stashed
+            // pre-Bypass baseline is restored before the new one lands. The
+            // write is also an inheritance barrier — the session must not
+            // observe an ancestor's armed Bypass mode after the user
+            // explicitly set its ceiling.
+            const lease = bypassLeases.get(target)
+            const disarmed = lease?.all === true
+            if (disarmed) setBypassKillSwitch(target, false)
+            explicitNoBypass.add(target)
             const result = writeSessionPerm(target, working, true)
             if (!result.ok) {
               return yield* Effect.fail(new Error(result.error ?? "Permission could not be applied"))
             }
-          }),
+            if (disarmed) {
+              syncSecurityNotice(target)
+              syncBypassDescendants(target)
+              emitBypassChanged(target, "updated")
+            }
+          }).pipe(Effect.ensuring(Effect.promise(() => sessionNotices.flush()))),
       })
     })
 
@@ -4052,19 +3183,19 @@ const plugin: Plugin = {
     // never reach the model. State changes live only in this plugin process
     // (see bypassLeases). Invalid input fails the command, which the TUI turns
     // into an error toast carrying the usage. The agent is told of effective-set
-    // transitions via an appended synthetic user message (except the `slow`
+     // transitions via an append-only user notice (except the `slow`
     // category, which never notifies the agent); the user, via the RPC event.
     //   /bypass <cat...>        arm categories (additive; space or comma separated)
     //   /bypass <cat...> 120    arm with a 120-second absolute timeout
     //   /bypass <cat...> 0      arm with no natural expiry (until /bypass off)
-    //   /bypass *               arm every category in BYPASS_CATEGORIES
-    //   /bypass all             session kill switch: ALL plugin enforcement off
-    //   /bypass off             clear the session's lease, including the kill switch
+    //   /bypass all|*|ALL|yolo  Bypass mode: every plugin check skipped for
+    //                           this session (same transition as /perm bypass)
+    //   /bypass off             clear the session's lease, including the mode
     yield* ctx.command.transform((draft) => {
       draft.add({
         name: "bypass",
         description:
-           `Toggle/arm bypass categories for this session (${BYPASS_CATEGORIES.join("|")}; legacy: fs=filesystem, os=host+privilege+indirection, web=network+remote; '*'|all=all categories, uppercase ALL=kill switch that disables all plugin enforcement — prefer specific categories when possible, off/0=clear; +token arms, -token disarms, bare token toggles; a trailing number is the timeout in seconds — absolute deadline, activity never extends it, <=0=no natural expiry)`,
+           `Toggle/arm bypass categories for this session (${BYPASS_CATEGORIES.join("|")}; legacy: fs=filesystem, os=host+privilege+indirection, web=network+remote; all/*/ALL/yolo = Bypass mode — all plugin checks skipped for this session, the permission ceiling still applies; prefer specific categories when possible; off/0=clear; +token arms, -token disarms, bare token toggles; a trailing number is the timeout in seconds — absolute deadline, activity never extends it, <=0=no natural expiry)`,
         execute: (input) =>
           Effect.gen(function* () {
             const sessionID = input.sessionID
@@ -4076,29 +3207,50 @@ const plugin: Plugin = {
             // and the user toast's armed/updated label reflects it too.
             const snapshot = activeBypass(sessionID)
             const snapshotAll = allBypassed(sessionID)
-            const wasActive = snapshot.size > 0 || snapshotAll
-            let reason = "status"
+            const snapshotCustom = activeCustomBypass(sessionID)
+            const wasActive = snapshot.size > 0 || snapshotAll || snapshotCustom.length > 0
+            let baselineTouched = false
+            // The mode transition notifies once itself; the handler must not
+            // emit a second `changed` toast for the same transition.
+            let modeTransitionNotified = false
             for (const op of args.ops) {
               if (op.kind === "clear") {
-                // Clearing removes the whole lease: categories AND the ALL
-                // kill switch.
-                if (bypassLeases.delete(sessionID)) reason = "cleared"
+                // Clearing ends the whole lease: categories, custom scopes AND
+                // the Bypass kill switch — with the stashed pre-Bypass
+                // baseline restored (lease lifetime rule).
+                const lease = bypassLeases.get(sessionID)
+                if (lease) {
+                  expireLease(sessionID, lease)
+                  baselineTouched = baselineTouched || lease.all === true
+                }
                 continue
               }
               if (op.kind === "killSwitch") {
                 const act = op.action === "toggle" ? (snapshotAll ? "disarm" : "arm") : op.action
-                if (act === "arm") armBypassAll(sessionID, args.timeoutSec)
-                else {
-                  const lease = bypassLeases.get(sessionID)
-                  if (lease) bypassLeases.set(sessionID, { ...lease, all: false })
+                if (act === "arm") {
+                  applyUserSecurityMode(sessionID, "bypass", args.timeoutSec)
+                  modeTransitionNotified = true
+                } else {
+                  setBypassKillSwitch(sessionID, false)
                 }
-                reason = wasActive ? "updated" : "armed"
+                baselineTouched = true
+                continue
+              }
+              if (op.kind === "custom") {
+                const prior = bypassLeases.get(sessionID)
+                bypassLeases.set(sessionID, {
+                  categories: new Set(prior?.categories ?? []),
+                  all: prior?.all,
+                  custom: [...new Set([...(prior?.custom ?? []), op.text])],
+                  expiresAt: bypassExpiry(args.timeoutSec),
+                  restoreBaseline: prior?.all === true ? prior.restoreBaseline : undefined,
+                })
                 continue
               }
               // Category op: the target set starts from the session's current
               // active set (own lease plus inherited parents) so a second
               // invocation keeps previously armed categories.
-              const targets: BypassCategory[] = op.which === "allCategories" ? [...BYPASS_CATEGORIES] : [...op.which]
+              const targets: BypassCategory[] = [...op.which]
               const act = op.action === "toggle"
                 ? (targets.every((t) => snapshot.has(t)) ? "disarm" : "arm")
                 : op.action
@@ -4106,7 +3258,6 @@ const plugin: Plugin = {
               if (act === "arm") for (const c of targets) next.add(c)
               else for (const c of targets) next.delete(c)
               armBypassLease(sessionID, next, args.timeoutSec)
-              reason = wasActive ? "updated" : "armed"
             }
             // The timeout applies to the session's overall lease: it can
             // re-point the expiry of an existing lease, and an arm without a
@@ -4121,23 +3272,36 @@ const plugin: Plugin = {
                 )
               }
               bypassLeases.set(sessionID, { ...lease, expiresAt: bypassExpiry(args.timeoutSec) })
-              reason = wasActive ? "updated" : "armed"
             }
             wakeBypassSweep()
-            syncAgentReminder(sessionID)
-            if (!allBypassed(sessionID)) syncPermReminder(sessionID)
-            emitBypassChanged(sessionID, reason)
-          }),
+            const nowActive = activeBypass(sessionID)
+            const nowAll = allBypassed(sessionID)
+            const nowCustom = activeCustomBypass(sessionID)
+            const changed =
+              snapshotAll !== nowAll ||
+              snapshot.size !== nowActive.size || [...snapshot].some((c) => !nowActive.has(c)) ||
+              snapshotCustom.length !== nowCustom.length || snapshotCustom.some((c, i) => nowCustom[i] !== c)
+            const cleared = nowActive.size === 0 && !nowAll && nowCustom.length === 0
+            const reason = !changed ? "status" : cleared ? "cleared" : wasActive ? "updated" : "armed"
+            syncSecurityNotice(sessionID)
+            syncBypassDescendants(sessionID)
+            if (!modeTransitionNotified) {
+              emitBypassChanged(sessionID, reason)
+              if (baselineTouched) emitPermChanged(sessionID, "set")
+            }
+          }).pipe(Effect.ensuring(Effect.promise(() => sessionNotices.flush()))),
       })
     })
 
-    // Clear in-memory caches when the plugin scope finalizes (unload). The
+    // Clear in-memory state when the plugin scope finalizes (unload). The
     // forked event fiber is interrupted by the same scope close.
     yield* Effect.addFinalizer(() =>
-      Effect.sync(() => {
-        sessions.clear()
-        inflightReviews.clear()
-        sessionDirectories.clear()
+      Effect.promise(async () => {
+        await Promise.all([...boundaryCalls.values()].map((authorization) => authorization.runtimeBroker?.close()))
+        sharedReviews.clear()
+        approvalCache.clearAll()
+        securityBases.clear()
+        securityEpochs.clear()
         bypassLeases.clear()
         bypassParent.clear()
         sessionPerms.clear()
@@ -4146,10 +3310,10 @@ const plugin: Plugin = {
         permBoundChildren.clear()
         permKnownRoots.clear()
         permUnresolved.clear()
-        escalationFailures.clear()
-        escalationPending.clear()
-        escalationGuideShown.clear()
+        permCreatedAt.clear()
+        explicitNoBypass.clear()
         sandboxMarkers.clear()
+        boundaryCalls.clear()
         bypassRpc = undefined
       }),
     )
@@ -4190,14 +3354,19 @@ export {
   PERM_FULL,
   PERM_NONE,
   parsePerm,
+  parseSecurityMode,
+  permEqual,
+  permForMode,
   permIntersect,
   permLabel,
   permSubset,
   fallbackPermBit,
   requiredPermBit,
+  securityModeFor,
+  securityModeLabel,
   tightenPerm,
 } from "./permissions"
-export type { Perm } from "./permissions"
+export type { Perm, SecurityMode } from "./permissions"
 export type {
   BashClassifierOptions,
   BypassCategory,
@@ -4228,44 +3397,3 @@ export type {
   PreviousRejectedCommand,
   ReviewCommandOptions,
 } from "./security/reviewer"
-export {
-  CATEGORY_HEADER_PREFIX,
-  ESCALATION_FORMAT_GUIDE,
-  ESCALATION_MARKER,
-  ESCALATION_RESERVED_PREFIX,
-  JUSTIFICATION_HEADER_PREFIX,
-  MAX_JUSTIFICATION_LENGTH,
-  parseEscalation,
-} from "./security/escalation"
-export type {
-  EscalationFailureCode,
-  EscalationParseResult,
-  EscalationRequest,
-  EscalationStatus,
-} from "./security/escalation"
-export {
-  escalationCommandsAreSimilar,
-  escalationContextFromMessages,
-  findSimilarFailedEscalation,
-  normalizedEscalationTokens,
-} from "./security/escalation-state"
-export type { EscalationContextMessage, FailedEscalationRecord } from "./security/escalation-state"
-export {
-  bundledEscalationReviewerPath,
-  createEscalationReviewLimiter,
-  EscalationReviewError,
-  parseEscalationReviewOutput,
-  resetEscalationReviewLimiter,
-  reviewEscalation,
-  setEscalationReviewLimiter,
-} from "./security/escalation-reviewer"
-export type {
-  EscalationReviewDecision,
-  EscalationReviewErrorKind,
-  EscalationReviewLimiter,
-  EscalationReviewOptions,
-  EscalationReviewPermissionScope,
-  EscalationReviewRequest,
-  PreviousFailedEscalation,
-  RollingEscalationReviewLimiterOptions,
-} from "./security/escalation-reviewer"

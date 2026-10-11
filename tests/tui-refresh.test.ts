@@ -118,15 +118,23 @@ describe("sessionsToRefresh", () => {
 type StatusReply = {
   sessionID: string
   permission: string
+  // Optional user-visible mode; absent on older servers, then derived by the
+  // indicator from `permission` + `active`.
+  mode?: "readonly" | "auto" | "bypass"
   active: string[]
   temporary: string[]
   permanent: string[]
+  // Optional verbatim scopes; only a boolean reaches the stored indicator.
+  custom?: string[]
   // Same optional shape as the RPC schema: number = finite lease deadline,
   // null = armed without natural expiry, absent = no live lease.
   expiresAt?: number | null
 }
 
-type HarnessStore = Record<string, { permission: string; active: string[]; synced?: boolean }>
+type HarnessStore = Record<
+  string,
+  { permission: string; active: string[]; mode?: string; custom?: boolean; synced?: boolean }
+>
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -138,6 +146,7 @@ function makeHarness() {
   const stores = new Map<string, Record<string, unknown>>()
   const sessions = new Map<string, { id: string; location: { directory: string; workspaceID?: string } }>()
   const families = new Map<string, string[]>()
+  const slots: { render: (input: { sessionID: string }) => unknown }[] = []
   const dataListeners = new Map<string, Set<(event: unknown) => void>>()
   const rpcHandlers = new Map<string, Set<(event: unknown) => void>>()
   const rpcOnCalls: string[] = []
@@ -204,7 +213,10 @@ function makeHarness() {
     },
     ui: {
       toast: { show: (toast: { title?: string; message: string }) => toasts.push(toast) },
-      slot: () => () => {},
+      slot: (value: { render: (input: { sessionID: string }) => unknown }) => {
+        slots.push(value)
+        return () => {}
+      },
     },
   }
 
@@ -238,6 +250,7 @@ function makeHarness() {
     emitRpc,
     flush,
     indicator,
+    slots,
     setStatusReply: (fn: typeof statusReply) => {
       statusReply = fn
     },
@@ -808,5 +821,181 @@ describe("past-deadline retry cap", () => {
       jest.useRealTimers()
       stop()
     }
+  })
+})
+
+describe("explicit mode and custom flags", () => {
+  test("a snapshot's mode and custom flag are stored; the raw scope text never is", async () => {
+    const h = makeHarness()
+    h.sessions.set("s1", { id: "s1", location: HERE })
+    h.setStatusReply((id) => ({
+      sessionID: id,
+      permission: "rwx",
+      mode: "auto",
+      active: ["host"],
+      temporary: ["host"],
+      permanent: [],
+      custom: ["read /home/me/.ssh/id_rsa"],
+    }))
+    const stop = tuiPlugin.setup(h.context as never)
+    h.emitData("session.compaction.ended", { type: "session.compaction.ended", data: { sessionID: "s1" } })
+    await h.flush()
+    expect(h.indicator()!.s1).toEqual({
+      permission: "rwx",
+      active: ["host"],
+      mode: "auto",
+      custom: true,
+      synced: true,
+    })
+    // The verbatim scope can carry credentials: only the boolean is kept.
+    expect(JSON.stringify(h.indicator())).not.toContain("id_rsa")
+    stop()
+  })
+
+  test("a legacy event without mode/custom clears a stale flag", async () => {
+    const h = makeHarness()
+    h.sessions.set("s1", { id: "s1", location: HERE })
+    h.setStatusReply((id) => ({
+      sessionID: id,
+      permission: "rwx",
+      mode: "bypass",
+      active: ["ALL"],
+      temporary: ["ALL"],
+      permanent: [],
+      custom: ["rm -rf /tmp/x"],
+    }))
+    const stop = tuiPlugin.setup(h.context as never)
+    h.emitData("session.compaction.ended", { type: "session.compaction.ended", data: { sessionID: "s1" } })
+    await h.flush()
+    expect(h.indicator()!.s1.mode).toBe("bypass")
+    expect(h.indicator()!.s1.custom).toBe(true)
+
+    // A legacy-shaped cleared event arrives without either optional field.
+    h.emitRpc("changed", { sessionID: "s1", reason: "cleared", active: [], temporary: [], permanent: [] })
+    expect(h.indicator()!.s1.active).toEqual([])
+    expect(h.indicator()!.s1.mode).toBeUndefined()
+    expect(h.indicator()!.s1.custom).toBeUndefined()
+    stop()
+  })
+
+  test("a permission event clears a stale mode when the server omits it", async () => {
+    const h = makeHarness()
+    h.sessions.set("s1", { id: "s1", location: HERE })
+    h.setStatusReply((id) => ({
+      sessionID: id,
+      permission: "rwx",
+      mode: "bypass",
+      active: ["ALL"],
+      temporary: ["ALL"],
+      permanent: [],
+    }))
+    const stop = tuiPlugin.setup(h.context as never)
+    h.emitData("session.compaction.ended", { type: "session.compaction.ended", data: { sessionID: "s1" } })
+    await h.flush()
+    expect(h.indicator()!.s1.mode).toBe("bypass")
+
+    h.emitRpc("permission", { sessionID: "s1", reason: "set", permission: "r-x" })
+    expect(h.indicator()!.s1.permission).toBe("r-x")
+    expect(h.indicator()!.s1.mode).toBeUndefined()
+    stop()
+  })
+})
+
+describe("bypass toast accuracy", () => {
+  test("effective Bypass toast omits the impossible read-only caveat", () => {
+    const h = makeHarness()
+    h.sessions.set("s1", { id: "s1", location: HERE })
+    const stop = tuiPlugin.setup(h.context as never)
+    h.emitRpc("changed", {
+      sessionID: "s1",
+      reason: "armed",
+      mode: "bypass",
+      active: ["ALL"],
+      temporary: [],
+      permanent: [],
+      expiresAt: null,
+    })
+    const toast = h.toasts.find((t) => t.title === "Bypass mode ON")
+    expect(toast).toBeDefined()
+    const message = toast!.message
+    expect(message).toContain("skipped for this session")
+    expect(message).toContain("/bypass off restores checks.")
+    // In an effective Bypass state the session is writable — an inherited
+    // read-only cap cannot apply, so that caveat must not appear.
+    expect(message.toLowerCase()).not.toContain("read-only")
+    expect(message.toLowerCase()).not.toContain("permission ceiling")
+    expect(message.toLowerCase()).not.toContain("gates")
+    stop()
+  })
+
+  test("a clamped bypass reports 'Bypass mode capped', not 'Classifier bypass armed'", () => {
+    const h = makeHarness()
+    h.sessions.set("s1", { id: "s1", location: HERE })
+    const stop = tuiPlugin.setup(h.context as never)
+    h.emitRpc("changed", {
+      sessionID: "s1",
+      reason: "clamped",
+      active: ["ALL"],
+      temporary: [],
+      permanent: [],
+    })
+    const toast = h.toasts.find((t) => t.title === "Bypass mode capped")
+    expect(toast).toBeDefined()
+    expect(toast!.message).toContain("[Read only]")
+    expect(toast!.message).toContain("/bypass off clears the selection.")
+    expect(h.toasts.some((t) => t.title === "Classifier bypass armed")).toBe(false)
+    stop()
+  })
+
+  test("mode readonly with the ALL marker inherits the same capped toast", () => {
+    const h = makeHarness()
+    h.sessions.set("s1", { id: "s1", location: HERE })
+    const stop = tuiPlugin.setup(h.context as never)
+    h.emitRpc("changed", {
+      sessionID: "s1",
+      reason: "armed",
+      mode: "readonly",
+      active: ["ALL"],
+      temporary: [],
+      permanent: [],
+    })
+    expect(h.toasts.some((t) => t.title === "Bypass mode capped")).toBe(true)
+    expect(h.toasts.some((t) => t.title === "Classifier bypass armed")).toBe(false)
+    stop()
+  })
+
+  test("a legacy server's ALL marker still selects the Bypass toast without a mode", () => {
+    const h = makeHarness()
+    h.sessions.set("s1", { id: "s1", location: HERE })
+    const stop = tuiPlugin.setup(h.context as never)
+    h.emitRpc("changed", { sessionID: "s1", reason: "armed", active: ["ALL"], temporary: [], permanent: [] })
+    expect(h.toasts.some((t) => t.title === "Bypass mode ON")).toBe(true)
+    stop()
+  })
+})
+
+describe("indicator slot mount", () => {
+  test("a never-changed session gets its badge from the mount pull", async () => {
+    const h = makeHarness()
+    h.sessions.set("s1", { id: "s1", location: HERE })
+    const stop = tuiPlugin.setup(h.context as never)
+    expect(h.slots.length).toBe(1)
+    h.slots[0]!.render({ sessionID: "s1" })
+    await h.flush()
+    expect(h.statusCalls).toEqual([{ sessionID: "s1", location: HERE }])
+    expect(h.indicator()!.s1).toEqual({ permission: "rwx", active: [], synced: true })
+    stop()
+  })
+
+  test("a mount before the session location is known still records an entry", async () => {
+    const h = makeHarness()
+    const stop = tuiPlugin.setup(h.context as never)
+    h.slots[0]!.render({ sessionID: "s1" })
+    await h.flush()
+    // No RPC to a guessed instance, but the badge admits "unknown" instead
+    // of rendering nothing until the first permission change.
+    expect(h.statusCalls).toEqual([])
+    expect(h.indicator()!.s1).toEqual({ permission: "rwx", active: [], synced: false })
+    stop()
   })
 })

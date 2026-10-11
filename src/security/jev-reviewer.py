@@ -6,15 +6,12 @@ Calling convention mirrors auditor.py / jev_auditor.py:
             `armed_categories` string array (defaults to `userBypass`).
   stdout  : exactly one compact JSON line
             {"decision":"ALLOW|DENY|collect_evidence","categories":[...],
-             "assessment":{...}, ["evidence_requests":[{subject,kind}]],
-             ["bypassing":bool]}
+             "assessment":{...}, ["evidence_requests":[{subject,kind}]]}
             `collect_evidence` fires when an executed script's body was
-            never inspected (or HARD's completeness bar trips): the host
-            collects bounded evidence and resubmits once — the pipeline is
-            unattended, never a human prompt. `evidence_requests` names the
-            concrete subjects when known.
-            (`bypassing` only under OPENCODE_V2_SECURITY_REVIEW_POLICY=HARD;
-            a DENY with no footprint falls back to ["indirection"]).
+            never inspected: the host collects bounded evidence and
+            resubmits once — the pipeline is unattended, never a human
+            prompt. `evidence_requests` names the concrete subjects when
+            known. (A DENY with no footprint falls back to ["indirection"].)
             `categories` is the INTRINSIC risk footprint — present risk
             families are reported on ALLOW too (authorization is a separate
             layer; it never erases what the command does). The `assessment`
@@ -29,7 +26,7 @@ Calling convention mirrors auditor.py / jev_auditor.py:
 Design (v1.5.0 slim bank, verbatim-intent decide, C4 structured heads):
   * ONE jev_call carries the global `decision` choice (the ONLY model
     vote: its verbatim selected label is the permit/deny), the `bypassing`
-    diagnostic noul (required under HARD), and the 9 shared risk_heads
+    diagnostic noul, and the 9 shared risk_heads
     choice questions — 11 questions total, well under the 20/call budget.
     The retired numeric judges (harm_score, secret_exposure,
     privilege_or_kernel, destructive) and the speculative ap_* appeal
@@ -1354,9 +1351,8 @@ def eval_appeal(appeal_answers: dict, fired: list[str],
 
 def build_questions(request: dict) -> dict:
     """The question set for one call (11): the global `decision` vote, the
-    `bypassing` diagnostic (HARD-required, otherwise still sent — it is a
-    cheap output-only signal), and the 9 shared risk_heads choice
-    questions (footprint + floor + domain diagnostics).
+    `bypassing` diagnostic (a cheap output-only signal), and the 9 shared
+    risk_heads choice questions (footprint + floor + domain diagnostics).
 
     v1.5.0 slimming: the retired numeric judges (harm_score,
     secret_exposure, privilege_or_kernel, destructive) and the speculative
@@ -1479,21 +1475,19 @@ def _validate_answers(answers, questions: dict) -> dict:
     endpoint disable the review entirely.
 
     ap_* answers are excluded because eval_appeal already fails closed on
-    absent/malformed entries. `bypassing` carries no deny rule, but under
-    the HARD review policy it is an emitted output field, so its answer is
-    validated there too.
+    absent/malformed entries. `bypassing` carries no deny rule and is not an
+    emitted output field, so its answer is not safety-critical.
     """
     if not isinstance(answers, dict):
         raise JevProtocolError(
             f"answers is not an object: {str(answers)[:200]}"
         )
-    # `bypassing` feeds the emitted HARD-mode flag; only then is a missing
-    # or malformed answer safety-critical.
-    bypassing_required = os.environ.get(ENV_POLICY) == "HARD"
+    # `bypassing` is output-only and carries no deny rule; a missing or
+    # malformed answer is not safety-critical.
     for name, question in questions.items():
         if not isinstance(name, str) or name.startswith("ap_"):
             continue
-        if name == "bypassing" and not bypassing_required:
+        if name == "bypassing":
             continue
         if not isinstance(question, dict):
             continue
@@ -3185,32 +3179,6 @@ def _rm_noop_refused(command: str) -> bool:
 # Review pipeline
 # ---------------------------------------------------------------------------
 
-def _hard_script_inspection_missing(request: dict, armed: set[str]) -> bool:
-    """HARD requires complete evidence for host-identified executed scripts.
-
-    Indirection authorizes only this evidence requirement, never a model
-    DENY or an unconditional floor. Ordinary referenced paths and stored
-    payloads do not enter the host's executable-script context.
-    """
-    if os.environ.get(ENV_POLICY) != "HARD" or "indirection" in armed:
-        return False
-    missing = request.get("uninspectedLocalScripts")
-    if isinstance(missing, list) and any(isinstance(p, str) and p for p in missing):
-        return True
-    scripts = request.get("localScripts")
-    if not isinstance(scripts, list) or not scripts:
-        return False
-    if len(scripts) > 4:
-        return True  # _build_state sends at most four script bodies.
-    for item in scripts:
-        if not isinstance(item, dict) or not isinstance(item.get("content"), str):
-            return True
-        if len(item["content"]) > MAX_SCRIPT_BYTES:
-            return True
-    # Oversized state reduces the script budget or clips the whole state.
-    return len(_build_state(request, MAX_SCRIPT_BYTES)) > MAX_STATE_CHARS
-
-
 def review_request(request: dict, model: str, timeout: float,
                    api_key: str, thresholds: dict) -> dict:
     """Full review of one request. Raises Jev*Error on failure."""
@@ -3295,23 +3263,17 @@ def review_request(request: dict, model: str, timeout: float,
             appeal_rec["noop_refused"] = True
         verdict["appeal"] = appeal_rec
 
-    # The model still reviews every call. Missing executed-script evidence
-    # now routes to collect_evidence instead of an outright denial: under
-    # the unattended pipeline the host performs ONE bounded evidence pass
-    # and resubmits once; an unobtainable body ends as a typed
+    # The model still reviews every call. A named executed script whose body
+    # was never inspected routes to collect_evidence instead of an outright
+    # denial: under the unattended pipeline the host performs ONE bounded
+    # evidence pass and resubmits once; an unobtainable body ends as a typed
     # evidence-limited denial upstream, never as a human prompt.
-    # HARD keeps its strict completeness bar (any missing/truncated body or
-    # oversized state); LOOSE collects when a named executed script's body
-    # was never inspected.
-    hard_missing = _hard_script_inspection_missing(request, armed)
-    loose_missing = (
-        os.environ.get(ENV_POLICY) != "HARD"
-        and "indirection" not in armed
+    inspection_missing = (
+        "indirection" not in armed
         and isinstance(request.get("uninspectedLocalScripts"), list)
         and any(isinstance(p, str) and p
                 for p in request["uninspectedLocalScripts"])
     )
-    inspection_missing = bool(hard_missing or loose_missing)
     evidence_requests: list[dict] = []
     if inspection_missing:
         verdict["inspection_required"] = True
@@ -3338,17 +3300,13 @@ def review_request(request: dict, model: str, timeout: float,
         projection["strongReasons"].append({
             "category": "indirection",
             "kind": "native_inspection",
-            "evidence": "HARD policy requires complete executed-script "
-                        "bodies; at least one body is missing or truncated",
+            "evidence": "an executed script body was never inspected; a "
+                        "bounded evidence pass is required before ALLOW",
         })
 
     result = {
         "deny": bool(verdict["deny"]),
         "collect_evidence": bool(verdict.get("collect_evidence")),
-        "bypassing": bool(
-            verdict["bypass"] is not None
-            and verdict["bypass"] >= thresholds["bypass"]
-        ),
         "categories": primary,
         "secondary_categories": [],
         "verdict_detail": verdict,
@@ -3378,7 +3336,7 @@ def review_request(request: dict, model: str, timeout: float,
     return result
 
 
-def _emit_stdout(result: dict, hard_policy: bool) -> None:
+def _emit_stdout(result: dict) -> None:
     # categories are the intrinsic footprint — reported on ALLOW too;
     # authorization is a separate layer and never erases what executes.
     categories = list(result["categories"])
@@ -3395,8 +3353,6 @@ def _emit_stdout(result: dict, hard_policy: bool) -> None:
     }
     if result.get("evidence_requests"):
         out["evidence_requests"] = result["evidence_requests"]
-    if hard_policy:
-        out["bypassing"] = bool(result.get("bypassing"))
     sys.stdout.write(
         json.dumps(out, ensure_ascii=False, separators=(",", ":")) + "\n")
     sys.stdout.flush()
@@ -3420,7 +3376,15 @@ def _load_thresholds() -> dict:
 
 
 def main() -> int:
-    hard_policy = os.environ.get(ENV_POLICY) == "HARD"
+    policy = os.environ.get(ENV_POLICY)
+    if policy == "HARD":
+        print('config error: review policy "HARD" has been removed; '
+              'only "LOOSE" is supported', file=sys.stderr)
+        return EXIT_PROTOCOL
+    if policy not in (None, "", "LOOSE"):
+        print(f"config error: unsupported review policy {policy!r}",
+              file=sys.stderr)
+        return EXIT_PROTOCOL
     try:
         timeout = float(os.environ.get(ENV_DEADLINE, "") or 30.0)
         if timeout <= 0:
@@ -3467,7 +3431,7 @@ def main() -> int:
         print(f"protocol error: {err}", file=sys.stderr)
         return EXIT_PROTOCOL
 
-    _emit_stdout(result, hard_policy)
+    _emit_stdout(result)
     print(
         f"verdict detail: {json.dumps(result['verdict_detail'], ensure_ascii=False, default=str)} "
         f"latency_ms={result['latency_ms']} usage={result['usage']}",

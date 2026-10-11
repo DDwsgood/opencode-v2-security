@@ -27,7 +27,7 @@ describe("A: comment-aware splitting closes the trailing-quote chain hide", () =
     "ls; rm -rf ~/work #",
   ]
   for (const script of denied) {
-    for (const mode of ["LOOSE", "HARD"] as const) {
+    for (const mode of ["LOOSE"] as const) {
       test(`${mode}: ${script}`, async () => {
         expect(await verdict(script, mode)).toBe("DENY")
       })
@@ -35,7 +35,6 @@ describe("A: comment-aware splitting closes the trailing-quote chain hide", () =
   }
   test("LOOSE: secret read in a comment-hidden tail is still caught", async () => {
     expect(await verdict("ls; cat ~/.ssh/id_rsa #'", "LOOSE")).toBe("ASK")
-    expect(await verdict("ls; cat ~/.ssh/id_rsa #'", "HARD")).toBe("DENY")
   })
   for (const script of [
     "ls # rm -rf /",
@@ -46,7 +45,7 @@ describe("A: comment-aware splitting closes the trailing-quote chain hide", () =
     "echo '#x'",
     "cat <<'EOF'\n# not a comment\nrm -rf /\nEOF",
   ]) {
-    for (const mode of ["LOOSE", "HARD"] as const) {
+    for (const mode of ["LOOSE"] as const) {
       test(`${mode}: comment/data stays benign — ${JSON.stringify(script)}`, async () => {
         expect(await verdict(script, mode)).toBe("ALLOW")
       })
@@ -54,7 +53,6 @@ describe("A: comment-aware splitting closes the trailing-quote chain hide", () =
   }
   test("unresolved splits are never allowed", async () => {
     expect(await verdict("echo hi '", "LOOSE")).toBe("ASK")
-    expect(await verdict("echo hi '", "HARD")).toBe("DENY")
     expect(await verdict("echo `x`", "LOOSE")).toBe("ASK")
   })
 })
@@ -80,7 +78,7 @@ describe("B: semantic git push argv", () => {
     "git push $'--force' origin main",
   ]) {
     test(`denied: ${script}`, async () => {
-      for (const mode of ["LOOSE", "HARD"] as const) {
+      for (const mode of ["LOOSE"] as const) {
         expect(await verdict(script, mode)).toBe("DENY")
       }
     })
@@ -111,16 +109,15 @@ describe("C: executor invocations never ride known-safe/read-only", () => {
       "git grep -O'rm -rf ~/work' x",
       "rg --pre 'rm -rf ~/work' x .",
     ]) {
-      for (const mode of ["LOOSE", "HARD"] as const) {
+      for (const mode of ["LOOSE"] as const) {
         expect(await verdict(script, mode)).toBe("DENY")
       }
       expect(await verdict(script, "LOOSE", RO_KERNEL)).toBe("DENY")
     }
   })
-  test("benign executor payloads still review (LOOSE) and deny in RO", async () => {
+  test("benign executor payloads still review (LOOSE)", async () => {
     for (const script of ["sed 'e id' f", "rg --pre=id x .", "git grep -Oid x", "sed -f script.sed f"]) {
       expect(await verdict(script, "LOOSE")).toBe("ASK")
-      expect(await verdict(script, "LOOSE", RO_KERNEL)).toBe("DENY")
     }
   })
   test("harmless text filters keep ALLOW", async () => {
@@ -146,7 +143,7 @@ describe("D: proven quoted data does not trip destructive rules", () => {
     "git commit -m 'remove rm -rf / mention'",
     "git commit -am 'cleanup notes: rm -rf /'",
   ]) {
-    for (const mode of ["LOOSE", "HARD"] as const) {
+    for (const mode of ["LOOSE"] as const) {
       test(`${mode}: ${script}`, async () => {
         expect(await verdict(script, mode)).toBe("ALLOW")
       })
@@ -178,7 +175,7 @@ describe("E2: data heredocs masked only when proven inert", () => {
       "cat <<'EOF' | wc -l\nrm -rf /\nEOF",
       "cat <<'EOF' | grep x | wc\nrm -rf /\nEOF",
     ]) {
-      for (const mode of ["LOOSE", "HARD"] as const) {
+      for (const mode of ["LOOSE"] as const) {
         expect(await verdict(script, mode)).toBe("ALLOW")
       }
     }

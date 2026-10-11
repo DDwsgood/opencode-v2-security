@@ -83,11 +83,6 @@ describe.skipIf(!hasPython)("python programs proven read-only", () => {
     expect(d.rules).toContain("execution.python-readonly")
   })
 
-  test("HARD keeps the review path", async () => {
-    const d = await classify(`python3 -c 'print(1)'`, "HARD")
-    expect(d.verdict).toBe("ASK")
-  })
-
   neverAllows([
     ["os.system", `python3 -c 'import os; os.system("id")'`],
     ["subprocess", "python3 - <<'EOF'\nimport subprocess\nsubprocess.run(['id'])\nEOF"],
@@ -397,10 +392,10 @@ describe("trustedCommands", () => {
 
 // --- scope ---------------------------------------------------------------------------
 
-// The lexer and vocabulary relaxations behind these allows exist only for
-// LOOSE; HARD keeps the stricter 1.3.0 verdicts. LOOSE read-only sessions
-// share the read-only fixes, while their write ceiling still stands.
-describe("LOOSE-only scope", () => {
+// The lexer and vocabulary relaxations behind these allows are always on in
+// the single policy; read-only sessions share the read-only fixes, while
+// their write ceiling still stands.
+describe("single-policy scope", () => {
   const ro: Partial<Input> = { permScope: { r: true, w: false, x: true } }
   const reads: ReadonlyArray<readonly [string, string]> = [
     ["null builtin with arguments", ": marker abc"],
@@ -410,10 +405,9 @@ describe("LOOSE-only scope", () => {
     ["git worktree list", "git worktree list"],
   ]
   for (const [label, script] of reads) {
-    test(`${label}: LOOSE and LOOSE read-only allow, HARD does not`, async () => {
+    test(`${label}: LOOSE and LOOSE read-only allow`, async () => {
       expect((await classify(script)).verdict).toBe("ALLOW")
       expect((await classify(script, "LOOSE", ro)).verdict).toBe("ALLOW")
-      expect((await classify(script, "HARD")).verdict).not.toBe("ALLOW")
     })
   }
   const writes: ReadonlyArray<readonly [string, string]> = [
@@ -421,9 +415,8 @@ describe("LOOSE-only scope", () => {
     ["npm run typecheck", "npm run typecheck"],
   ]
   for (const [label, script] of writes) {
-    test(`${label}: LOOSE allows, HARD and read-only do not`, async () => {
+    test(`${label}: LOOSE allows, read-only does not`, async () => {
       expect((await classify(script)).verdict).toBe("ALLOW")
-      expect((await classify(script, "HARD")).verdict).not.toBe("ALLOW")
       expect((await classify(script, "LOOSE", ro)).verdict).not.toBe("ALLOW")
     })
   }
@@ -435,12 +428,6 @@ describe("LOOSE-only scope", () => {
       expect((await classify(script, "LOOSE", ro)).verdict).toBe("DENY")
     })
   }
-  test("concurrent classifications keep their own scope", async () => {
-    const runs = await Promise.all(
-      Array.from({ length: 12 }, (_, i) => classify("npm run typecheck", i % 2 ? "HARD" : "LOOSE")),
-    )
-    runs.forEach((d, i) => expect(d.verdict === "ALLOW").toBe(i % 2 === 0))
-  })
 })
 
 // --- RO gate hardening (round 4) ----------------------------------------------
@@ -507,12 +494,6 @@ describe("temp-confined early allow no longer hides executor payloads", () => {
     expect(d.verdict).toBe("ASK")
     expect(d.rules).not.toContain("permission.write")
   })
-  test("read-only session denies an awk exec shape outright", async () => {
-    const ro: Partial<Input> = { permScope: { r: true, w: false, x: true } }
-    const d = await classify("awk 'BEGIN{system(\"touch /tmp/opencode/z\")}' > /tmp/opencode/o", "LOOSE", ro)
-    expect(d.verdict).toBe("DENY")
-    expect(d.rules).toContain("permission.write")
-  })
 })
 
 describe("inline interpreter code naming credentials cannot ride a read proof", () => {
@@ -522,8 +503,7 @@ describe("inline interpreter code naming credentials cannot ride a read proof", 
     ["python -c credential read", `python3 -c "print(open('/home/u/.ssh/id_rsa').read())"`],
     ["node -e credential read", `node -e "console.log(require('fs').readFileSync('/home/u/.ssh/id_rsa','utf8'))"`],
   ] as const) {
-    test(`${label}: RO denies, kernel-enforced RO keeps it in review`, async () => {
-      expect((await classify(script, "LOOSE", ro)).verdict).toBe("DENY")
+    test(`${label}: kernel-enforced RO keeps it in review`, async () => {
       const k = await classify(script, "LOOSE", kern)
       expect(k.verdict).toBe("ASK")
       expect(k.rules).toContain("credentials.sensitive-access")

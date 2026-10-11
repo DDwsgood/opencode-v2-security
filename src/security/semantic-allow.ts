@@ -10,7 +10,8 @@
 
 import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
-import { existsSync, readFileSync, statSync } from "node:fs"
+import { existsSync, statSync } from "node:fs"
+import { inspectRegularTextFileSync } from "./inspection"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { checkPathSensitivity, classifyPathTarget, type PathContext } from "./paths"
@@ -58,6 +59,11 @@ function runPythonProver(source: string, searchDirs: string[]): Promise<PythonPr
     child.stdout?.on("data", (chunk: string) => {
       stdout += chunk
       if (stdout.length > 1_000_000) child.kill("SIGKILL")
+    })
+    child.stdout?.on("error", () => {
+      child.kill("SIGKILL")
+      clearTimeout(timer)
+      finish({ ok: false, reason: "prover output unreadable" })
     })
     child.on("error", () => {
       clearTimeout(timer)
@@ -767,12 +773,8 @@ export function foreignGitConfigArmed(dir: string): boolean {
     // Not a repo root (or unreadable): a parent repo may apply — not inspected.
     return true
   }
-  if (!existsSync(configPath)) return true
-  let text: string
-  try {
-    text = readFileSync(configPath, "utf8")
-  } catch {
-    return true
-  }
+  const inspected = inspectRegularTextFileSync(configPath, 64 * 1024)
+  if (!inspected.ok) return true
+  const text = inspected.text
   return /^\s*(?:fsmonitor|pager|textconv|external|program|clean|smudge|process|command|path|worktree)\s*=|^\s*\[(?:include|includeif|filter|diff\s|pager|gpg)/im.test(text)
 }

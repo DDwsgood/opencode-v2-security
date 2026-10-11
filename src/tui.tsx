@@ -39,10 +39,10 @@
 //   dropped emit, a dead subscription, a silent queue overflow — the timer
 //   resubscribes the RPC handlers and pulls a fresh snapshot. Entries that
 //   cannot prove freshness render "[Security state unknown]" rather than a
-//   confident claim (e.g. stale [YOLO ON]).
+//   confident claim (e.g. a stale [Bypass mode] after the bypass expired).
 import { createEffect, For, Show } from "solid-js"
 import type { Plugin } from "@opencode-ai/plugin/tui"
-import { BypassRpc, type BypassChangedData, type BypassStatusData } from "./bypass-rpc"
+import { BypassRpc, type BypassChangedData, type BypassPermissionData, type BypassStatusData } from "./bypass-rpc"
 import {
   allIsOff,
   segmentsFor,
@@ -92,13 +92,30 @@ function toastFor(data: BypassChangedData): Toast {
       : typeof data.expiresAt === "number"
         ? `expires in ${formatDuration(Math.max(0, data.expiresAt - Date.now()))}`
         : "expires on its own schedule"
-  // Kill-switch transitions get their own loud error toast: "armed" with
-  // "ALL" in the active list means every plugin enforcement layer is off.
-  if (allIsOff(data.active) && (data.reason === "armed" || data.reason === "updated")) {
+  // The bypass selection can be capped by an inherited read-only ceiling: the
+  // user asked for Bypass, but the session stays [Read only]. The new backend
+  // emits reason:"clamped"; a mode-carrying server may instead send
+  // mode:"readonly" with the ALL marker still in `active`. Report that
+  // honestly FIRST — the "armed"/status copy would wrongly imply protections
+  // were relaxed.
+  if (data.reason === "clamped" || (data.mode === "readonly" && allIsOff(data.active))) {
     return {
-      title: "ALL plugin enforcement OFF",
+      title: "Bypass mode capped",
       message:
-        `Static/dynamic classification, slow-command checks, injection detection, sandbox wrapping, and permission gates are all disabled for this session (${expiry}). /bypass off restores them.`,
+        "Bypass mode was selected, but a read-only limit applies to this session, so it stays [Read only]. /bypass off clears the selection.",
+      variant: "warning",
+      duration: 8000,
+    }
+  }
+  // Bypass mode (the /bypass all/*/ALL/yolo selection) skips static
+  // classification, effects review and the plugin sandbox. In an effective
+  // Bypass state the session is writable (a read-only ceiling would have won
+  // and produced the capped toast above), so no read-only caveat belongs here.
+  const bypassMode = data.mode === "bypass" || (data.mode === undefined && allIsOff(data.active))
+  if (bypassMode && (data.reason === "armed" || data.reason === "updated")) {
+    return {
+      title: "Bypass mode ON",
+      message: `Classification, effects review and the plugin sandbox are skipped for this session (${expiry}). /bypass off restores checks.`,
       variant: "error",
       duration: 10000,
     }
@@ -191,7 +208,14 @@ const plugin: Plugin.Definition = {
               // placeholders, not observations — only a full status snapshot
               // or a live event field plus a confirming pull marks synced.
               const current = draft[sessionID] ?? { permission: "rwx", active: [], synced: false }
-              draft[sessionID] = { ...current, ...patch }
+              const next = { ...current, ...patch }
+              // Optional fields are stored only while meaningful: a legacy
+              // snapshot (no `mode`) or a cleared event must not leave a stale
+              // mode/custom flag behind, and entries stay shape-stable across
+              // plugin generations.
+              if (!next.mode) delete next.mode
+              if (next.custom !== true) delete next.custom
+              draft[sessionID] = next
             })
 
     // The session's own location is required: RPCs without an explicit
@@ -315,6 +339,8 @@ const plugin: Plugin.Definition = {
         writeIndicator?.(data.sessionID, {
           permission: data.permission,
           active: [...data.active],
+          mode: data.mode,
+          custom: (data.custom?.length ?? 0) > 0,
           synced: true,
         })
         armDeadline(sessionID, data.expiresAt)
@@ -370,6 +396,11 @@ const plugin: Plugin.Definition = {
               // are the only authority, so they certify the badge directly.
               writeIndicator?.(data.sessionID, {
                 active: [...data.active],
+                // `mode`/`custom` are optional on the wire: passing them here
+                // (even as undefined/false) clears a stale prior value so the
+                // render either takes the fresh mode or derives it.
+                mode: data.mode,
+                custom: (data.custom?.length ?? 0) > 0,
                 ...(canPull ? {} : { synced: true }),
               })
               // The event carries the lease deadline (finite | null | absent)
@@ -393,13 +424,17 @@ const plugin: Plugin.Definition = {
             // A throwing handler rejects the event pump's async loop and
             // silently kills the subscription — keep the body fault-free.
             try {
-              const data = event.data as { sessionID?: string; permission?: string }
+              const data = event.data as Partial<BypassPermissionData>
               if (!live() || typeof data?.sessionID !== "string") return
               if (!sameWorkspace(data.sessionID, event)) return
               revisions.markEvent(data.sessionID)
               if (typeof data.permission === "string") {
                 writeIndicator?.(data.sessionID, {
                   permission: data.permission,
+                  // A permission transition may also change the mode (e.g. a
+                  // read-only ceiling overriding an armed bypass); clear a
+                  // stale value when this server does not send one.
+                  mode: data.mode,
                   ...(canPull ? {} : { synced: true }),
                 })
               }
@@ -494,12 +529,14 @@ const plugin: Plugin.Definition = {
           context.ui.slot({
             append: "session.composer.top",
             render: (input: { sessionID: string }) => {
-              // The host keeps session info and the slot input reactive. Wait
-              // for the authoritative session location before pulling; the
-              // currently selected TUI location may be a different instance.
+              // The host keeps session info and the slot input reactive. Pull
+              // on every mount: without the session's authoritative location
+              // pullStatus records an unsynced entry instead of sending to a
+              // possibly different instance, and the effect re-runs once the
+              // location arrives. A skipped pull would leave no entry at all,
+              // hiding the badge until the first permission change.
               createEffect(() => {
-                const sessionID = input.sessionID
-                if (locationOf(sessionID)) void pullStatus(sessionID)
+                void pullStatus(input.sessionID)
               })
               return (
                 <Show when={indicator[input.sessionID]}>

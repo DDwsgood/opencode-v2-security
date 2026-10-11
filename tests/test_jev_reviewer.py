@@ -99,20 +99,7 @@ class TestAnswerValidation(unittest.TestCase):
         with self.assertRaises(jev.JevProtocolError):
             jev._validate_answers(answers, self.questions)
 
-    def test_out_of_range_noul_raises(self) -> None:
-        # bypassing is the only noul in the slim bank and it is only
-        # required under HARD — exercise the range check under that policy.
-        with patch.dict(os.environ, {jev.ENV_POLICY: "HARD"}):
-            answers = _allow_answers()
-            answers["bypassing"] = {"type": "noul", "noul": 1.5}
-            with self.assertRaises(jev.JevProtocolError):
-                jev._validate_answers(answers, self.questions)
-            answers["bypassing"] = {"type": "noul", "noul": float("nan")}
-            with self.assertRaises(jev.JevProtocolError):
-                jev._validate_answers(answers, self.questions)
-            answers["bypassing"] = {"type": "noul", "noul": True}
-            with self.assertRaises(jev.JevProtocolError):
-                jev._validate_answers(answers, self.questions)
+    def test_stale_legacy_answer_keys_are_ignored(self) -> None:
         # Stale legacy answer keys (retired judges) are ignored — they are
         # no longer asked, so a stray response key is not a protocol error.
         answers = _allow_answers()
@@ -157,22 +144,6 @@ class TestAnswerValidation(unittest.TestCase):
         }
         with self.assertRaises(jev.JevProtocolError):
             jev._validate_answers(answers, self.questions)
-
-    def test_bypassing_answer_required_under_hard_policy(self) -> None:
-        with patch.dict(os.environ,
-                        {"OPENCODE_V2_SECURITY_REVIEW_POLICY": "HARD"}):
-            answers = _allow_answers()
-            with self.assertRaises(jev.JevProtocolError):
-                jev._validate_answers(answers, self.questions)
-            answers["bypassing"] = {"type": "noul", "noul": 0.2}
-            jev._validate_answers(answers, self.questions)
-            answers["bypassing"] = {"type": "noul", "noul": 1.2}
-            with self.assertRaises(jev.JevProtocolError):
-                jev._validate_answers(answers, self.questions)
-        # Without HARD the field stays output-only and optional.
-        with patch.dict(os.environ,
-                        {"OPENCODE_V2_SECURITY_REVIEW_POLICY": ""}):
-            jev._validate_answers(_allow_answers(), self.questions)
 
     def test_appeal_answers_reject_out_of_range_values(self) -> None:
         # ap_* answers bypass _validate_answers; eval_appeal must bound

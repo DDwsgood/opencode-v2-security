@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.6.0 (2026-10-11)
+
+- Treat failed path/process inspection as unavailable evidence, never an opaque
+  tool failure; bound regular-file reads, skip pseudo/special files, and keep
+  Bun's inaccessible trace-marker probes as ordinary OS errors.
+- Read-only sessions follow the same observe → static → dynamic chain as
+  Auto. Statically proven writes (`permission.write` or a floor rule) and
+  write tools are refused without review; unproven commands run under the
+  runtime observer. Observed non-exempt writes and privilege crossings are
+  refused directly; read/network/interop/opaque crossings get a read-only
+  JEV review (frozen v10-8 questions plus a `readonly_conformance` question;
+  `writes`/`unclear` deny). The write-mode request body is unchanged.
+- Incidental tool writes are not boundary crossings in Auto or Read-only:
+  `~/.cache`, sqlite/less/python/node/psql/mysql/redis history files, and
+  `__pycache__`/`.pytest_cache` components, never inside denyWrite, protect
+  or credential paths. The observer accepts a not-yet-existing file root.
+- Permission changes during a run reach the model with the next completed
+  tool result; idle changes still ride the next user prompt.
+- The TUI badge is shown for a session whose permission never changed.
+- A status pull for a session the server has not created yet no longer
+  marks it unverified; the prompt re-verifies the ancestry before its notice.
+  `status` reads the clock once again, including lazy lease expiry.
+- Remove the escalation pipeline, `auditor.py`, and tests of removed
+  behaviour (HARD strictness, RO static deny of unproven commands,
+  intermediate host-wrapper admission design).
+
 ## 1.5.0 (2026-10-06)
 
 - Deploy the owner-based JEV classification strategy selected by development

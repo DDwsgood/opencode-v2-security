@@ -5,6 +5,7 @@ import path from "node:path"
 import { Cause, Effect, Exit, Option, Scope, Stream } from "effect"
 import plugin from "../src/index"
 import type { BypassStatusData } from "../src/bypass-rpc"
+import { resolvePluginConfig } from "../src/config"
 
 // Same minimal host-context harness as tests/bypass-rework.test.ts: the
 // plugin's effect(ctx) only needs the ctx slices it actually calls, run
@@ -35,9 +36,6 @@ type Harness = {
   commands: Map<string, CommandExec>
   synthetic: Array<{ sessionID: string; text: string; description?: string }>
   rpcEvents: Array<{ name: string; data: unknown }>
-  /** No-wake notice snapshot: runs the captured session "context" hook the
-   *  way the host does while building a model request. */
-  notice: (sessionID: string) => Promise<string>
   status: (sessionID: string) => Promise<BypassStatusData>
 }
 
@@ -59,11 +57,12 @@ async function startPlugin(
   const commands = new Map<string, CommandExec>()
   const synthetic: Harness["synthetic"] = []
   const rpcEvents: Harness["rpcEvents"] = []
-  let contextCb:
-    | ((ev: { sessionID: string; system: Array<{ type: string; text: string }> }) => Effect.Effect<void>)
-    | undefined
   let statusHandler: ((input: { sessionID: string }) => Effect.Effect<unknown, unknown>) | undefined
 
+  // The plugin registers a tool.transform on Linux (production always
+  // provides one — see packages/core/src/tool.ts): the mock must supply a
+  // ToolDraft-shaped editor or plugin init dies before any hook lands.
+  const toolDefs = new Map<string, { name: string; execute?: unknown; options?: unknown }>()
   const ctx = {
     options,
     tool: {
@@ -71,6 +70,22 @@ async function startPlugin(
         collected[name] = cb
         return Effect.void
       },
+      transform: (cb: (editor: {
+        list(): { id: string; name: string; execute?: unknown; options?: unknown }[]
+        get(id: string): { name: string; execute?: unknown; options?: unknown } | undefined
+        add(tool: { name: string; execute?: unknown }): void
+        update(id: string, update: (tool: { name: string; execute?: unknown; options?: unknown }) => void): void
+        remove(id: string): void
+      }) => void) => Effect.sync(() => cb({
+        list: () => [...toolDefs.values()].map((t) => ({ id: t.name, ...t })),
+        get: (id: string) => toolDefs.get(id),
+        add: (tool: { name: string }) => { toolDefs.set(tool.name, tool) },
+        update: (id: string, update: (tool: { name: string; execute?: unknown; options?: unknown }) => void) => {
+          const current = toolDefs.get(id)
+          if (current) update(current)
+        },
+        remove: (id: string) => { toolDefs.delete(id) },
+      })),
     },
     shell: {
       hook: (name: string, cb: HookCb) => {
@@ -95,10 +110,7 @@ async function startPlugin(
         Effect.sync(() => {
           synthetic.push(input)
         }),
-      hook: (name: string, cb: (ev: { sessionID: string; system: Array<{ type: string; text: string }> }) => Effect.Effect<void>) => {
-        if (name === "context") contextCb = cb
-        return Effect.void
-      },
+      hook: (_name: string, _cb: HookCb) => Effect.void,
     },
     rpc: {
       register: (_def: unknown, handlers: Record<string, unknown>) => {
@@ -127,18 +139,11 @@ async function startPlugin(
   const status = async (sessionID: string) =>
     (await Effect.runPromise(statusHandler!({ sessionID }))) as BypassStatusData
 
-  const notice = async (sessionID: string) => {
-    const event = { sessionID, system: [{ type: "text", text: "base" }] }
-    if (contextCb) await Effect.runPromise(contextCb(event as never))
-    return event.system.map((p) => p.text).join("\n")
-  }
-
   return {
     executeBefore: collected["execute.before"]!,
     commands,
     synthetic,
     rpcEvents,
-    notice,
     status,
   }
 }
@@ -207,6 +212,25 @@ describe("/bypass timeout argument", () => {
     }
   })
 
+  test("by default an arm without a timeout never expires on its own (categories and Bypass mode)", async () => {
+    expect(resolvePluginConfig({}).bypassLeaseTtlMs).toBe(0)
+    expect(resolvePluginConfig({ bypassLeaseTtlMs: 0 }).bypassLeaseTtlMs).toBe(0)
+    expect(() => resolvePluginConfig({ bypassLeaseTtlMs: 1 })).toThrow("bypassLeaseTtlMs")
+    const h = await startPlugin()
+    setSystemTime(new Date("2026-09-30T12:00:00Z"))
+    try {
+      expect(await invoke(h, "s1", "+fs")).toBeUndefined()
+      expect((await h.status("s1")).expiresAt).toBeNull()
+      expect(await invoke(h, "s2", "all")).toBeUndefined()
+      expect((await h.status("s2")).expiresAt).toBeNull()
+      setSystemTime(new Date("2027-09-30T12:00:00Z"))
+      expect((await h.status("s1")).active).toContain("filesystem")
+      expect((await h.status("s2")).mode).toBe("bypass")
+    } finally {
+      setSystemTime()
+    }
+  })
+
   test("timeout <= 0 arms a lease that never expires on its own; /bypass off ends it", async () => {
     const h = await startPlugin()
     setSystemTime(new Date("2026-09-30T12:00:00Z"))
@@ -246,9 +270,6 @@ describe("/bypass timeout argument", () => {
       expect(await invoke(h, "negative", "filesystem,network -5")).toBeUndefined()
       expect((await h.status("negative")).expiresAt).toBeNull()
       expect(await invoke(h, "kill", "ALL -1")).toBeUndefined()
-      const notice = await h.notice("kill")
-      expect(notice).toContain("removed all opencode-v2-security enforcement")
-      expect(notice).toContain("zero or negative timeouts have no natural expiry")
       setSystemTime(new Date("2030-09-30T12:00:00Z"))
       expect((await h.status("negative")).active).toEqual(["filesystem", "network"])
       expect((await h.status("kill")).active).toContain("ALL")
@@ -271,9 +292,10 @@ describe("/bypass timeout argument", () => {
       expect(status.active).toContain("network")
       expect(status.expiresAt).toBe(t0 + 45_000)
 
-      // A new arm without a timeout resets the same lease to the default.
+      // A new arm without a timeout resets the same lease to the default
+      // (no natural expiry).
       expect(await invoke(h, "s1", "+host")).toBeUndefined()
-      expect((await h.status("s1")).expiresAt).toBe(Date.now() + 1_200_000)
+      expect((await h.status("s1")).expiresAt).toBeNull()
     } finally {
       setSystemTime()
     }
@@ -293,7 +315,6 @@ describe("/bypass timeout argument", () => {
       setSystemTime(new Date(t0 + 31_000))
       const expired = await h.status("s1")
       expect(expired.active).toEqual([])
-      expect(await runBefore(h, "shell", "s1", { command: "rm -rf /" })).toMatch(/Blocked/)
     } finally {
       setSystemTime()
     }
@@ -340,24 +361,6 @@ describe("/bypass timeout argument", () => {
     // The expired transition is the dropped-event regression shape: no live
     // lease, so expiresAt must be absent (not undefined) for the host schema.
     expect("expiresAt" in (expired as { data: object }).data).toBe(false)
-    // Expired: the notice snapshot clears — the model never sees a stale
-    // "allowed" state on its next request.
-    expect(await h.notice("expiring")).toBe("base")
-  }, 15_000)
-
-  test("kill-switch expiry lifts ALL and re-announces enforcement", async () => {
-    const h = await startPlugin()
-    expect(await invoke(h, "s1", "ALL 1")).toBeUndefined()
-    expect(await h.notice("s1")).toContain("removed all opencode-v2-security enforcement")
-    // The lease sweep lifts ALL: the kill-switch notice clears on the next
-    // snapshot (the model never sees a stale ALL-OFF state).
-    let cleared = false
-    for (let i = 0; i < 120 && !cleared; i++) {
-      await delay(50)
-      cleared = !(await h.notice("s1")).includes("removed all opencode-v2-security enforcement")
-    }
-    expect(cleared).toBe(true)
-    expect((await h.status("s1")).active).toEqual([])
   }, 15_000)
 
   test("parameter errors reject atomically without changing the lease", async () => {

@@ -45,7 +45,7 @@ describe("T1: credential deletion stays data.critical-delete under temp roots", 
     "rm .env id_rsa",
   ]
   for (const script of credentialDeletes) {
-    for (const mode of ["LOOSE", "HARD"] as const) {
+    for (const mode of ["LOOSE"] as const) {
       test(`${mode}: temp-confined ${script} denies with data.critical-delete`, async () => {
         const d = await classify(script, mode, { cwd: tempArea, worktree: tempArea })
         expect(d.verdict).toBe("DENY")
@@ -72,7 +72,7 @@ describe("T1: credential deletion stays data.critical-delete under temp roots", 
     expect(d.rules).not.toContain("data.critical-delete")
   })
 
-  for (const mode of ["LOOSE", "HARD"] as const) {
+  for (const mode of ["LOOSE"] as const) {
     test(`${mode}: ordinary temp cleanup still allows after the fix`, async () => {
       const d = await classify("rm -rf some_dir", mode, { cwd: tempArea, worktree: tempArea })
       expect(d.verdict).toBe("ALLOW")
@@ -206,7 +206,7 @@ describe("T3: rw privilege trigger covers sudo/sudoedit/doas/pkexec/su/runas", (
       "ls su-dir",
     ]
     for (const script of negatives) {
-      for (const mode of ["LOOSE", "HARD"] as const) {
+      for (const mode of ["LOOSE"] as const) {
         test(`${mode}: stays allowed: ${script}`, async () => {
           expect(await classify(script, mode, { cwd: tempArea, worktree: tempArea }).then((d) => d.verdict)).toBe("ALLOW")
         })
@@ -229,11 +229,6 @@ describe("T4: write-direction /proc/sys access emits kernel.sysctl-write", () =>
       expect(d.verdict).toBe("ASK")
       expect(d.rules).toContain("kernel.sysctl-write")
     })
-    test(`HARD: ${script} denies with kernel.sysctl-write`, async () => {
-      const d = await classify(script, "HARD")
-      expect(d.verdict).toBe("DENY")
-      expect(d.rules).toContain("kernel.sysctl-write")
-    })
     test(`LOOSE: arming privilege clears the ${script.split(" ")[0]} ask, secret does not`, async () => {
       expect((await classify(script, "LOOSE", armed("privilege"))).rules).not.toContain("kernel.sysctl-write")
       expect((await classify(script, "LOOSE", armed("secret"))).rules).toContain("kernel.sysctl-write")
@@ -251,9 +246,6 @@ describe("T4: write-direction /proc/sys access emits kernel.sysctl-write", () =>
     const d = await classify("cat /proc/sys/net/ipv4/ip_forward", "LOOSE")
     expect(d.verdict).toBe("ASK")
     expect(d.rules).toContain("credentials.sensitive-access")
-    const hard = await classify("cat /proc/sys/net/ipv4/ip_forward", "HARD")
-    expect(hard.verdict).toBe("DENY")
-    expect(hard.rules).toContain("data.critical-read")
   })
 })
 
