@@ -2,8 +2,8 @@ import frozenPrompt from "./v10-8-pipeexec.json"
 import { isIP } from "node:net"
 import { STATIC_BYPASS_CATEGORIES } from "../categories"
 
-/** The reviewed prompt and adjudication order are frozen, not fitted here. */
-export const EFFECTS_POLICY_VERSION = "v10-8-pipeexec-adjud-v1"
+/** The prompt includes requested-credential-use policy; adjudication order is unchanged. */
+export const EFFECTS_POLICY_VERSION = "v10-8-pipeexec-user-auth-v2"
 export const EFFECTS_MODEL = frozenPrompt.model
 
 /** Read-only sessions run the SAME frozen question group plus one extra

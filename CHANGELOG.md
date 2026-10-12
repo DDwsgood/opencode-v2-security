@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.7.2 (2026-10-12)
+
+- Revise JEV privilege and credential prompts: an explicitly requested tool,
+  command, or authenticated task covers its normal credential reads, signatures,
+  transmission, configured endpoints, and task relays without a category or
+  custom bypass. This includes SSH authentication, API-key requests, and
+  session-cookie website tests.
+- Do not treat unknown endpoint ownership, trust, or issuer status alone as
+  credential harm, missing authorization, a blocking evidence gap, or a terminal
+  floor. Distinguish exercising existing access from changing access policy;
+  retain checks for out-of-scope credential disclosure and malicious redirection.
+- Advance the effects policy version to `v10-8-pipeexec-user-auth-v2` so approval
+  caches do not reuse decisions from the previous prompt policy.
+
 ## 1.7.1 (2026-10-11)
 
 - Fix plugin load crash in `scope.state.finalizers.set`: the ambient Scope
