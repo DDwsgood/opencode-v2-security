@@ -1,0 +1,193 @@
+{
+  "context.adjudicated.jsonl": {
+    "baseline": {
+      "attempts": 20,
+      "errors": 0,
+      "expected_allow": 16,
+      "direct_allow": 16,
+      "false_deny": 0,
+      "extra_collection": 0,
+      "control_cases": 4,
+      "control_matches": 2,
+      "input_tokens_mean": 8583,
+      "latency_ms_p50": 3046,
+      "latency_ms_p95": 4243
+    }
+  },
+  "discovery.adjudicated.jsonl": {
+    "baseline": {
+      "attempts": 41,
+      "errors": 0,
+      "expected_allow": 35,
+      "direct_allow": 35,
+      "false_deny": 0,
+      "extra_collection": 0,
+      "control_cases": 6,
+      "control_matches": 5,
+      "input_tokens_mean": 8445.1,
+      "latency_ms_p50": 3188,
+      "latency_ms_p95": 4904
+    },
+    "compact": {
+      "attempts": 41,
+      "errors": 0,
+      "expected_allow": 35,
+      "direct_allow": 35,
+      "false_deny": 0,
+      "extra_collection": 0,
+      "control_cases": 6,
+      "control_matches": 5,
+      "input_tokens_mean": 8958.1,
+      "latency_ms_p50": 3183,
+      "latency_ms_p95": 4556
+    },
+    "targeted": {
+      "attempts": 41,
+      "errors": 0,
+      "expected_allow": 35,
+      "direct_allow": 35,
+      "false_deny": 0,
+      "extra_collection": 0,
+      "control_cases": 6,
+      "control_matches": 5,
+      "input_tokens_mean": 9685.1,
+      "latency_ms_p50": 2999,
+      "latency_ms_p95": 4856
+    }
+  },
+  "followup.adjudicated.jsonl": {
+    "baseline": {
+      "attempts": 26,
+      "errors": 0,
+      "expected_allow": 22,
+      "direct_allow": 21,
+      "false_deny": 0,
+      "extra_collection": 1,
+      "control_cases": 4,
+      "control_matches": 3,
+      "input_tokens_mean": 8451.4,
+      "latency_ms_p50": 2950,
+      "latency_ms_p95": 3730
+    },
+    "compact": {
+      "attempts": 26,
+      "errors": 0,
+      "expected_allow": 22,
+      "direct_allow": 21,
+      "false_deny": 0,
+      "extra_collection": 1,
+      "control_cases": 4,
+      "control_matches": 3,
+      "input_tokens_mean": 8964.4,
+      "latency_ms_p50": 3307,
+      "latency_ms_p95": 3951
+    },
+    "interop": {
+      "attempts": 26,
+      "errors": 0,
+      "expected_allow": 22,
+      "direct_allow": 22,
+      "false_deny": 0,
+      "extra_collection": 0,
+      "control_cases": 4,
+      "control_matches": 3,
+      "input_tokens_mean": 8790.4,
+      "latency_ms_p50": 2814,
+      "latency_ms_p95": 3695
+    }
+  },
+  "order-stability.adjudicated.jsonl": {
+    "baseline": {
+      "attempts": 24,
+      "errors": 0,
+      "expected_allow": 15,
+      "direct_allow": 15,
+      "false_deny": 0,
+      "extra_collection": 0,
+      "control_cases": 9,
+      "control_matches": 6,
+      "input_tokens_mean": 8441.6,
+      "latency_ms_p50": 3648,
+      "latency_ms_p95": 4718
+    },
+    "evidence_scope": {
+      "attempts": 24,
+      "errors": 0,
+      "expected_allow": 15,
+      "direct_allow": 15,
+      "false_deny": 0,
+      "extra_collection": 0,
+      "control_cases": 9,
+      "control_matches": 6,
+      "input_tokens_mean": 8600.6,
+      "latency_ms_p50": 3495,
+      "latency_ms_p95": 4643
+    }
+  },
+  "repeat-original-order.adjudicated.jsonl": {
+    "baseline": {
+      "attempts": 3,
+      "errors": 0,
+      "expected_allow": 3,
+      "direct_allow": 3,
+      "false_deny": 0,
+      "extra_collection": 0,
+      "control_cases": 0,
+      "control_matches": 0,
+      "input_tokens_mean": 8444,
+      "latency_ms_p50": 3767,
+      "latency_ms_p95": 3767
+    },
+    "evidence_scope": {
+      "attempts": 3,
+      "errors": 0,
+      "expected_allow": 3,
+      "direct_allow": 3,
+      "false_deny": 0,
+      "extra_collection": 0,
+      "control_cases": 0,
+      "control_matches": 0,
+      "input_tokens_mean": 8603,
+      "latency_ms_p50": 5370,
+      "latency_ms_p95": 5370
+    }
+  },
+  "validation.adjudicated.jsonl": {
+    "baseline": {
+      "attempts": 67,
+      "errors": 0,
+      "expected_allow": 57,
+      "direct_allow": 56,
+      "false_deny": 0,
+      "extra_collection": 1,
+      "control_cases": 10,
+      "control_matches": 8,
+      "input_tokens_mean": 8447.6,
+      "latency_ms_p50": 3263,
+      "latency_ms_p95": 4883
+    },
+    "evidence_scope": {
+      "attempts": 67,
+      "errors": 0,
+      "expected_allow": 57,
+      "direct_allow": 57,
+      "false_deny": 0,
+      "extra_collection": 0,
+      "control_cases": 10,
+      "control_matches": 8,
+      "input_tokens_mean": 8606.6,
+      "latency_ms_p50": 3366,
+      "latency_ms_p95": 4964
+    }
+  },
+  "totals": {
+    "recorded_requests": 409,
+    "smoke_requests": 1,
+    "total_requests": 410,
+    "input_tokens_recorded": 3566428,
+    "output_tokens_recorded": 297022,
+    "model_identifiers": [
+      "typesafe/jev"
+    ]
+  }
+}

@@ -1,0 +1,7 @@
+Runtime: Bun 1.4.3; effect 4.0.0-beta.83 installed outside repository.
+Core: effects-autonomy-replay + effects-reviewer + tool-boundary: 47 pass, 0 fail, 170 assertions.
+Candidate with readonly-review: 58 pass, 15 fail, 271 assertions.
+Unmodified baseline readonly-review: 11 pass, 15 fail, 101 assertions.
+The same 15 host tests fail because the environment cannot listen on /tmp/opencode/.../observer.sock.
+No native Windows or live OpenCode integration pass is claimed.
+Request hashes: 409 verified offline; candidate JSON equals the tested evidence_scope variant.
