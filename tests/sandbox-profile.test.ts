@@ -712,7 +712,7 @@ describe("assertSandboxAvailable", () => {
 
   test("fail_close throws the §4.3 message; degrade reports degraded", () => {
     expect(() => assertSandboxAvailable("ro", unavailable, "fail_close")).toThrow(
-      /Command blocked:.*sandbox is not available.*The whole command was not run/,
+      /Command blocked:.*sandbox is not available.*The whole command was not run/s,
     )
     expect(assertSandboxAvailable("ro", unavailable, "degrade")).toBe("degraded")
     expect(() => assertSandboxAvailable("rw", undefined, "fail_close")).toThrow(/sandbox is not available/)

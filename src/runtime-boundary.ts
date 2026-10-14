@@ -22,6 +22,8 @@ export type RuntimeBoundaryEvent = {
 export type RuntimeBoundaryResponse = {
   action: "allow" | "continue" | "deny"
   reason?: string
+  /** Rendered, bounded agent notice for the observer's background output. */
+  message?: string
 }
 
 export interface RuntimeBoundaryBroker {
@@ -284,7 +286,7 @@ export async function createRuntimeBoundaryBroker(options: {
           const pass = failureOrPass(options.failPolicy ?? "fail_close", "broker_protocol", () => { options.onFailure?.("broker_protocol") })
           action = pass ? "allow" : "deny"
         }
-        socket.write(JSON.stringify({ version: 1, eventID: event.eventID, action, reason: response.reason }) + "\n")
+        socket.write(JSON.stringify({ version: 1, eventID: event.eventID, action, reason: response.reason, message: response.message }) + "\n")
       }).catch(() => {
         const pass = failureOrPass(options.failPolicy ?? "fail_close", "broker_callback", () => { options.onFailure?.("broker_callback") })
         if (!closed && !socket.destroyed) socket.write(JSON.stringify({

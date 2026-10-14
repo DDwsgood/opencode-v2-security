@@ -59,12 +59,9 @@
  *     SIGTERM/INT/HUP arm a flag checked in every wait loop and take the
  *     same teardown path (SIGKILL is uncatchable and remains a stated
  *     limitation: the payload survives us then).
- *   Block messages: "Command blocked: <reason>. <The boundary operation
- *   was not performed|The command was stopped>; earlier steps may already
- *   have run. Do not automatically rerun the whole command." The first
- *   phrase is used ONLY for entry-gate denials; exit-side denials (recvmsg
- *   cmsg), cancels, timeouts and review failures never claim the operation
- *   did not run.
+ *   Block messages use the broker's rendered notice when available, including
+ *   the observed trigger and refusal source for background jobs. Every runtime
+ *   phase reports the same outcome: "The command was stopped."
  *
  *   helper -> broker (terminal, no reply expected):
  *     {"version":1,"type":"exit","token":"...","exit":<0..255>}
@@ -1014,7 +1011,37 @@ static int proc_check(const char *path, pid_t *pid_out)
 
 static unsigned long g_event_id;
 static char g_deny_reason[240]; /* broker 'reason' carried to the kill text */
+static char g_deny_message[4096]; /* full agent notice, including the trigger */
 static int g_at_exit_stop;      /* decision made at a syscall-EXIT check */
+
+/* The broker renders this field; decode its JSON escaping without allowing
+ * terminal controls. A missing/oversized notice never changes a deny verdict. */
+static void read_deny_message(const char *line)
+{
+    const char *value = strstr(line, "\"message\"");
+    if (!value || !(value = strchr(value, ':'))) return;
+    value++;
+    while (*value == ' ' || *value == '\t') value++;
+    if (*value++ != '"') return;
+    char message[sizeof(g_deny_message)];
+    size_t length = 0;
+    while (*value && *value != '"') {
+        unsigned char character = (unsigned char)*value++;
+        if (character == '\\') {
+            character = (unsigned char)*value++;
+            if (character == 'n') character = '\n';
+            else if (character == 'r' || character == 't') character = ' ';
+            else if (character != '"' && character != '\\' && character != '/') return;
+        }
+        if (length + 1 >= sizeof(message)) return;
+        if (character < 0x20 && character != '\n') character = ' ';
+        if (character == 0x7f) character = ' ';
+        message[length++] = (char)character;
+    }
+    if (*value != '"') return;
+    message[length] = 0;
+    memcpy(g_deny_message, message, length + 1);
+}
 
 static void json_escape(const char *in, char *out, size_t cap)
 {
@@ -1270,6 +1297,7 @@ static int broker_decide_argv(Tracee *t, const char *syscall, const char *kind,
     }
     if (strcmp(action, "allow") == 0) return 1;
     if (strcmp(action, "deny") == 0) {
+        read_deny_message(line);
         /* Carry the broker's reason into the block message when present —
          * bounded and flattened (no quotes/newlines/controls through). */
         const char *rs = strstr(line, "\"reason\"");
@@ -1421,17 +1449,20 @@ static void kill_everything(void)
  * on a broker-EOF path the channel is dead and the write simply fails),
  * then exit with the canonical blocked message.
  *
- * op_blocked distinguishes the two honest wordings: only an ENTRY-gate
- * denial may claim the boundary operation was not performed; a kill during
- * or after the operation must not. */
+ * The stop phase is retained by callers for review evidence, not for the
+ * agent-facing outcome: all runtime refusals use the same stopped wording. */
 static void kill_tree(const char *msg, int op_blocked)
 {
     kill_everything();
     broker_send_exit(128 + SIGKILL);
-    fprintf(stderr, "Command blocked: %s. %s; earlier steps may already "
-            "have run. Do not automatically rerun the whole command.\n",
-            msg, op_blocked ? "The boundary operation was not performed"
-                            : "The command was stopped");
+    (void)op_blocked;
+    if (g_deny_message[0]) {
+        fprintf(stderr, "%s\n", g_deny_message);
+    } else {
+        fprintf(stderr, "Command blocked: %s. The command was stopped. "
+                "Report this block to the user. Do not automatically rerun "
+                "or bypass this denial. Any revised request requires a fresh check.\n", msg);
+    }
     exit(126);
 }
 

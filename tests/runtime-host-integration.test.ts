@@ -175,7 +175,7 @@ describe("real observer → broker → frozen reviewer → original process", ()
     try {
       const failure = await host.failure("write", { path: path.join(directory, "fixture.txt"), content: "fixture" })
       expect(failure._tag).toBe("Tool.Error")
-      expect(failure.message).toContain("Command blocked:")
+      expect(failure.message).toContain("Action blocked before execution:")
       expect(host.calls).toHaveLength(1)
       expect(host.calls[0].input_facts.join("\n")).toContain("EACCES")
       expect(host.executed).toBe(0)
@@ -231,8 +231,15 @@ describe("real observer → broker → frozen reviewer → original process", ()
     expect(host.calls[0].sandbox.trigger).toBe("runtime write boundary")
     expect(host.executed).toBe(1)
   })
-  test("runtime refusal blocks the crossing, not falsely all earlier steps", async () => {
-    const host = await harness(true)
+  test("runtime refusal reports the observed trigger and selected category once without changing earlier effects", async () => {
+    const host = await harness(true, { review: async () => {
+      const answers = report().answers
+      answers.scope_coverage = { choice: "uncovered" }
+      answers.uncovered_owner = { choice: "remote" }
+      answers.remote_severity = { noul: 1 }
+      answers.remote_facts = { choice: "resolved_present" }
+      return adjudicateEffectAnswers(answers)
+    } })
     const counter = path.join(workspace, "before-refusal.txt"), target = path.join(outside, "denied.txt")
     await writeFile(target, "UNCHANGED")
     const result = await host.run("shell", { command: python(`open(${JSON.stringify(counter)},'a').write('A'); open(${JSON.stringify(target)},'w').write('replacement')`) })
@@ -240,13 +247,18 @@ describe("real observer → broker → frozen reviewer → original process", ()
     expect(await readFile(counter, "utf8")).toBe("A")
     expect(await readFile(target, "utf8")).toBe("UNCHANGED")
     expect(result.content).toContain("Command blocked:")
-    expect(result.content).toContain("earlier steps")
+    expect(result.content).toContain("Trigger: open for truncation (openat)")
+    expect(result.content).toContain("Command review - remote or shared-state effects: the commands contains effects that is unsafe or unauthorized.")
+    expect(result.content).toContain(JSON.stringify(target))
+    expect(result.content).toContain("Report this block to the user.")
+    expect(result.output.output.match(/Command blocked:/g)).toHaveLength(1)
     expect(result.content).not.toContain("The whole command was not run.")
     expect(host.calls).toHaveLength(1)
-    // Entry-gate refusal keeps its honest wording: the operation was
-    // paused before its boundary effect and was not performed.
+    // The reviewer still receives the real entry phase; the agent sees
+    // the same stopped outcome used for every runtime refusal.
     expect(host.calls[0].input_facts[0]).toContain("paused this operation before its boundary effect")
-    expect(result.content).toContain("was not performed")
+    expect(result.content).toContain("The command was stopped.")
+    expect(result.content).not.toMatch(/was not performed|earlier steps|rolled back/)
   })
   test("a boundary event without atExit is reviewed and refused as phase-unknown", async () => {
     const host = await harness(true)
@@ -264,13 +276,10 @@ describe("real observer → broker → frozen reviewer → original process", ()
     expect(host.calls[0].input_facts[0]).toContain("may or may not have run")
     expect(host.calls[0].input_facts[0]).not.toContain("paused this operation before its boundary effect")
     expect(host.calls[0].input_facts[0]).not.toContain("already ran")
-    // And the appended refusal notice must not claim the operation was
-    // not performed. (The helper's own stderr may truthfully say "The
-    // boundary operation was not performed" — it knows the stop was an
-    // entry stop; only the notice wording is phase-derived.)
+    // Native output and the tool notice both use the same stopped wording.
     expect(result.content).toContain("Command blocked:")
     expect(result.content).toContain("The command was stopped")
-    expect(result.content).not.toContain("The blocked boundary operation was not performed")
+    expect(result.content).not.toContain("was not performed")
   })
   test("same outside object, changed contents reuses an event grant", async () => {
     const host = await harness()
@@ -570,7 +579,7 @@ describe("failPolicy at the original native executor", () => {
           const result = await host.run("shell", { command: "printf observer-pass" })
           expect(result.content).toBe("observer-pass")
           expect(result.metadata.boundary.executionRoute).toBe("host_direct_reviewed")
-        } else expect((await host.failure("shell", { command: "printf observer-pass" })).message).toContain("observer is unavailable")
+        } else expect((await host.failure("shell", { command: "printf observer-pass" })).message).toContain("Check unavailable (observer_unavailable)")
       } finally { unavailable.mockRestore() }
     })
     test(`cache exceptions: ${failPolicy}`, async () => {
@@ -618,7 +627,7 @@ describe("failPolicy at the original native executor", () => {
   })
   test("adjudicated model/floor denies remain refusals under fail_open", async () => {
     const host = await harness(true)
-    expect((await host.failure("write", { path: path.join(outside, "floor-deny.txt"), content: "fixture" })).message).toContain("Command blocked:")
+    expect((await host.failure("write", { path: path.join(outside, "floor-deny.txt"), content: "fixture" })).message).toContain("Action blocked before execution:")
     const result = await host.run("shell", { command: `printf x > ${quote(path.join(outside, "runtime-deny.txt"))}` })
     expect(result.output.exit).toBe(126)
     expect(result.metadata.boundary.runtimeBlocked).toBe(true)

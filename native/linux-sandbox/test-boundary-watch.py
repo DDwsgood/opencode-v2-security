@@ -925,8 +925,9 @@ print("sent")
         self.assertEqual(len(br.events), 1)
         self.assertEqual(br.events[0]["targets"][0]["path"], victim)
         self.assertTrue(os.path.exists(victim))
-        # Entry-gate denial: the operation really was held before execution.
-        self.assertIn("was not performed", err)
+        # The operation was held, but all runtime phases share one outcome.
+        self.assertIn("The command was stopped.", err)
+        self.assertNotIn("was not performed", err)
 
     # 25. linkat source is followed only under AT_SYMLINK_FOLLOW ('ln -L'):
     #     the default physical link of an in-root symlink raises no event.
@@ -1092,8 +1093,7 @@ print("sent")
         self.assertEqual(br.events[0]["targets"][0]["path"], "/dev/null")
 
     # 34. A cancel while the (detached) payload is still running must say
-    #     "The command was stopped" — the boundary operation ran long ago;
-    #     only an entry-gate denial may claim it was not performed.
+    #     "The command was stopped", just like entry and unknown-phase stops.
     #     (The only exit-side event, recvfd/SCM_RIGHTS, cannot be exercised
     #     live: its sendmsg sibling is full-approval, which only 'allow'
     #     can pass — and 'allow' ends supervision. Wording coverage for the

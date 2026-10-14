@@ -136,8 +136,15 @@ import { inspectRegularTextFileSync, inspectionErrorCode } from "./security/insp
 import { createSingleFlight } from "./security/single-flight"
 import {
   accessErrorNote,
+  CANCEL_ADVICE,
+  cancelledText,
+  checkUnavailableReason,
   runtimeBlockedText,
+  runtimeBoundaryTrigger,
+  nativeActionTrigger,
+  type RuntimeBlockDetails,
   actionBlockedText,
+  actionBeforeText,
   blockedText,
   permissionChangeRejectedText,
   RECHECK,
@@ -240,7 +247,7 @@ function blockedRejection(reason: string, advice?: string): Error & { readonly _
 // blocked" envelope so the host's `catchTag("Tool.Error")` still routes it to
 // a tool-call error instead of a step-killing defect.
 function toRejection(error: unknown): Error & { readonly _tag: "Tool.Error" } {
-  if (error instanceof SecurityCheckFailure) return blockedRejection(error.reason)
+  if (error instanceof SecurityCheckFailure) return blockedRejection(checkUnavailableReason(error.code), RETRY_LATER)
   if (error instanceof Error && (error as { _tag?: string })._tag === "Tool.Error") {
     return error as Error & { readonly _tag: "Tool.Error" }
   }
@@ -256,12 +263,10 @@ function toRejection(error: unknown): Error & { readonly _tag: "Tool.Error" } {
     return blockedRejection(error.agentReason, error.changed ? RECHECK : undefined)
   }
   if (error instanceof EffectsReviewError) {
-    if (error.kind === "aborted") return blockedRejection("the call was cancelled before it started")
+    if (error.kind === "aborted") return rejectionError(cancelledText())
     return blockedRejection(reviewUnavailableReason(error.kind), RETRY_LATER)
   }
-  return blockedRejection(
-    `the security check failed with an internal error (${error instanceof Error ? error.message : String(error)})`,
-  )
+  return blockedRejection(checkUnavailableReason("check_unavailable"), RETRY_LATER)
 }
 
 function conciseReason(reason: string, limit = 160) {
@@ -1366,8 +1371,10 @@ const plugin: Plugin = {
       for (const authorization of boundaryCalls.values()) {
         if (authorization.sessionID !== sessionID) continue
         if (authorization.securitySnapshot === currentSnapshot) continue
-        authorization.runtimeBlocked = "the session's security mode or authorization changed while the command was running"
-        authorization.runtimeBlockedPhase ??= "unknown" // revoked mid-run: never "not performed"
+        if (!authorization.runtimeBlocked) {
+          authorization.runtimeBlocked = "Session permissions or authorization changed"
+          authorization.runtimeBlockDetails = { advice: RECHECK }
+        }
         if (authorization.runtimeBroker) void authorization.runtimeBroker.close()
         else authorization.cancelExecution?.()
       }
@@ -1821,13 +1828,8 @@ const plugin: Plugin = {
       cancelExecution?: () => void
       cacheUpdates?: Array<{ scope: ApprovalCacheScope; facts: ApprovalCacheFacts }>
       runtimeBlocked?: string
+      runtimeBlockDetails?: RuntimeBlockDetails
       failOpenPasses?: string[]
-      /** Phase of the refused crossing. Only "entry" (the helper emitted
-       *  atExit:false — the syscall was still held before execution) may
-       *  claim the boundary operation was not performed. "exit" (recvmsg
-       *  cmsg check), cancels, review failures and anything else map to
-       *  "unknown"→"the command was stopped". */
-      runtimeBlockedPhase?: "entry" | "exit" | "unknown"
       runtimeStats?: { crossings: number; reviewRequests: number; cacheHits: number; staticAllows: number }
       background?: boolean
       /** Set once permission.evaluate has allowed at least one assert of
@@ -1956,6 +1958,7 @@ const plugin: Plugin = {
             decision: verdict.decision,
             source: verdict.source,
             floor: verdict.floor,
+            uncoveredOwner: verdict.uncoveredOwner,
             policyVersion,
           })
           return verdict
@@ -2009,11 +2012,14 @@ const plugin: Plugin = {
       return resolveUncollectableEffects(result, true, resolved.dynamicReview.onUncollectable)
     }
 
-    function assertBoundaryDecision(result: EffectReviewResult): void {
+    function assertBoundaryDecision(result: EffectReviewResult, action?: string): void {
       if (result.decision === "allow") return
       // Refusal wording lives in agent-messages.ts (floor → evidence → deny
       // order preserved there); the frozen adjudication itself is untouched.
       const refusal = reviewRefusal(result)
+      if (action) {
+        throw rejectionError(actionBeforeText(refusal.reason, action, refusal.advice))
+      }
       throw blockedRejection(refusal.reason, refusal.advice)
     }
 
@@ -2126,18 +2132,28 @@ const plugin: Plugin = {
         return { verdict: decision.verdict, rules: decision.rules }
       })
       const commandProofRules = () => proofRules
-      const blocked = (reason: string) => {
+      const recordBlock = (reason: string, event?: RuntimeBoundaryEvent, advice?: string, cancelled = false) => {
         // First refusal reason wins: a downstream broker EOF/cancel must not
         // rewrite why the crossing was actually denied.
-        authorization.runtimeBlocked ??= reason
-        authorization.runtimeBlockedPhase ??= eventPhase
-        return { action: "deny" as const, reason }
+        if (!authorization.runtimeBlocked) {
+          authorization.runtimeBlocked = reason
+          authorization.runtimeBlockDetails = {
+            ...(event ? { trigger: runtimeBoundaryTrigger(event) } : {}),
+            ...(advice ? { advice } : {}),
+            ...(cancelled ? { cancelled: true } : {}),
+          }
+        }
+        return {
+          action: "deny" as const,
+          reason: authorization.runtimeBlocked,
+          message: runtimeBlockedText(authorization.runtimeBlocked, authorization.runtimeBlockDetails),
+        }
       }
-      const failed = (code: string, reason: string) => {
-        if (authorization.runtimeBlocked) return blocked(authorization.runtimeBlocked)
-        if (preparationSignal.aborted) return blocked("the command was cancelled at its sandbox boundary")
-        if (securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot) return blocked("the session's security mode or authorization changed")
-        return passFailure(code, call, authorization) ? { action: "allow" as const } : blocked(reason)
+      const failure = (code: string, event?: RuntimeBoundaryEvent) => {
+        if (authorization.runtimeBlocked) return recordBlock(authorization.runtimeBlocked)
+        if (preparationSignal.aborted) return recordBlock("Cancellation: the call was cancelled", undefined, CANCEL_ADVICE, true)
+        if (securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot) return recordBlock("Session permissions or authorization changed", undefined, RECHECK)
+        return passFailure(code, call, authorization) ? { action: "allow" as const } : recordBlock(checkUnavailableReason(code), event, RETRY_LATER)
       }
       // Name-matched incidental writes (any `__pycache__`/`.pytest_cache`
       // component) bypass the boundary in EVERY mode — but never inside a
@@ -2152,10 +2168,12 @@ const plugin: Plugin = {
       const broker = await createRuntimeBoundaryBroker({
         directory: "/tmp/opencode",
         failPolicy: resolved.failPolicy,
-        onError: (reason) => { failed("broker_unavailable", reason) },
-        onFailure: (code) => { failed(code, "the runtime boundary observer could not complete its check") },
+        onError: () => { failure("broker_unavailable") },
+        onFailure: (code) => { failure(code) },
         onCancelFailure: () => authorization.cancelExecution?.(),
         onBoundary: async (event: RuntimeBoundaryEvent, signal) => {
+          const blocked = (reason: string, advice?: string) => recordBlock(reason, event, advice)
+          const failed = (code: string) => failure(code, event)
           try {
           authorization.runtimeStats!.crossings++
           // The helper always emits atExit explicitly; an absent field is
@@ -2163,10 +2181,10 @@ const plugin: Plugin = {
           eventPhase = event.details.atExit === true ? "exit"
             : event.details.atExit === false ? "entry" : "unknown"
           await hydratePermAncestry(call.sessionID)
-          if (preparationSignal.aborted) return blocked("the command was cancelled at its sandbox boundary")
-          if (signal.aborted) return failed("broker_unavailable", "the runtime boundary observer connection failed")
+          if (preparationSignal.aborted) return recordBlock("Cancellation: the call was cancelled", undefined, CANCEL_ADVICE, true)
+          if (signal.aborted) return failed("broker_unavailable")
           if (securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot) {
-            return blocked("the session's security mode or authorization changed")
+            return recordBlock("Session permissions or authorization changed", undefined, RECHECK)
           }
           const permission = effectivePerm(call.sessionID)
           const canWrite = permission.w
@@ -2187,15 +2205,15 @@ const plugin: Plugin = {
           // interop/opaque/read/network crossings get the read-only review.
           if (!canWrite && ["write", "privilege"].includes(event.kind)) {
             return blocked(ancestryUnresolved(call.sessionID)
-              ? "the session's permission chain could not be verified, so this operation is blocked for now"
-              : "this session is in [Read only] mode: the observed operation exceeds its read-only limit")
+              ? "Permission check incomplete: the session's inherited permissions could not be verified"
+              : "Read-only limit: this operation exceeds the session's permitted effects", ancestryUnresolved(call.sessionID) ? RETRY_LATER : WITHIN_MODE)
           }
-          if (event.kind === "read" && !permission.r) return blocked("this session does not allow file reads")
+          if (event.kind === "read" && !permission.r) return blocked("Read limit: this session does not permit file reads", WITHIN_MODE)
           if (event.kind === "write" && event.targets.some((target) =>
             deniedWritePaths.some((root) => containsPath(root, target.path)) ||
             [path.dirname(broker.socketPath), DEFAULT_BOUNDARY_WATCH_HELPER, PACKAGE_ROOT]
               .some((root) => containsPath(root, target.path) || containsPath(target.path, root)))) {
-            return blocked("the observed write hits a protected or denied path")
+            return blocked("Write protection: the target is protected or explicitly denied", WITHIN_MODE)
           }
           const bypass = activeBypass(call.sessionID)
           // Disabling review layers cannot waive the independent RO
@@ -2246,12 +2264,12 @@ const plugin: Plugin = {
                 ...(executable ? { executable: path.basename(executable) } : {}) } })
             return { action: "continue" }
           }
-          if (!ctx.session.context) return failed("session_context", "the safety review could not read the session's user authorization")
+          if (!ctx.session.context) return failed("session_context")
           const retained = boundarySessionContext(await run(ctx.session.context({ sessionID: call.sessionID }), signal))
           const observed = await currentCacheTargets(event.targets)
-          if (!targetIdentitiesMatch(event.targets, observed)) return failed("target_changed", "a boundary target changed before it could be checked")
+          if (!targetIdentitiesMatch(event.targets, observed)) return failed("target_changed")
           if (observed.some((target) => target.inspectionError) && resolved.failPolicy === "fail_open") {
-            return failed("target_inspection", "the boundary target evidence could not be inspected")
+            return failed("target_inspection")
           }
           const metadata = await Promise.all(observed.map(async (target) => {
             let inspectionError: string | undefined
@@ -2318,16 +2336,20 @@ const plugin: Plugin = {
             authorization.runtimeStats!.cacheHits++
             // The exact negative verdict has already been selected. A later
             // context/cache inspection failure must not turn it into a pass.
-            if (hit.decision === "deny") return blocked(hit.result ? reviewRefusal(hit.result).reason : "a previous safety review denied the same operation")
+            if (hit.decision === "deny") {
+              const refusal = hit.result ? reviewRefusal(hit.result) : { reason: "Cached denial: a pervious review denied the similar operation" }
+              return blocked(refusal.reason, refusal.advice)
+            }
             const currentTargets = await currentCacheTargets(observed)
             // Positive cache reuse is not bound to the user message: a new
             // message does not revoke an allowed verdict. (Deny hits already
             // returned above, still bound to their message by the lookup.)
-            if (preparationSignal.aborted || securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot) {
-              return blocked("the boundary authorization or target changed before its cached approval could be used")
+            if (preparationSignal.aborted) return recordBlock("Cancellation: the call was cancelled", undefined, CANCEL_ADVICE, true)
+            if (securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot) {
+              return recordBlock("Session permissions or authorization changed", undefined, RECHECK)
             }
             if (currentTargets.some((target) => target.inspectionError) || !targetIdentitiesMatch(observed, currentTargets)) {
-              return failed("target_changed", "the boundary authorization or target changed before its cached approval could be used")
+              return failed("target_changed")
             }
             authorization.source = `cache:${hit.layer}`
             writeReviewerTrace({ kind: "effects_cache_hit", sessionID: call.sessionID, callID: call.id,
@@ -2350,18 +2372,19 @@ const plugin: Plugin = {
                   stats: authorization.runtimeStats,
                 }, !canWrite))
             } catch (error) {
-              if (preparationSignal.aborted) return blocked("the command was cancelled at its sandbox boundary")
-              if (error instanceof EffectsReviewError && error.kind === "aborted" && !signal.aborted) return blocked("the command was cancelled at its sandbox boundary")
-              return failed(error instanceof EffectsReviewError ? `review_${error.kind}` : "review_unavailable", reviewUnavailableReason(error instanceof EffectsReviewError ? error.kind : "infrastructure"))
+              if (preparationSignal.aborted) return recordBlock("Cancellation: the call was cancelled", undefined, CANCEL_ADVICE, true)
+              if (error instanceof EffectsReviewError && error.kind === "aborted" && !signal.aborted) return recordBlock("Cancellation: the call was cancelled", undefined, CANCEL_ADVICE, true)
+              return failed(error instanceof EffectsReviewError ? `review_${error.kind}` : "review_unavailable")
             }
             writeReviewerTrace({ kind: "effects_boundary_outcome", sessionID: call.sessionID, callID: call.id,
               commandSha256: digest(command), eventID: event.eventID, decision: result.decision, source: result.source,
-              floor: result.floor, reviewer: injectedEffectsReview ? "test_injection" : "jev", policyVersion: reviewPolicyVersion })
+              floor: result.floor, uncoveredOwner: result.uncoveredOwner, reviewer: injectedEffectsReview ? "test_injection" : "jev", policyVersion: reviewPolicyVersion })
           }
           // A completed deny remains final even if subsequent cache or
           // identity bookkeeping fails.
           if (result.decision !== "allow") {
-            const refusal = blocked(reviewRefusal(result).reason)
+            const review = reviewRefusal(result)
+            const refusal = blocked(review.reason, review.advice)
             // Bookkeeping is best-effort after a real deny; its exception
             // must never erase or turn that completed decision into a pass.
             try { if (!hit) approvalCache.store(scope, facts, result) } catch {
@@ -2372,13 +2395,14 @@ const plugin: Plugin = {
           // A positive verdict stands on its own: it is stored unbound to
           // the user message, so a newer message mid-review does not block
           // it. (Denials returned above, still bound to their message.)
-          if (preparationSignal.aborted || securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot) {
-            return blocked("the session's user authorization changed during the boundary check")
+          if (preparationSignal.aborted) return recordBlock("Cancellation: the call was cancelled", undefined, CANCEL_ADVICE, true)
+          if (securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot) {
+            return recordBlock("Session permissions or authorization changed", undefined, RECHECK)
           }
           const reviewedTargets = await currentCacheTargets(observed)
-          if (!targetIdentitiesMatch(observed, reviewedTargets)) return failed("target_changed", "a boundary target changed during the safety review")
+          if (!targetIdentitiesMatch(observed, reviewedTargets)) return failed("target_changed")
           if (reviewedTargets.some((target, index) => target.inspectionError && !observed[index]?.inspectionError)) {
-            return failed("target_inspection", "the reviewed target identity is now unavailable; it must be checked again with that evidence gap")
+            return failed("target_inspection")
           }
           // requiresFullApproval (opaque/exec-domain/capability) events never
           // get a positive cache entry: executable identity + argv still does
@@ -2390,7 +2414,10 @@ const plugin: Plugin = {
           const storable = result.decision !== "allow" ||
             !(facts.requiresFullApproval ?? false)
           if (!hit && storable) approvalCache.store(scope, facts, result)
-          if (result.decision !== "allow") return blocked(reviewRefusal(result).reason)
+          if (result.decision !== "allow") {
+            const refusal = reviewRefusal(result)
+            return blocked(refusal.reason, refusal.advice)
+          }
           rememberAllowedWrite(event)
           authorization.source = hit ? `cache:${hit.layer}` : result.source
           authorization.cacheUpdates ??= []
@@ -2406,7 +2433,7 @@ const plugin: Plugin = {
             // to record the refusal: the broker replies 'deny', and without
             // runtimeBlocked the command would die with a bare 126 and no
             // reason anywhere (foreground notice AND metadata depend on it).
-            return failed("boundary_inspection", `the runtime boundary evidence could not be collected (${inspectionErrorCode(error)})`)
+            return failed("boundary_inspection")
           }
         },
       })
@@ -2576,7 +2603,7 @@ const plugin: Plugin = {
             sandboxDenyWrite: resolved.sandbox.denyWrite, trustedCommands: resolved.trustedCommands,
           })
           if (floorCheck.verdict === "DENY" && floorCheck.rules.some(isFloorRule)) {
-            throw blockedRejection(floorCheck.reason, WITHIN_MODE)
+            throw blockedRejection(`Static restriction: ${conciseReason(floorCheck.reason, 300)}`, WITHIN_MODE)
           }
         }
         if (readOnly) {
@@ -2601,7 +2628,7 @@ const plugin: Plugin = {
             trustedCommands: resolved.trustedCommands,
           })
           if (launch.verdict === "DENY" && launch.rules.some((rule) => rule === "permission.write" || isFloorRule(rule))) {
-            throw blockedRejection(launch.reason, ancestryUnresolved(call.sessionID) ? RETRY_LATER : WITHIN_MODE)
+            throw blockedRejection(`Static restriction: ${conciseReason(launch.reason, 300)}`, ancestryUnresolved(call.sessionID) ? RETRY_LATER : WITHIN_MODE)
           }
         }
         if (effectivePerm(call.sessionID).w && (!resolved.sandbox.enabled || resolved.sandbox.mode === "full" || bypass.has("sandbox"))) {
@@ -2638,7 +2665,7 @@ const plugin: Plugin = {
       if (filePlan.targets.some((target) => target.mode !== "read" &&
         [...resolved.sandbox.denyWrite, ...credentialPaths, DEFAULT_BOUNDARY_WATCH_HELPER, PACKAGE_ROOT]
           .some((root) => containsPath(root, target.resolved)))) {
-        throw blockedRejection("the native write hits a protected or denied path")
+        throw rejectionError(actionBeforeText("Write protection: the target is protected or explicitly denied", nativeActionTrigger(tool, filePlan), WITHIN_MODE))
       }
       if (filePlan.targets.some((target) => target.inspectionError) && resolved.failPolicy === "fail_open") {
         throw new SecurityCheckFailure("target_inspection", "the native target evidence could not be inspected")
@@ -2730,7 +2757,7 @@ const plugin: Plugin = {
           try { if (!cacheHit) approvalCache.store(cacheScope, cacheFacts, result) } catch {
             passFailure("cache_store", call, authorization)
           }
-          assertBoundaryDecision(result)
+          assertBoundaryDecision(result, nativeActionTrigger(tool, filePlan))
         }
         const latest = boundarySessionContext(await run(ctx.session.context({ sessionID: call.sessionID }), signal))
         if (securitySnapshotFor(call.sessionID) !== securitySnapshot ||
@@ -2750,9 +2777,10 @@ const plugin: Plugin = {
           decision: result.decision,
           source: result.source,
           floor: result.floor,
+          uncoveredOwner: result.uncoveredOwner,
           policyVersion: fileReviewPolicyVersion,
         })
-        assertBoundaryDecision(result)
+        assertBoundaryDecision(result, nativeActionTrigger(tool, filePlan))
         authorization.source = cacheHit ? `cache:${cacheHit.layer}` : result.source
         authorization.cacheUpdates = [{ scope: cacheScope, facts: cacheFacts }]
       } else if (needsReview) {
@@ -2948,7 +2976,7 @@ const plugin: Plugin = {
                 // output must not be dressed up as a post-launch OS error.
                 const runtimeRefusal = prepared.authorization.runtimeBlocked
                   ? runtimeBlockedText(prepared.authorization.runtimeBlocked,
-                      prepared.authorization.runtimeBlockedPhase === "entry") : undefined
+                      prepared.authorization.runtimeBlockDetails) : undefined
                 const accessError = !runtimeRefusal && name === "shell" && output && output.exit !== 0 &&
                   typeof output.output === "string" && !output.output.includes("The whole command was not run.") &&
                   /permission denied|read-only file system|device or resource busy|cross-device link|\bEACCES\b|\bEPERM\b|sudo:|bwrap:|opencode-sandbox:/i.test(output.output)
@@ -2956,7 +2984,9 @@ const plugin: Plugin = {
                 // note (agent-messages.ts) only explains that this is an OS
                 // result, not a plugin block — never a retry hint.
                 const notice = runtimeRefusal ?? accessErrorNote(prepared.authorization.executionRoute === "host_direct_reviewed")
-                const appendNotice = !!runtimeRefusal || accessError
+                const appendNotice = runtimeRefusal
+                  ? !String(output?.output ?? "").includes(runtimeRefusal)
+                  : accessError
                 return {
                   ...value,
                   ...(appendNotice ? {
@@ -3225,7 +3255,7 @@ const plugin: Plugin = {
           // denial must not claim the whole command never ran.
           const deny = (reason: string, advice?: string) => {
             ev.effect = "deny"
-            ev.message = authorization.asserted ? actionBlockedText(reason) : blockedText(reason, advice)
+            ev.message = authorization.asserted ? actionBlockedText(reason, advice) : blockedText(reason, advice)
           }
           // Last gate before the action runs: the admission was computed
           // against a security snapshot (effective r/w ceiling + mode +

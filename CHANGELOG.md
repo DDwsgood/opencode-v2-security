@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.7.3 (2026-10-15)
+
+- Report the observed runtime effect, syscall and safely displayed target in
+  refusal notices; keep whole-command review reasons distinct from the trigger.
+- Describe uncovered review categories with short phrases, distinguish hard
+  limits, review failures, cancellation and permission changes, and ask the agent
+  to report blocks to the user instead of bypassing or automatically replaying them.
+- Use `The command was stopped.` for entry, exit and unknown runtime phases.
+  Deliver the same rendered notice through the native observer for background
+  commands and avoid duplicate notices in foreground results.
+- Include `uncoveredOwner` in reviewer result and outcome traces so single-category
+  and multiple-category denials can be measured without recording command bodies.
+
 ## 1.7.2 (2026-10-12)
 
 - Revise JEV privilege and credential prompts: an explicitly requested tool,
