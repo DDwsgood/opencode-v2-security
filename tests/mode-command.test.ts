@@ -336,6 +336,40 @@ describe("security mode commands", () => {
     expect(status.active).not.toContain("ALL")
   })
 
+  test("/bypass emits one command response for the final state, never intermediate or failed results", async () => {
+    for (const text of ["all off", "all fs", "+all +all"]) {
+      const host = await harness()
+      await host.command("bypass", text)
+      const status = await host.status()
+      const responses = host.events.filter((entry) => entry[0] === "changed" && (entry[1] as any).command === "bypass")
+      expect(responses).toHaveLength(1)
+      expect((responses[0]![1] as any).mode).toBe(status.mode)
+      expect((responses[0]![1] as any).active).toEqual(status.active)
+      if (text === "all off") {
+        expect(status.mode).toBe("auto")
+        expect(status.active).toEqual([])
+      }
+    }
+
+    const host = await harness()
+    expect(await host.commandError("bypass", "all -all 120")).toContain("No active bypass lease")
+    expect(host.events.filter((entry) => entry[0] === "changed" && (entry[1] as any).command)).toHaveLength(0)
+  })
+
+  test("/perm responds once for every successful mode command, while agent changes stay silent", async () => {
+    const host = await harness()
+    for (const mode of ["readonly", "auto", "bypass", "auto"]) {
+      host.events.length = 0
+      await host.command("perm", mode)
+      const responses = host.events.filter((entry) => entry[0] === "changed" && (entry[1] as any).command === "perm")
+      expect(responses).toHaveLength(1)
+      expect((responses[0]![1] as any).mode).toBe(mode)
+    }
+    host.events.length = 0
+    await host.setPermission("readonly", "child")
+    expect(host.events.filter((entry) => entry[0] === "changed" && (entry[1] as any).command)).toHaveLength(0)
+  })
+
   test("category arms without the kill switch keep the ceiling visible", async () => {
     const host = await harness()
     await host.command("perm", "ro")
@@ -436,6 +470,83 @@ describe("security mode commands", () => {
     })
     expect((await host.status("child")).mode).toBe("readonly")
     expect(host.events.some((entry) => entry[0] === "permission" && (entry[1] as any).sessionID === "child")).toBe(true)
+    expect(host.events.some((entry) => entry[0] === "changed" && (entry[1] as any).sessionID === "child")).toBe(false)
+  })
+
+  test("spawning a subagent that inherits parent permissions emits no TUI bypass-changed toast event", async () => {
+    const host = await harness()
+    await host.command("bypass", "fs")
+    const changedBefore = host.events.filter((entry) => entry[0] === "changed").length
+    await host.execBefore({
+      tool: "subagent",
+      sessionID: "parent",
+      id: "spawn-inherit",
+      input: {},
+    })
+    await host.execAfter({
+      tool: "subagent",
+      id: "spawn-inherit",
+      status: "completed",
+      result: { metadata: { sessionID: "child" } },
+    })
+    expect((await host.status("child")).active).toContain("filesystem")
+    expect(host.events.some((entry) => entry[0] === "permission" && (entry[1] as any).sessionID === "child" && (entry[1] as any).reason === "spawned")).toBe(true)
+    expect(host.events.filter((entry) => entry[0] === "changed").length).toBe(changedBefore)
+  })
+
+  test("/bypass c alias adds custom scope and /bypass c, -c, -c <index>, -c <substring> remove it", async () => {
+    const scope = "Ignore checks on **site**:..."
+    for (const closeCmd of ["c", "custom", "-c", "-custom", "-c 0", "-c site"]) {
+      const host = await harness()
+      await host.command("bypass", `c ${scope}`)
+      const armed = await host.status()
+      expect(armed.custom).toEqual([scope])
+      await host.command("bypass", closeCmd)
+      const cleared = await host.status()
+      expect(cleared.custom).toBeUndefined()
+      expect(cleared.expiresAt).toBeUndefined()
+    }
+
+    // Selective removal among multiple custom scopes while keeping armed categories intact
+    const host = await harness()
+    await host.command("bypass", "fs")
+    await host.command("bypass", "c first rule about alpha")
+    await host.command("bypass", "custom second rule about site")
+    await host.command("bypass", "c third rule about site and beta")
+    expect((await host.status()).custom).toEqual([
+      "first rule about alpha",
+      "second rule about site",
+      "third rule about site and beta",
+    ])
+    // Remove by 0-based index
+    await host.command("bypass", "-c 0")
+    expect((await host.status()).custom).toEqual([
+      "second rule about site",
+      "third rule about site and beta",
+    ])
+    // Remove all remaining scopes containing "site"
+    await host.command("bypass", "-c site")
+    const afterSubstring = await host.status()
+    expect(afterSubstring.custom).toBeUndefined()
+    expect(afterSubstring.active).toContain("filesystem")
+  })
+
+  test("/bypass help emits a help event without mutating state, and invalid /bypass input returns concise error with /bypass help hint", async () => {
+    const host = await harness()
+    await host.command("bypass", "c allow /tmp/demo")
+    const before = await host.status()
+    await host.command("bypass", "help")
+    const after = await host.status()
+    expect(after).toEqual(before)
+    const helpEvent = host.events.findLast((entry) => entry[0] === "changed")
+    expect(helpEvent).toBeDefined()
+    expect((helpEvent![1] as any).reason).toBe("help")
+    expect((helpEvent![1] as any).custom).toEqual(["allow /tmp/demo"])
+
+    const unknownErr = await host.commandError("bypass", "bogus_cat")
+    expect(unknownErr).toBe("Unknown bypass category: bogus_cat. Run /bypass help for usage.")
+    const emptyCustomErr = await host.commandError("bypass", "+c   ")
+    expect(emptyCustomErr).toBe("Custom bypass (+c / +custom) requires a nonempty scope. Run /bypass help for usage.")
   })
 
   test("a failed spawn consumes the declared stash instead of leaking it to siblings", async () => {

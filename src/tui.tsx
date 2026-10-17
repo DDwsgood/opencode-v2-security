@@ -50,6 +50,7 @@ import {
   type IndicatorTheme,
 } from "./indicator"
 import { StatusRevisions, sessionsToRefresh } from "./indicator-refresh"
+import { securityModeLabel } from "./permissions"
 
 type Context = Plugin.Context
 
@@ -79,6 +80,38 @@ function formatDuration(ms: number): string {
   if (min < 90) return `${min}m`
   const hr = Math.round(min / 60)
   return `${hr}h`
+}
+
+function bypassHelpText(data: BypassChangedData): string {
+  const active = data.active.length > 0 ? data.active.join(", ") : "none"
+  const temporary = data.temporary.length > 0 ? data.temporary.join(", ") : "none"
+  const permanent = data.permanent.length > 0 ? data.permanent.join(", ") : "none"
+  const customLines =
+    data.custom && data.custom.length > 0
+      ? data.custom.map((item, idx) => `  [${idx}] ${item}`)
+      : ["  none"]
+  return [
+    `Current session: mode=${data.mode ?? "auto"} | active=${active} (temporary: ${temporary}; permanent: ${permanent})`,
+    "Active custom scopes:",
+    ...customLines,
+    "",
+    "Commands:",
+    "  /bypass <cat...> [timeout]       Toggle/arm categories (+cat arms, -cat disarms)",
+    "  /bypass c <text>                 Add custom scope (alias for /bypass custom <text>)",
+    "  /bypass c  |  /bypass -c         Clear all custom scopes",
+    "  /bypass -c <index|text>          Remove custom scope at 0-based index or matching <text>",
+    "  /bypass all | * | ALL | yolo     Switch to [Bypass mode] (skips all plugin checks)",
+    "  /bypass off | 0 | clear          Clear all categories, custom scopes, and Bypass mode",
+    "  /bypass help | ? | -h            Show this persistent help dialog",
+    "",
+    "Categories:",
+    "  filesystem (fs), host, privilege, secret, network, remote, indirection, dynamic, sandbox, slow",
+    "  Legacy aliases: fs=filesystem, os=host+privilege+indirection, web=network+remote, c=custom",
+    "",
+    "Timeout:",
+    "  Trailing number in seconds sets an absolute deadline (never extended by activity).",
+    "  <= 0 (e.g. /bypass fs -1) never expires on its own until /bypass off.",
+  ].join("\n")
 }
 
 function toastFor(data: BypassChangedData): Toast {
@@ -118,6 +151,14 @@ function toastFor(data: BypassChangedData): Toast {
       message: `Classification, effects review and the plugin sandbox are skipped for this session (${expiry}). /bypass off restores checks.`,
       variant: "error",
       duration: 10000,
+    }
+  }
+  if (data.command === "perm") {
+    return {
+      title: "Session permissions updated",
+      message: `Current mode: ${securityModeLabel(data.mode ?? "auto", data.active, (data.custom?.length ?? 0) > 0)}.`,
+      variant: "info",
+      duration: 6000,
     }
   }
   switch (data.reason) {
@@ -365,6 +406,25 @@ const plugin: Plugin.Definition = {
       for (const id of sessionsToRefresh(sourceID, family)) void pullStatus(id)
     }
 
+    const showBypassHelp = (data: BypassChangedData) => {
+      const title = "/bypass — Command & Category Reference"
+      const message = bypassHelpText(data)
+      const dialog = (
+        context.ui as {
+          dialog?: {
+            alert?: (options: { title: string; message: string }) => Promise<void>
+            set?: (options: { size?: "medium" | "large" | "xlarge"; centered?: boolean }) => void
+          }
+        }
+      )?.dialog
+      if (typeof dialog?.alert === "function") {
+        void dialog.alert({ title, message })
+        dialog.set?.({ size: "large", centered: true })
+        return
+      }
+      context.ui.toast.show({ title, message, variant: "info", duration: 15000 })
+    }
+
     // rpc.events.on subscriptions finish silently when the shared event
     // stream restarts, so both handlers live behind subscribeRpc() which can
     // re-register them; a generation stamp keeps a not-yet-collected stale
@@ -413,6 +473,13 @@ const plugin: Plugin.Definition = {
               }
               // Descendants inherit the change but get no event of their own.
               pullFamily(data.sessionID)
+              // Background changes (including expiry) update the badge only.
+              // A reason such as "updated" does not identify a user command.
+              if (data.command !== "bypass" && data.command !== "perm") return
+              if (data.reason === "help") {
+                showBypassHelp(data)
+                return
+              }
               context.ui.toast.show(toastFor(data))
             } catch (error) {
               console.error("[opencode-v2-security] bypass toast failed", error)
@@ -438,7 +505,11 @@ const plugin: Plugin.Definition = {
                   ...(canPull ? {} : { synced: true }),
                 })
               }
-              if (canPull && indicator && indicator[data.sessionID]?.synced !== true) {
+              if (
+                canPull &&
+                indicator &&
+                (indicator[data.sessionID]?.synced !== true || data.reason === "updated" || data.reason === "spawned")
+              ) {
                 void pullStatus(data.sessionID)
               }
               pullFamily(data.sessionID)

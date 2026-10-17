@@ -107,13 +107,15 @@ OpenCode v2 全自动执行边界安全插件。Linux 原生 shell 与内置文�
 - 兼容别名只在输入边界展开：`fs` → `filesystem`，`os` → `host+privilege+indirection`，`web` → `network+remote`。注意 `os` 是历史收窄后的写法，**不再覆盖 `remote`**（`git.remote-history-rewrite`、`infrastructure.*`、`database.*` 需要 `remote` 单独武装）。状态、RPC、提示词与永久配置状态只使用规范类别名；永久 `BypassClassifier` 若输入别名会展开并警告，不会把别名存为类别。
 - `all/*/ALL/yolo` 均切换到 `[Bypass mode]`，不是逐类全开。它们是 `/bypass` 的控制语法，不是类别；提权注释和永久 `BypassClassifier` 都禁止使用 `all/*/ALL`。
 - **子代理传导**（默认开，`bypassPropagateToSubagents: false` 关闭）：子代理会话继承父会话（沿祖先链并集）的 armed 类别与相同到期语义；继承是只读的，子代理活动不会延长父租约。
+- **自定义授权**：`/bypass c <原文>` 等同于 `/bypass custom <原文>`，末尾数字也是授权正文，不作为超时。`/bypass c`、`/bypass custom`、`/bypass -c`、`/bypass -custom` 清空本会话自定义授权；`/bypass -c <索引或文本>`（也可用 `-custom`）按从 0 开始的本地索引删除一项，或删除所有包含该文本的项。数字超出索引范围时按文本匹配。删除不改变其他类别、Bypass 模式或剩余租约的截止时间，也不撤销祖先会话的授权。`+c`／`+custom` 必须附带非空正文。
+- **命令帮助**：`/bypass help`（也可用 `?`、`-h`、`--help`）打开持续帮助对话框，显示当前模式、类别、自定义授权及用法；宿主无对话框接口时退回浮动提示。
 
 ### 通知（agent 与用户分离）
 
 权限切换通过追加通知传达，不改写 system prompt 或已有会话历史。状态反馈分两条通道：
 
 - **agent 侧**：变更、继承和到期只记录最新状态；宿主准备下一条真实用户消息时（`session.hook("prompt")`），在该消息入队之前用 `session.synthetic`（`resume:false`、`delivery:"steer"`）追加一条 user-role 通知，两者在同一次模型请求中送达。状态变更本身不入队：inbox 里待处理的 steer 项会让正在收尾的 runner 再发一次模型请求。排队（`queue`）的用户消息不携带通知（排队项每轮只提升一条，通知会单独占一轮），留给下一条 steer 消息。同一状态不重复通知，切回 Auto 也明确通知。旧通知保持为历史记录，不被覆盖、删除或重新插入历史前缀。
-- **用户侧**：服务端注册 event-only RPC（`src/bypass-rpc.ts`），由本包的 TUI 伴随入口（`src/tui.ts`，package `exports["./tui"]`）订阅并弹 toast 显示 armed/updated/cleared/expired/status。参数非法时命令抛错，TUI 显示 usage；usage 不再回显给 agent。
+- **用户侧**：服务端通过 RPC（`src/bypass-rpc.ts`）同步状态，由 TUI 伴随入口（`src/tui.tsx`，package `exports["./tui"]`）刷新状态栏。只有成功执行 `/bypass`、`/perm` 后，带 `command` 标记的最终结果才弹一次 toast；多操作命令不提示中间结果。租约到期、子代理权限变化、`set_permission` 和跨实例同步只更新状态，不弹 toast。`/bypass help` 单独显示帮助对话框。参数非法时命令抛错，由宿主 TUI 显示错误；错误不回显给 agent。
 - 到期或清除追加新的状态通知，先前通知不再表示当前授权。显式用户命令自身的正常执行不属于“权限提醒额外唤醒”。
 - 无 TUI 伴随时，工具执行边界仍生效；通知不注册或修改模型 context hook。
 - **本地目录安装**：host 对“目录”形式的插件目标只解析 `<dir>/index`（server）与 `<dir>/tui`（TUI），不看 package.json exports；因此仓库根有 `index.ts` / `tui.ts` 两个薄转发文件。npm 包则走 `exports`。

@@ -862,7 +862,6 @@ const plugin: Plugin = {
       syncSecurityNotice(event.sessionID)
       syncBypassDescendants(event.sessionID)
       syncPermDescendants(event.sessionID)
-      emitBypassChanged(event.sessionID, "updated")
       emitPermChanged(event.sessionID, "updated")
     })
 
@@ -1216,7 +1215,7 @@ const plugin: Plugin = {
 
     /** Push a bypass state change to the TUI companion (best effort). The TUI
      * is the only user-visible channel that does not enter the model context. */
-    function emitBypassChanged(sessionID: string, reason: string) {
+    function emitBypassChanged(sessionID: string, reason: string, command?: "bypass" | "perm") {
       if (!bypassRpc) return
       // ONE clock read per payload: if a lease crosses its deadline between
       // reads, an `active` list built at t and an `expiresAt` read at t+ε
@@ -1239,6 +1238,7 @@ const plugin: Plugin = {
         temporary,
         permanent,
       }
+      if (command !== undefined) payload.command = command
       const custom = activeCustomBypass(sessionID, now)
       if (custom.length > 0) payload.custom = custom
       const expiresAt = leaseExpiryForRpc(sessionID, now)
@@ -1588,18 +1588,29 @@ const plugin: Plugin = {
     }
 
     type BypassOp =
+      | { kind: "help" }
       | { kind: "clear" }
       | { kind: "custom"; text: string }
+      | { kind: "customClear" }
+      | { kind: "customRemove"; target: string }
       | { kind: "categories"; action: "arm" | "disarm" | "toggle"; which: readonly BypassCategory[] }
       | { kind: "killSwitch"; action: "arm" | "disarm" | "toggle" }
 
     /** Parses /bypass arguments into ordered operations plus an optional
      *  timeout. Explicit `+token` always arms, `-token` always disarms (never
      *  toggles); a bare token toggles against the pre-command snapshot.
-     *  Aliases: fs→filesystem, 0→off (when it is the only token — see the
-     *  timeout rule below). `all`, `*`, `ALL`, `yolo`/`YOLO`, and `bypass`
+     *  Aliases: fs→filesystem, c→custom, 0→off (when it is the only token — see
+     *  the timeout rule below). `all`, `*`, `ALL`, `yolo`/`YOLO`, and `bypass`
      *  are ALL the same user Bypass mode — the kill switch that skips every
      *  plugin check for the session; they no longer mean "every category".
+     *
+     *  Custom scopes (`custom` or `c`):
+     *  - `/bypass custom <text>` or `/bypass c <text>` adds a verbatim scope.
+     *  - `/bypass custom`, `/bypass c`, `/bypass -custom`, or `/bypass -c`
+     *    clears all custom scopes on the session.
+     *  - `/bypass -custom <index|text>` or `/bypass -c <index|text>` removes
+     *    the custom scope at the 0-based index or all custom scopes containing
+     *    `<text>`.
      *
      *  Timeout: the LAST token may be a signed number, interpreted as
      *  seconds until the session's lease expires (`/bypass fs 120` arms fs
@@ -1611,13 +1622,29 @@ const plugin: Plugin = {
      *  token, so malformed input rejects atomically without touching the
      *  lease. */
     function parseBypassArguments(text: string): { ops: BypassOp[]; invalid: string[]; timeoutSec?: number } {
+      if (/^\s*(?:help|\?|-h|--help)\s*$/i.test(text)) {
+        return { ops: [{ kind: "help" }], invalid: [] }
+      }
       // The remainder is verbatim. A final number is part of the scope, not a
       // hidden timeout; custom uses the existing configured lease TTL.
-      const custom = /^\s*custom(?:[ \t]|\r?\n)/i.exec(text)
+      const custom = /^\s*([+-])?(?:custom|c)(?:$|(?:[ \t]|\r?\n)([\s\S]*))$/i.exec(text)
       if (custom) {
-        const scope = text.slice(custom[0].length)
-        return scope.trim() ? { ops: [{ kind: "custom", text: scope }], invalid: [] }
-          : { ops: [], invalid: ["custom requires a nonempty scope"] }
+        const sign = custom[1] as "+" | "-" | undefined
+        const scope = custom[2] ?? ""
+        const trimmed = scope.trim()
+        if (sign === "-") {
+          return trimmed
+            ? { ops: [{ kind: "customRemove", target: scope }], invalid: [] }
+            : { ops: [{ kind: "customClear" }], invalid: [] }
+        }
+        if (sign === "+") {
+          return trimmed
+            ? { ops: [{ kind: "custom", text: scope }], invalid: [] }
+            : { ops: [], invalid: ["custom requires a nonempty scope"] }
+        }
+        return trimmed
+          ? { ops: [{ kind: "custom", text: scope }], invalid: [] }
+          : { ops: [{ kind: "customClear" }], invalid: [] }
       }
       const ops: BypassOp[] = []
       const invalid: string[] = []
@@ -1653,6 +1680,10 @@ const plugin: Plugin = {
           ops.push({ kind: "clear" })
           continue
         }
+        if ((token === "c" || token === "custom") && sign !== "+") {
+          ops.push({ kind: "customClear" })
+          continue
+        }
         const categories = expandBypassCategoryToken(token)
         if (categories) {
           ops.push({ kind: "categories", action: sign === "+" ? "arm" : sign === "-" ? "disarm" : "toggle", which: categories })
@@ -1661,23 +1692,37 @@ const plugin: Plugin = {
         invalid.push(raw)
       }
       // Reject before mutating state: a timeout cannot apply after clearing.
-      if (timeoutSec !== undefined && ops.at(-1)?.kind === "clear") invalid.push("timeout after off")
+      if (timeoutSec !== undefined && (ops.at(-1)?.kind === "clear" || ops.at(-1)?.kind === "customClear")) {
+        invalid.push("timeout after off")
+      }
       return { ops, invalid, timeoutSec }
     }
 
     function bypassUsage(invalid: string[]): string {
+      if (invalid.length === 1 && invalid[0] === "custom requires a nonempty scope") {
+        return "Custom bypass (+c / +custom) requires a nonempty scope. Run /bypass help for usage."
+      }
+      if (invalid.includes("timeout after off")) {
+        return "Cannot set a timeout after clearing (timeout after off). Run /bypass help for usage."
+      }
       return (
-        `Unknown bypass categor${invalid.length > 1 ? "ies" : "y"}: ${invalid.join(", ")}.\n` +
-        `Usage: /bypass <${[...BYPASS_CATEGORIES].join("|")}|fs|custom|all|*|ALL|yolo|off> — ` +
-        `categories space or comma separated; legacy aliases: fs=filesystem, os=host+privilege+indirection, web=network+remote; ` +
-        `all, *, ALL, yolo and bypass are the user Bypass mode (all plugin checks skipped for this session — ` +
-        `prefer specific categories when possible); off/0 clears categories, custom scopes and the mode. ` +
-        `/bypass custom <verbatim text> adds an authorization scope using the same lease TTL. +token arms, -token disarms, a bare token toggles. ` +
-        `A trailing bare number is the timeout in seconds — an absolute deadline, never extended by activity; ` +
-        `a zero or negative timeout (e.g. "/bypass fs -1") means no natural expiry until /bypass off.\n` +
-        `Categories skip their static checks and are passed as authorization to the effects reviewer. ` +
-        `Only the explicit sandbox switch removes OS isolation; privilege/filesystem categories do not imply full access.`
+        `Unknown bypass categor${invalid.length > 1 ? "ies" : "y"}: ${invalid.join(", ")}. ` +
+        `Run /bypass help for usage.`
       )
+    }
+
+    function updateCustomBypassLease(sessionID: string, nextCustom: string[]) {
+      const prior = bypassLeases.get(sessionID)
+      if (!prior) return
+      if (nextCustom.length === 0) {
+        if (prior.categories.size === 0 && prior.all !== true) {
+          bypassLeases.delete(sessionID)
+        } else {
+          bypassLeases.set(sessionID, { ...prior, custom: undefined })
+        }
+        return
+      }
+      bypassLeases.set(sessionID, { ...prior, custom: nextCustom })
     }
 
     function armBypassLease(sessionID: string, categories: Set<BypassCategory>, timeoutSec?: number) {
@@ -2900,7 +2945,11 @@ const plugin: Plugin = {
           // through while the ceiling lands.
           explicitNoBypass.add(input.sessionID)
           sessionPerms.set(input.sessionID, permIntersect(sessionPerms.get(input.sessionID) ?? PERM_FULL, perm))
-          notifySecurityState(input.sessionID, "updated", "set")
+          syncSecurityNotice(input.sessionID)
+          syncBypassDescendants(input.sessionID)
+          syncPermDescendants(input.sessionID)
+          emitPermChanged(input.sessionID, "set")
+          publishSharedStateChange(input.sessionID)
         } else {
           permStash.set(ev.id, { parentSessionID: ev.sessionID, perm, at: Date.now(), declared: true })
         }
@@ -3077,7 +3126,11 @@ const plugin: Plugin = {
             permParent.set(childID, stash.parentSessionID)
             permBoundChildren.add(childID)
             if (stash.declared) explicitNoBypass.add(childID)
-            notifySecurityState(childID, "updated", "spawned")
+            syncSecurityNotice(childID)
+            syncBypassDescendants(childID)
+            syncPermDescendants(childID)
+            emitPermChanged(childID, "spawned")
+            publishSharedStateChange(childID)
           }
           // The stash no longer tightens (or barriers) this parent's still-
           // unbound children — refresh their notices and RPC snapshots so
@@ -3086,7 +3139,6 @@ const plugin: Plugin = {
             if (parent !== stash.parentSessionID || permBoundChildren.has(child) || child === childID) continue
             syncSecurityNotice(child)
             emitPermChanged(child, "updated")
-            emitBypassChanged(child, "updated")
           }
           // The bound child published itself (notifySecurityState); the
           // consumed-stash transition above is parent-scoped, so publish the
@@ -3439,9 +3491,9 @@ const plugin: Plugin = {
                   failure = result.error
                 } else {
                   // The declared mode masked inherited Bypass: descendants'
-                  // effective state and the TUI badge move too.
+                  // effective state moves too (writeSessionPerm already emitted
+                  // the `permission` event and published the shared-state change).
                   syncBypassDescendants(targetID)
-                  emitBypassChanged(targetID, "updated")
                 }
               }
               if (failure) {
@@ -3574,7 +3626,8 @@ const plugin: Plugin = {
               return yield* Effect.fail(new Error(`Session ${target} is not a descendant of this session`))
             }
             if (sawBypassMode) {
-              applyUserSecurityMode(target, "bypass")
+              const mode = applyUserSecurityMode(target, "bypass")
+              emitBypassChanged(target, mode === "bypass" ? "armed" : "clamped", "perm")
               return
             }
             if (!sawPerm || working === undefined) {
@@ -3597,8 +3650,8 @@ const plugin: Plugin = {
             if (disarmed) {
               syncSecurityNotice(target)
               syncBypassDescendants(target)
-              emitBypassChanged(target, "updated")
             }
+            emitBypassChanged(target, "status", "perm")
           }).pipe(Effect.ensuring(Effect.promise(() => sessionNotices.flush()))),
       })
     })
@@ -3629,6 +3682,10 @@ const plugin: Plugin = {
             if (args.invalid.length > 0) {
               return yield* Effect.fail(new Error(bypassUsage(args.invalid)))
             }
+            if (args.ops.length === 1 && args.ops[0]?.kind === "help") {
+              emitBypassChanged(sessionID, "help", "bypass")
+              return
+            }
             // Snapshot BEFORE mutating: bare tokens toggle against this state,
             // and the user toast's armed/updated label reflects it too.
             const snapshot = activeBypass(sessionID)
@@ -3636,9 +3693,6 @@ const plugin: Plugin = {
             const snapshotCustom = activeCustomBypass(sessionID)
             const wasActive = snapshot.size > 0 || snapshotAll || snapshotCustom.length > 0
             let baselineTouched = false
-            // The mode transition notifies once itself; the handler must not
-            // emit a second `changed` toast for the same transition.
-            let modeTransitionNotified = false
             for (const op of args.ops) {
               if (op.kind === "clear") {
                 // Clearing ends the whole lease: categories, custom scopes AND
@@ -3655,7 +3709,6 @@ const plugin: Plugin = {
                 const act = op.action === "toggle" ? (snapshotAll ? "disarm" : "arm") : op.action
                 if (act === "arm") {
                   applyUserSecurityMode(sessionID, "bypass", args.timeoutSec)
-                  modeTransitionNotified = true
                 } else {
                   setBypassKillSwitch(sessionID, false)
                 }
@@ -3671,6 +3724,28 @@ const plugin: Plugin = {
                   expiresAt: bypassExpiry(args.timeoutSec),
                   restoreBaseline: prior?.all === true ? prior.restoreBaseline : undefined,
                 })
+                continue
+              }
+              if (op.kind === "customClear") {
+                updateCustomBypassLease(sessionID, [])
+                continue
+              }
+              if (op.kind === "customRemove") {
+                const prior = bypassLeases.get(sessionID)
+                const current = prior?.custom ?? []
+                const trimmed = op.target.trim()
+                let next: string[]
+                if (/^\d+$/.test(trimmed)) {
+                  const idx = Number(trimmed)
+                  if (Number.isSafeInteger(idx) && idx >= 0 && idx < current.length) {
+                    next = current.filter((_, i) => i !== idx)
+                  } else {
+                    next = current.filter((item) => !item.includes(op.target) && !item.includes(trimmed))
+                  }
+                } else {
+                  next = current.filter((item) => !item.includes(op.target) && !item.includes(trimmed))
+                }
+                updateCustomBypassLease(sessionID, next)
                 continue
               }
               // Category op: the target set starts from the session's current
@@ -3694,7 +3769,7 @@ const plugin: Plugin = {
               const lease = bypassLeases.get(sessionID)
               if (!lease) {
                 return yield* Effect.fail(
-                  new Error("No active bypass lease to set a timeout on — arm categories first, e.g. /bypass fs 120"),
+                  new Error("No active bypass lease to set a timeout on. Run /bypass help for usage."),
                 )
               }
               bypassLeases.set(sessionID, { ...lease, expiresAt: bypassExpiry(args.timeoutSec) })
@@ -3708,14 +3783,15 @@ const plugin: Plugin = {
               snapshot.size !== nowActive.size || [...snapshot].some((c) => !nowActive.has(c)) ||
               snapshotCustom.length !== nowCustom.length || snapshotCustom.some((c, i) => nowCustom[i] !== c)
             const cleared = nowActive.size === 0 && !nowAll && nowCustom.length === 0
-            const reason = !changed ? "status" : cleared ? "cleared" : wasActive ? "updated" : "armed"
+            let reason: string = !changed ? "status" : cleared ? "cleared" : wasActive ? "updated" : "armed"
+            if (nowAll && effectiveMode(sessionID) !== "bypass") reason = "clamped"
             syncSecurityNotice(sessionID)
             syncBypassDescendants(sessionID)
-            if (!modeTransitionNotified) {
-              emitBypassChanged(sessionID, reason)
-              if (baselineTouched) emitPermChanged(sessionID, "set")
-            }
+            if (baselineTouched) emitPermChanged(sessionID, "set")
             publishSharedStateChange(sessionID)
+            // Intermediate mode transitions still synchronize security state,
+            // but only the completed command requests user-visible feedback.
+            emitBypassChanged(sessionID, reason, "bypass")
           }).pipe(Effect.ensuring(Effect.promise(() => sessionNotices.flush()))),
       })
     })

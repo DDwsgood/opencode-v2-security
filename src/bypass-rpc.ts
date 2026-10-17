@@ -66,8 +66,11 @@ export const BypassRpc = {
         type: "object",
         properties: {
           sessionID: { type: "string" },
-          // armed | updated | cleared | expired | status | clamped
+          // armed | updated | cleared | expired | status | clamped | help
           reason: { type: "string" },
+          // Present only on the final response to an explicit user command.
+          // State synchronization without this field must remain silent.
+          command: { type: "string", enum: ["bypass", "perm"] },
           // User-visible mode; optional for older servers / partial events.
           mode: MODE_SCHEMA,
           active: { type: "array", items: { type: "string" } },
@@ -105,7 +108,9 @@ export const BypassRpc = {
 
 export type BypassChangedData = {
   readonly sessionID: string
-  readonly reason: "armed" | "updated" | "cleared" | "expired" | "status" | "clamped"
+  readonly reason: "armed" | "updated" | "cleared" | "expired" | "status" | "clamped" | "help"
+  /** Only command completion may trigger a toast (or the help dialog). */
+  readonly command?: "bypass" | "perm"
   /** User-visible mode; absent on older servers (derive from `permission` +
    *  `active`). */
   readonly mode?: SecurityMode

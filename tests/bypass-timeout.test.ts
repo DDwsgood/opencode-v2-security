@@ -362,6 +362,7 @@ describe("/bypass timeout argument", () => {
     }
     expect(expired).toBeDefined()
     expect((expired as { data: { active: string[] } }).data.active).toEqual([])
+    expect("command" in (expired as { data: object }).data).toBe(false)
     // The expired transition is the dropped-event regression shape: no live
     // lease, so expiresAt must be absent (not undefined) for the host schema.
     expect("expiresAt" in (expired as { data: object }).data).toBe(false)
@@ -380,14 +381,15 @@ describe("/bypass timeout argument", () => {
       // invalid tokens; none may mutate the lease or its deadline.
       for (const bad of ["+fs 60 bogus", "+fs 30 120", "+fs -5 bogus", "+fs 1e3", "+fs Infinity", "+fs NaN", "+fs 12x", "off 120"]) {
         const err = await invoke(h, "s1", bad)
-        expect(err).toMatch(/Unknown bypass categor|Usage: \/bypass/)
+        expect(err).toMatch(/Unknown bypass categor|timeout after off/)
+        expect(err).toContain("/bypass help")
       }
       const after = await h.status("s1")
       expect(after.active).toEqual(before.active)
       expect(after.expiresAt).toBe(t0 + 60_000)
 
       // A bare number alone is not a command — usage error, lease untouched.
-      expect(await invoke(h, "s1", "120")).toMatch(/Usage: \/bypass/)
+      expect(await invoke(h, "s1", "120")).toContain("/bypass help")
       expect((await h.status("s1")).expiresAt).toBe(t0 + 60_000)
 
       // A timeout that leaves no lease behind is an explicit error.

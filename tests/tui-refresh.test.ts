@@ -421,7 +421,7 @@ describe("lease-deadline fallback timer", () => {
     stop()
   })
 
-  test("a cleared event clears the badge, shows the toast, and disarms the timer", async () => {
+  test("a background cleared event silently clears the badge and disarms the timer", async () => {
     const h = makeHarness()
     const stop = tuiPlugin.setup(h.context as never)
     await syncSession(h)
@@ -442,7 +442,7 @@ describe("lease-deadline fallback timer", () => {
       // expiresAt absent = no live lease → the pending deadline is disarmed.
     })
     expect(h.indicator()!.s1.active).toEqual([])
-    expect(h.toasts.some((t) => t.title === "Classifier bypass cleared")).toBe(true)
+    expect(h.toasts).toHaveLength(0)
 
     const callsAfterClear = h.statusCalls.length
     await sleep(120)
@@ -628,7 +628,7 @@ describe("workspace filtering", () => {
       { directory: "/proj", workspaceID: "ws-B" },
     )
     expect(h.indicator()!["s-b"]).toBeDefined()
-    expect(h.toasts.some((t) => t.title === "Classifier bypass cleared")).toBe(true)
+    expect(h.toasts).toHaveLength(0)
 
     // The same kind of event under a genuinely different workspace for a
     // known session is still filtered.
@@ -902,6 +902,47 @@ describe("explicit mode and custom flags", () => {
 })
 
 describe("bypass toast accuracy", () => {
+  test("background changes stay silent even when expiry leaves inherited Bypass active", () => {
+    const h = makeHarness()
+    h.sessions.set("s1", { id: "s1", location: HERE })
+    const stop = tuiPlugin.setup(h.context as never)
+    for (const reason of ["armed", "updated", "expired", "cleared", "clamped", "status"]) {
+      h.emitRpc("changed", {
+        sessionID: "s1",
+        reason,
+        mode: "bypass",
+        active: ["ALL"],
+        temporary: ["ALL"],
+        permanent: [],
+      })
+      expect(h.indicator()!.s1.mode).toBe("bypass")
+    }
+    h.emitRpc("permission", { sessionID: "s1", reason: "set", permission: "r-x", mode: "readonly" })
+    expect(h.indicator()!.s1.mode).toBe("readonly")
+    expect(h.toasts).toHaveLength(0)
+    stop()
+  })
+
+  test("a completed /perm command reports the final mode once", () => {
+    const h = makeHarness()
+    h.sessions.set("s1", { id: "s1", location: HERE })
+    const stop = tuiPlugin.setup(h.context as never)
+    h.emitRpc("permission", { sessionID: "s1", reason: "set", permission: "r-x", mode: "readonly" })
+    h.emitRpc("changed", {
+      sessionID: "s1",
+      reason: "status",
+      command: "perm",
+      mode: "readonly",
+      active: [],
+      temporary: [],
+      permanent: [],
+    })
+    expect(h.toasts).toHaveLength(1)
+    expect(h.toasts[0]!.title).toBe("Session permissions updated")
+    expect(h.toasts[0]!.message).toContain("[Read only]")
+    stop()
+  })
+
   test("effective Bypass toast omits the impossible read-only caveat", () => {
     const h = makeHarness()
     h.sessions.set("s1", { id: "s1", location: HERE })
@@ -910,6 +951,7 @@ describe("bypass toast accuracy", () => {
       sessionID: "s1",
       reason: "armed",
       mode: "bypass",
+      command: "bypass",
       active: ["ALL"],
       temporary: [],
       permanent: [],
@@ -935,6 +977,7 @@ describe("bypass toast accuracy", () => {
     h.emitRpc("changed", {
       sessionID: "s1",
       reason: "clamped",
+      command: "bypass",
       active: ["ALL"],
       temporary: [],
       permanent: [],
@@ -955,6 +998,7 @@ describe("bypass toast accuracy", () => {
       sessionID: "s1",
       reason: "armed",
       mode: "readonly",
+      command: "bypass",
       active: ["ALL"],
       temporary: [],
       permanent: [],
@@ -964,12 +1008,46 @@ describe("bypass toast accuracy", () => {
     stop()
   })
 
-  test("a legacy server's ALL marker still selects the Bypass toast without a mode", () => {
+  test("a command response's ALL marker selects the Bypass toast without a mode", () => {
     const h = makeHarness()
     h.sessions.set("s1", { id: "s1", location: HERE })
     const stop = tuiPlugin.setup(h.context as never)
-    h.emitRpc("changed", { sessionID: "s1", reason: "armed", active: ["ALL"], temporary: [], permanent: [] })
+    h.emitRpc("changed", { sessionID: "s1", reason: "armed", command: "bypass", active: ["ALL"], temporary: [], permanent: [] })
     expect(h.toasts.some((t) => t.title === "Bypass mode ON")).toBe(true)
+    stop()
+  })
+
+  test("/bypass help opens a persistent modal dialog instead of an ephemeral toast", () => {
+    const h = makeHarness()
+    const alerts: Array<{ title: string; message: string }> = []
+    const sizes: Array<{ size?: string; centered?: boolean }> = []
+    ;(h.context.ui as Record<string, unknown>).dialog = {
+      alert: (options: { title: string; message: string }) => {
+        alerts.push(options)
+        return Promise.resolve()
+      },
+      set: (options: { size?: string; centered?: boolean }) => {
+        sizes.push(options)
+      },
+    }
+    h.sessions.set("s1", { id: "s1", location: HERE })
+    const stop = tuiPlugin.setup(h.context as never)
+    h.emitRpc("changed", {
+      sessionID: "s1",
+      reason: "help",
+      command: "bypass",
+      mode: "auto",
+      active: ["filesystem"],
+      temporary: ["filesystem"],
+      permanent: [],
+      custom: ["Ignore checks on **site**:..."],
+    })
+    expect(h.toasts).toHaveLength(0)
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]!.title).toContain("/bypass")
+    expect(alerts[0]!.message).toContain("[0] Ignore checks on **site**:...")
+    expect(alerts[0]!.message).toContain("/bypass -c <index|text>")
+    expect(sizes).toEqual([{ size: "large", centered: true }])
     stop()
   })
 })
