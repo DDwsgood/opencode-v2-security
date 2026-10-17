@@ -1,7 +1,8 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test"
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test"
 import { lstat, mkdir, mkdtemp } from "node:fs/promises"
 import { connect } from "node:net"
 import path from "node:path"
+import * as os from "node:os"
 import { Effect, Scope, Stream } from "effect"
 import plugin from "../src/index"
 import frozen from "../src/security/v10-8-pipeexec.json"
@@ -151,6 +152,8 @@ let workspace: string
 let scratch: string
 let home: string
 const oldHome = process.env.HOME
+const systemHome = os.homedir()
+let homeSpy: { mockRestore(): void }
 const scopes: Scope.Closeable[] = []
 beforeAll(async () => {
   root = await mkdtemp("/tmp/opencode/readonly-review-")
@@ -159,9 +162,11 @@ beforeAll(async () => {
   home = path.join(root, "home")
   await Promise.all([mkdir(workspace), mkdir(scratch), mkdir(home)])
   process.env.HOME = home
+  homeSpy = spyOn(os, "homedir").mockImplementation(() => process.env.HOME ?? systemHome)
 })
 afterAll(async () => {
   for (const scope of scopes) await Effect.runPromise(Scope.close(scope, undefined as never))
+  homeSpy.mockRestore()
   if (oldHome === undefined) delete process.env.HOME
   else process.env.HOME = oldHome
   await cleanupTestArtifacts(root, { recursive: true, force: true })
@@ -176,6 +181,7 @@ type HostOptions = {
   rootReview?: (request: import("../src/security/root-widening").RootWideningInput) => Promise<unknown>
   workspaceNetwork?: "on" | "off"
   securityEnabled?: boolean
+  directory?: string
 }
 
 // The real plugin wrappers and broker are used, but no sample shell command
@@ -221,7 +227,7 @@ async function harness(options: HostOptions = {}) {
             })
             socket.write(JSON.stringify({
               version: 1, type: "boundary", token, eventID: 1, pid: process.pid,
-              syscall: "fixture", operation: "open", targets,
+              syscall: input.event.syscall ?? "fixture", operation: "open", targets,
               kind: input.event.kind,
               details: { atExit: false, requiresFullApproval: input.event.full === true },
             }) + "\n")
@@ -263,7 +269,7 @@ async function harness(options: HostOptions = {}) {
     permission: { hook: (name: string, callback: any) => Effect.sync(() => { hooks.set(`permission.${name}`, callback) }) },
     command: { transform: (callback: any) => Effect.sync(() => callback({ add: (command: any) => commands.set(command.name, command.execute) })) },
     session: {
-      get: () => Effect.succeed({ location: { directory: workspace } }),
+      get: () => Effect.succeed({ location: { directory: options.directory ?? workspace } }),
       context: () => Effect.succeed(retained),
       synthetic: () => Effect.void,
     },
@@ -277,7 +283,7 @@ async function harness(options: HostOptions = {}) {
   return {
     calls, mode, get executed() { return executed },
     newUserMessage: (text: string) => { retained.push({ type: "user", text }) },
-    run: (command: string, event?: { kind: RuntimeBoundaryEvent["kind"]; full?: boolean; paths?: string[] }, workdir?: string) =>
+    run: (command: string, event?: { kind: RuntimeBoundaryEvent["kind"]; full?: boolean; paths?: string[]; syscall?: string }, workdir?: string) =>
       Effect.runPromise(tools.get("shell").execute({ command, event, workdir }, { sessionID: "readonly-fixture", messageID: "m", id: `call-${++serial}`, agent: "build" })) as Promise<any>,
     file: (name: string, input: unknown) => Effect.runPromise(tools.get(name).execute(input, {
       sessionID: "readonly-fixture", messageID: "m", id: `call-${++serial}`, agent: "build",
@@ -350,12 +356,38 @@ describe("RO launch gate", () => {
     expect((await classify("curl --request-target /resource https://fixture.invalid/")).verdict).not.toBe("DENY")
   })
 
-  test("all native write tools refuse before review, including temp targets", async () => {
+  test("native writes allow temp-only targets but refuse workspace and mixed patches", async () => {
     const host = await harness()
-    await expect(host.file("write", { path: path.join(scratch, "file"), content: "x" })).rejects.toThrow("[Read only]")
-    await expect(host.file("edit", { path: path.join(scratch, "file"), oldString: "x", newString: "y" })).rejects.toThrow("[Read only]")
-    await expect(host.file("patch", { patchText: `*** Begin Patch\n*** Add File: ${scratch}/file\n+x\n*** End Patch` })).rejects.toThrow("[Read only]")
-    expect(host.executed).toBe(0)
+    await host.file("write", { path: path.join(scratch, "file"), content: "x" })
+    await host.file("edit", { path: path.join(scratch, "file"), oldString: "x", newString: "y" })
+    await host.file("patch", { patchText: `*** Begin Patch\n*** Add File: ${scratch}/file\n+x\n*** End Patch` })
+    await expect(host.file("write", { path: path.join(workspace, "file"), content: "x" })).rejects.toThrow("[Read only]")
+    await expect(host.file("patch", { patchText: `*** Begin Patch\n*** Add File: ${scratch}/file\n+x\n*** Add File: ${workspace}/file\n+x\n*** End Patch` })).rejects.toThrow("[Read only]")
+    expect(host.executed).toBe(3)
+    expect(host.calls).toHaveLength(0)
+  })
+
+  test("plugin development is scoped to its workspace and keeps the observer protected", async () => {
+    const packageRoot = path.resolve(import.meta.dir, "..")
+    const target = path.join(packageRoot, "README.md")
+    const unrelated = await harness({ mode: "auto" })
+    await expect(unrelated.file("write", { path: target, content: "fixture" })).rejects.toThrow("protected")
+    const developer = await harness({ mode: "auto", directory: packageRoot })
+    // Synthetic executors never change the real source or observer image.
+    await developer.file("write", { path: target, content: "fixture" })
+    await expect(developer.file("write", { path: path.join(packageRoot, "bin/opencode-boundary-watch"), content: "fixture" })).rejects.toThrow("protected")
+    const result = await developer.run("true")
+    expect(result.output.spawn.command).not.toContain(`'--protect' '${packageRoot}'`)
+    expect(developer.calls).toHaveLength(0)
+  })
+
+  test("existing temp ancestors permit mkdir but still refuse destructive writes", async () => {
+    const host = await harness({ mode: "auto" })
+    const paths = ["/tmp/opencode"]
+    const mkdir = await host.run("true", { kind: "write", syscall: "mkdirat", paths })
+    expect(mkdir.output.response.action).toBe("continue")
+    const removal = await host.run("true", { kind: "write", syscall: "rmdir", paths })
+    expect(removal.output.response.action).toBe("deny")
     expect(host.calls).toHaveLength(0)
   })
 
@@ -530,10 +562,10 @@ describe("RO observer routing through the plugin", () => {
       ]) {
         const before = host.calls.length
         const result = await host.run("python3 -c 'import json'", { kind: "write", paths: [target] })
-        // Configured/protected roots are actual refusals in either mode.
-        // Synthetic credential paths outside the real configured stores
-        // still need review rather than incidental-write exemption.
-        const configuredOrProtected = target.startsWith(`${deniedRoot}/`) || target === path.resolve(import.meta.dir, "../.pytest_cache/state")
+        // Configured/protected roots and the isolated HOME's actual credential
+        // stores are hard refusals; sensitive cache leaves still need review.
+        const configuredOrProtected = target.startsWith(`${deniedRoot}/`) || target.startsWith(`${home}/.aws/`) ||
+          target === path.resolve(import.meta.dir, "../.pytest_cache/state")
         if (mode === "ro" || configuredOrProtected) {
           expect(result.output.response.action).toBe("deny")
           expect(host.calls.length).toBe(before)

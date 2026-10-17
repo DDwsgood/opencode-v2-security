@@ -21,6 +21,10 @@ function overlaps(root: string, target: string): boolean {
   return containsWritePath(root, target) || containsWritePath(target, root)
 }
 
+export function isRuntimeBrokerPath(target: string, base = "/tmp/opencode"): boolean {
+  return containsWritePath(base, target) && path.relative(base, target).split(path.sep)[0]?.startsWith("security-boundary-") === true
+}
+
 /** A grant never follows a redirected root or a symlinked leaf, including a
  * missing descendant whose deepest existing ancestor is redirected. */
 export function canonicalWriteRoot(target: string): string | undefined {
@@ -44,8 +48,7 @@ export function writeRootRejection(root: string, policy: WriteRootPolicy): strin
   if (root === path.parse(root).root || containsWritePath(root, policy.home) ||
     containsWritePath(root, canonicalCandidate(policy.home) ?? policy.home)) return "the root covers HOME or the filesystem root"
   if (protectedOverlap(root, policy)) return "the root overlaps a denied, credential, or protected path"
-  if (policy.brokerBase && (containsWritePath(root, policy.brokerBase) ||
-    (containsWritePath(policy.brokerBase, root) && path.relative(policy.brokerBase, root).split(path.sep)[0]?.startsWith("security-boundary-")))) {
+  if (policy.brokerBase && isRuntimeBrokerPath(root, policy.brokerBase)) {
     return "the root overlaps the runtime broker directory"
   }
   const sensitivity = checkPathSensitivity(root, { cwd: policy.cwd, worktree: policy.cwd })
@@ -57,6 +60,7 @@ export function writeRootRejection(root: string, policy: WriteRootPolicy): strin
  * Ancestor mutations cannot replace a denied/protected subtree. */
 export function writeTargetExempt(target: string, policy: WriteRootPolicy): boolean {
   if (protectedOverlap(target, policy)) return false
+  if (policy.brokerBase && isRuntimeBrokerPath(target, policy.brokerBase)) return false
   const sensitivity = checkPathSensitivity(target, { cwd: policy.cwd, worktree: policy.cwd })
   return sensitivity.parseable && !sensitivity.sensitive
 }

@@ -9638,11 +9638,12 @@ async function roPathWritable(
  *  any target is unparseable (dynamic expansion) — fail closed. */
 async function mutationTargetsOf(
   segment: string,
-  roView: string,
   shell: string,
 ): Promise<Array<{ path: string; container: boolean }> | undefined> {
   if (hasDynamicShellExpansion(segment, shell)) return undefined
-  const writes = extractWriteTargets(roView)
+  // The shell-aware extractor distinguishes quoted operands from quoted data;
+  // the vocabulary-only masked view would erase legitimate output paths.
+  const writes = extractWriteTargets(segment)
   if (writes.unparseable) return undefined
   const targets = writes.targets
     .filter((target) => target !== "")
@@ -9749,7 +9750,7 @@ async function roScratchCarveOut(
     !NONEXTRACTABLE_WRITE_RE.test(roView) &&
     !extractQuotedWrappers(segment).some((payload) => NONEXTRACTABLE_WRITE_RE.test(payload))
   if (enumerableWrite) {
-    const targets = await mutationTargetsOf(segment, roView, input.shell)
+    const targets = await mutationTargetsOf(segment, input.shell)
     if (targets !== undefined && targets.length > 0) {
       let frozen = false
       for (const target of targets) {

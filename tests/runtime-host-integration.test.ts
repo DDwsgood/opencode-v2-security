@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test"
 import { execFile } from "node:child_process"
 import { chmod, mkdtemp, mkdir, readFile, rename, writeFile } from "node:fs/promises"
 import path from "node:path"
+import * as os from "node:os"
 import * as filesystem from "node:fs/promises"
 import * as classifier from "../src/security/classifier"
 import * as cache from "../src/security/approval-cache"
@@ -14,18 +15,29 @@ import { resetSharedSecurityStateForTests } from "../src/security/shared-state"
 import { cleanupTestArtifacts } from "./artifacts"
 
 let root: string, workspace: string, outside: string, scratch: string, probe: string
+const oldHome = process.env.HOME
+const systemHome = os.homedir()
+let homeSpy: { mockRestore(): void }
 const scopes: Scope.Closeable[] = []
 beforeAll(async () => {
   root = await mkdtemp("/tmp/opencode/runtime-host-")
   workspace = path.join(root, "workspace")
   outside = path.join(root, "outside")
   scratch = path.join(root, "scratch")
-  await Promise.all([mkdir(workspace), mkdir(outside), mkdir(scratch)])
+  const home = path.join(root, "home")
+  await Promise.all([mkdir(workspace), mkdir(outside), mkdir(scratch), mkdir(home)])
+  // Keep the root-external fixtures outside adopted temp roots: a root that
+  // covers this isolated HOME is intentionally never an automatic grant.
+  process.env.HOME = home
+  homeSpy = spyOn(os, "homedir").mockImplementation(() => process.env.HOME ?? systemHome)
   probe = path.join(root, "probe-fixture")
   await writeFile(probe, "#!/bin/sh\nprintf 'bwrap: /usr/bin/bwrap\\nuserns: yes\\nlandlock_abi: 7\\nsandbox_path: full\\n'\n", { mode: 0o700 })
 })
 afterAll(async () => {
   for (const scope of scopes) await Effect.runPromise(Scope.close(scope, undefined as never))
+  homeSpy.mockRestore()
+  if (oldHome === undefined) delete process.env.HOME
+  else process.env.HOME = oldHome
   await cleanupTestArtifacts(root, { recursive: true, force: true })
 })
 const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`
@@ -328,15 +340,14 @@ describe("real observer → broker → frozen reviewer → original process", ()
   })
   test("the L1 core ignores shell command text around an identical crossing", async () => {
     const host = await harness()
-    // A pre-created target makes mkdir -p a single identical crossing every
-    // run (exists + identities stable); tail's count and a leading `; echo`
-    // change only the shell's command line.
-    const dir = path.join(outside, "core-dir")
-    await mkdir(dir)
-    const first = await host.run("shell", { command: `mkdir -p ${dir} | tail -30` })
+    // A credential-shaped inert fixture produces a stable read crossing;
+    // only the surrounding shell text changes. Reads cannot fall back to L2.
+    const target = path.join(outside, "core-file.env")
+    await writeFile(target, "FAKE FIXTURE DATA")
+    const first = await host.run("shell", { command: `wc -c < ${target} | tail -30` })
     expect(first.output.exit).toBe(0)
-    const second = await host.run("shell", { command: `mkdir -p ${dir} | tail -20` })
-    const third = await host.run("shell", { command: `echo "v"; mkdir -p ${dir}` })
+    const second = await host.run("shell", { command: `wc -c < ${target} | tail -20` })
+    const third = await host.run("shell", { command: `echo "v"; wc -c < ${target}` })
     expect(second.output.exit).toBe(0)
     expect(third.output.exit).toBe(0)
     expect(host.calls).toHaveLength(1)
@@ -498,6 +509,32 @@ describe("real observer → broker → frozen reviewer → original process", ()
     await expect(readFile(path.join(workspace, "ro-blocked.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" })
     await expect(host.run("shell", { command: "touch ro-literal.txt" })).rejects.toThrow("[Read only]")
     expect(host.calls).toHaveLength(0)
+  })
+  test("Auto and ReadOnly share global temp roots and native temp-only writes", async () => {
+    const isolatedHome = process.env.HOME!
+    process.env.HOME = systemHome
+    const temp = await mkdtemp("/var/tmp/opencode-regression-")
+    const reserved = await mkdtemp("/tmp/opencode/security-boundary-regression-")
+    try {
+      for (const mode of ["auto", "ro"]) {
+        const host = await harness(true)
+        if (mode === "ro") await host.command("ro")
+        const target = path.join(temp, `${mode}-native.txt`)
+        expect((await host.run("write", { path: target, content: "fixture" })).content).toBe("written")
+        expect((await host.run("shell", { command: "mkdir -p /tmp/opencode" })).output.exit).toBe(0)
+        const file = path.join(temp, `${mode}-shell.txt`)
+        const result = await host.run("shell", { command: `printf fixture > ${quote(file)}; rm -- ${quote(file)}` })
+        expect(result.output.exit).toBe(0)
+        const blocked = await host.run("shell", { command: `printf fixture > ${quote(path.join(reserved, "denied.txt"))}` })
+        expect(blocked.output.exit).toBe(126)
+        await expect(readFile(path.join(reserved, "denied.txt"))).rejects.toMatchObject({ code: "ENOENT" })
+        expect(host.calls).toHaveLength(0)
+      }
+    } finally {
+      process.env.HOME = isolatedHome
+      await cleanupTestArtifacts(temp, { recursive: true, force: true })
+      await cleanupTestArtifacts(reserved, { recursive: true, force: true })
+    }
   })
   test("ReadOnly Python reads do not enter JEV", async () => {
     const host = await harness()

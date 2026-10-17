@@ -128,7 +128,7 @@ import {
 import { linkedWorktreePrivateDir } from "./security/worktree-roots"
 import { globalTempWriteRoots, incidentalWriteRoots, isIncidentalToolWrite, standardCacheWriteRoots } from "./security/automatic-write-roots"
 import { checkPathSensitivity, credentialStoreReadPaths } from "./security/paths"
-import { writeRootRejection, writeTargetExempt, type WriteRootPolicy } from "./security/write-root-policy"
+import { isRuntimeBrokerPath, writeRootRejection, writeTargetExempt, type WriteRootPolicy } from "./security/write-root-policy"
 import { createRootWidening, reviewRootWidening, L3_POLICY_VERSION, type L3Trace, type RootWideningContext, type RootWideningInput, type RootWideningScope } from "./security/root-widening"
 import { boundaryCoreDigest, observedNetworkEndpoint, type ApprovalCacheFacts, type ApprovalCacheScope, type ApprovalCacheTarget } from "./security/approval-cache"
 import { createRuntimeBoundaryBroker, currentCacheTargets, targetIdentitiesMatch, runtimeWriteEffect, staticCrossingReview, type RuntimeBoundaryBroker, type RuntimeBoundaryEvent } from "./runtime-boundary"
@@ -160,6 +160,14 @@ import { collectBoundedEvidence } from "./security/automatic"
 // Package root, derived from this module's own URL so relative paths (native
 // supervisor, auditor) resolve no matter where the plugin is installed from.
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
+
+function runtimeProtectedPaths(workspace: string): string[] {
+  // A session opened in the plugin source may develop it; unrelated sessions
+  // still cannot modify the installation. Never relax the live observer image.
+  return containsPath(PACKAGE_ROOT, workspace)
+    ? [DEFAULT_BOUNDARY_WATCH_HELPER]
+    : [DEFAULT_BOUNDARY_WATCH_HELPER, PACKAGE_ROOT]
+}
 
 const PROMPT_VERSION = "v7-execution-scope"
 
@@ -2143,7 +2151,7 @@ const plugin: Plugin = {
       const writePolicy = (): WriteRootPolicy => ({
         home: homedir(), cwd: runtimeCwd, credentialPaths: credentialStoreReadPaths(homedir()),
         denyWrite: deniedWritePaths,
-        protect: [DEFAULT_BOUNDARY_WATCH_HELPER, PACKAGE_ROOT, path.dirname(broker.socketPath)],
+        protect: [...runtimeProtectedPaths(cwd), path.dirname(broker.socketPath)],
         brokerBase: "/tmp/opencode",
       })
       const rememberAllowedWrite = (event: RuntimeBoundaryEvent) => {
@@ -2207,7 +2215,8 @@ const plugin: Plugin = {
       // `.pytest_cache` directory inside `~/.aws` must not be exempt. The
       // target path is already canonicalized by the observer.
       const incidentalWriteExempt = (target: string): boolean => {
-        if (!isIncidentalToolWrite(target) && !incidentalRoots.some((root) => containsPath(root, target))) return false
+        const sharedTempWrite = containsPath("/tmp/opencode", target) && roots.some((root) => containsPath(root, target))
+        if (!sharedTempWrite && !isIncidentalToolWrite(target) && !incidentalRoots.some((root) => containsPath(root, target))) return false
         return writeTargetExempt(target, writePolicy())
       }
       const broker = await createRuntimeBoundaryBroker({
@@ -2233,6 +2242,12 @@ const plugin: Plugin = {
           }
           const permission = effectivePerm(call.sessionID)
           const canWrite = permission.w
+          // mkdir on an existing directory cannot change it (EEXIST). Let
+          // mkdir -p ensure shared temp ancestors without treating it as removal.
+          if (runtimeWriteEffect(event) === "mkdir" && event.targets.length === 1 &&
+            (await lstat(event.targets[0]!.path).catch(() => undefined))?.isDirectory()) {
+            return { action: "continue" }
+          }
           if (event.kind === "write" && event.targets.length > 0 &&
             event.targets.every((target) => incidentalWriteExempt(target.path))) {
             return { action: "continue" }
@@ -2256,7 +2271,8 @@ const plugin: Plugin = {
           if (event.kind === "read" && !permission.r) return blocked("Read limit: this session does not permit file reads", WITHIN_MODE)
           if (event.kind === "write" && event.targets.some((target) =>
             deniedWritePaths.some((root) => containsPath(root, target.path)) ||
-            [path.dirname(broker.socketPath), DEFAULT_BOUNDARY_WATCH_HELPER, PACKAGE_ROOT]
+            isRuntimeBrokerPath(target.path) ||
+            [path.dirname(broker.socketPath), ...runtimeProtectedPaths(cwd)]
               .some((root) => containsPath(root, target.path) || containsPath(target.path, root)))) {
             return blocked("Write protection: the target is protected or explicitly denied", WITHIN_MODE)
           }
@@ -2493,13 +2509,13 @@ const plugin: Plugin = {
         helperPath: DEFAULT_BOUNDARY_WATCH_HELPER, socketPath: broker.socketPath, token: broker.token,
         roots, denyRead: [...resolved.sandbox.denyRead, ...readOnlyDenyRead],
         denyWrite: [...deniedWritePaths, path.dirname(broker.socketPath)],
-        // The broker socket dir, the watcher binary and the package's own
-        // executable code always gate on write — in EITHER direction: a
+        // The broker socket dir, watcher binary and non-development installs
+        // always gate on write — in EITHER direction: a
         // write inside them or a rename/unlink/chmod on any ancestor swaps
         // the control plane mid-command. This holds even when the session
-        // workspace IS this repository. Not content review: integrity.
-        protect: [path.dirname(broker.socketPath), DEFAULT_BOUNDARY_WATCH_HELPER,
-          PACKAGE_ROOT, ...temporaryWriteRoots, ...observedWriteRoots],
+        // workspace never exempts the live broker or watcher image.
+        protect: ["/tmp/opencode", ...runtimeProtectedPaths(cwd),
+          ...temporaryWriteRoots, ...observedWriteRoots],
         // Explicit/worktree roots stay observed for per-target exclusions;
         // L3 roots also re-check expiry/revocation on every write. Safe local
         // continuations do not need another static/JEV review.
@@ -2595,8 +2611,8 @@ const plugin: Plugin = {
       // Auto and ReadOnly share the incidental tool cache/history roots
       // (~/.cache, *.sqlite_history-style files): a read-oriented command's
       // own history/cache effect is not a boundary crossing. On top of those,
-      // ReadOnly keeps only the global temp directories (scratch, /tmp,
-      // /var/tmp, TMPDIR, WSL's Windows %TEMP%) writable. The workspace stays
+      // Both modes share global temp directories (scratch, /tmp, /var/tmp,
+      // TMPDIR, WSL's Windows %TEMP%). In ReadOnly the workspace stays
       // read-only even when it lives inside one of them.
       const readOnly = !effectivePerm(call.sessionID).w
       const credentialPaths = await Promise.all(credentialStoreReadPaths(homedir()).map((target) => canonicalBoundaryPath(target)))
@@ -2605,7 +2621,7 @@ const plugin: Plugin = {
         !checkPathSensitivity(root, { cwd, worktree: cwd }).sensitive)
       const configuredRoots = resolved.sandbox.allowWrite.filter((root) => !writeRootRejection(root, {
         home: homedir(), cwd, credentialPaths, denyWrite: resolved.sandbox.denyWrite,
-        protect: [PACKAGE_ROOT, DEFAULT_BOUNDARY_WATCH_HELPER], brokerBase: "/tmp/opencode",
+        protect: runtimeProtectedPaths(cwd), brokerBase: "/tmp/opencode",
       }))
       // A linked git worktree's private metadata directory (resolved from the
       // cwd/.git pointer and fully verified — see linkedWorktreePrivateDir)
@@ -2621,7 +2637,7 @@ const plugin: Plugin = {
         const candidate = await linkedWorktreePrivateDir(cwd)
         if (candidate && !writeRootRejection(candidate, {
           home: homedir(), cwd, credentialPaths, denyWrite: resolved.sandbox.denyWrite,
-          protect: [PACKAGE_ROOT, DEFAULT_BOUNDARY_WATCH_HELPER], brokerBase: "/tmp/opencode",
+          protect: runtimeProtectedPaths(cwd), brokerBase: "/tmp/opencode",
         })) worktreePrivateRoots = [candidate]
       }
       let temporaryRoots: string[] = []
@@ -2630,10 +2646,9 @@ const plugin: Plugin = {
           writeReviewerTrace({ kind: "l3_root_error", sessionID: call.sessionID, policyVersion: L3_POLICY_VERSION })
         }
       }
-      const tempRoots = readOnly
-        ? [...new Set([...(await globalTempWriteRoots([scratchRoot])), ...incidental, ...configuredRoots])]
-        : []
-      const baseRoots = [cwd, scratchRoot, ...(readOnly ? tempRoots : [...new Set([...standardCacheWriteRoots(), ...incidental, ...configuredRoots, ...temporaryRoots, ...worktreePrivateRoots])])]
+      const tempRoots = [...new Set([...(await globalTempWriteRoots([scratchRoot])), ...incidental, ...configuredRoots])]
+      const baseRoots = [...new Set([cwd, scratchRoot, ...tempRoots,
+        ...(!readOnly ? [...standardCacheWriteRoots(), ...temporaryRoots, ...worktreePrivateRoots] : [])])]
       const beyondReadOnlyTemp = (writes: readonly string[]) => readOnly
         ? writes.filter((target) => containsPath(cwd, target) || !tempRoots.some((root) => containsPath(root, target)))
         : writes
@@ -2695,9 +2710,6 @@ const plugin: Plugin = {
         boundaryCalls.set(boundaryKey(call), authorization)
         return { input: raw, authorization }
       }
-      // A native write tool is itself a proven write, even when aimed at a
-      // temp/cache path. Incidental exemptions belong to observed CLI effects.
-      if (readOnly) assertNativeCeiling(tool, call.sessionID, [])
       const filePlan = await planFileBoundary(tool, raw, { cwd: directory, writableRoots: baseRoots, bypassCategories: bypass })
       authorization.filePlan = filePlan
       const operation = filePlan.command
@@ -2708,8 +2720,9 @@ const plugin: Plugin = {
       const tempOnly = readOnly && filePlan.resolvedWrites.length > 0 && beyondReadOnlyTemp(filePlan.resolvedWrites).length === 0
       assertNativeCeiling(tool, call.sessionID, filePlan.resolvedWrites, tempOnly)
       if (filePlan.targets.some((target) => target.mode !== "read" &&
-        [...resolved.sandbox.denyWrite, ...credentialPaths, DEFAULT_BOUNDARY_WATCH_HELPER, PACKAGE_ROOT]
-          .some((root) => containsPath(root, target.resolved)))) {
+        (isRuntimeBrokerPath(target.resolved) ||
+          [...resolved.sandbox.denyWrite, ...credentialPaths, ...runtimeProtectedPaths(cwd)]
+            .some((root) => containsPath(root, target.resolved))))) {
         throw rejectionError(actionBeforeText("Write protection: the target is protected or explicitly denied", nativeActionTrigger(tool, filePlan), WITHIN_MODE))
       }
       if (filePlan.targets.some((target) => target.inspectionError) && resolved.failPolicy === "fail_open") {

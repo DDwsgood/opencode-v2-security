@@ -1027,6 +1027,8 @@ describe("read-only session: kernel-enforced pass-through + scratch carve-out", 
   // --- /tmp scratch carve-out (all modes, flag-independent) ------------------
   const scratchCases: Array<[string, Script]> = [
     ["redirect into /tmp", () => "echo hi > /tmp/x"],
+    ["single-quoted redirect into /tmp", () => "echo hi > '/tmp/quoted file'"],
+    ["double-quoted redirect into /tmp", () => 'echo hi > "/tmp/quoted file"'],
     ["rm -rf /tmp path", () => "rm -rf /tmp/work-zzz"],
     ["mkdir under /tmp", () => "mkdir -p /tmp/build-zzz"],
     ["mv /tmp to /tmp", () => "mv /tmp/a /tmp/b"],
@@ -1057,6 +1059,7 @@ describe("read-only session: kernel-enforced pass-through + scratch carve-out", 
   // (Configured denyWrite freezes stay static — below.)
   const outsideCases: Array<[string, Script]> = [
     ["redirect to home", () => `echo hi > ${root}/x`],
+    ["quoted redirect to home", () => `echo hi > '${root}/quoted file'`],
     ["shuf -o outside", () => "shuf -o /etc/nonexistent-zzz-x"],
     ["npm install in home cwd", () => "npm install"],
   ]

@@ -90,7 +90,7 @@ describe("configured allowWrite roots", () => {
     const protectedRoot = path.join(root, "package")
     const inputs = ["/", home, path.dirname(home), path.join(home, ".ssh"), path.join(home, ".ssh/log"),
       path.join(home, ".config"), denied, `${denied}/logs`, path.dirname(denied), protectedRoot, `${protectedRoot}/logs`,
-      path.join(root, "helper"), "/tmp/opencode", "/tmp/opencode/security-boundary-fixture/log", `${logs}/private.key`, "/etc/ssh"]
+      path.join(root, "helper"), "/tmp/opencode/security-boundary-fixture/log", `${logs}/private.key`, "/etc/ssh"]
     const result = resolveAllowWriteRoots(inputs, { ...policy, denyWrite: [denied] })
     expect(result.roots).toEqual([])
     expect(result.warnings).toHaveLength(inputs.length)
@@ -112,6 +112,16 @@ describe("configured allowWrite roots", () => {
     for (const target of [`${logs}/denied/file`, `${logs}/protected/file`, `${logs}/credentials/file`, `${logs}/.env`, logs]) {
       expect(writeTargetExempt(target, guard)).toBe(false)
     }
+  })
+  test("shared temp roots can be granted without granting broker descendants", () => {
+    const brokerBase = path.join(logs, "broker")
+    const guard = { ...policy, brokerBase }
+    const reserved = path.join(brokerBase, "security-boundary-fixture", "observer.sock")
+    const parsed = resolveAllowWriteRoots([logs, brokerBase, path.dirname(reserved)], guard)
+    expect(parsed.roots).toEqual([logs, brokerBase])
+    expect(parsed.warnings).toHaveLength(1)
+    expect(writeTargetExempt(path.join(brokerBase, "ordinary.txt"), guard)).toBe(true)
+    expect(writeTargetExempt(reserved, guard)).toBe(false)
   })
 })
 
