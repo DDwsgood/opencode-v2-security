@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { runtimeBlockedText, runtimeBoundaryTrigger } from "../src/agent-messages"
+import { CANCEL_ADVICE, cancelledText, runtimeBlockedText, runtimeBoundaryTrigger } from "../src/agent-messages"
 import type { RuntimeBoundaryEvent } from "../src/runtime-boundary"
 
 test("runtimeBlockedText: all boundary phases use the same stopped outcome without exposing argv", () => {
@@ -28,4 +28,27 @@ test("runtimeBlockedText: non-boundary stops do not manufacture a trigger", () =
     expect(text).not.toContain("was not performed")
     expect(text).not.toContain("Trigger:")
   }
+})
+
+test("runtimeBlockedText: a cancelled run is never framed as a refusal", () => {
+  for (const details of [{ cancelled: true }, { cancelled: true, advice: CANCEL_ADVICE }]) {
+    const text = runtimeBlockedText("Cancellation: the call was cancelled", details)
+    expect(text).toStartWith("Command cancelled.")
+    expect(text).toContain("this is not a security denial")
+    expect(text).not.toContain("Command blocked")
+    expect(text).not.toContain("stopped")
+    expect(text).not.toContain("Do not automatically rerun")
+    expect(text).not.toContain("Do not restart")
+    expect(text).not.toContain("was not performed")
+  }
+})
+
+test("cancelledText: a pre-launch cancellation carries no refusal or retry protocol", () => {
+  const text = cancelledText()
+  expect(text).toContain("Command cancelled before launch.")
+  expect(text).toContain("The whole command was not run.")
+  expect(text).not.toContain("Command blocked")
+  expect(text).not.toContain("stopped")
+  expect(text).not.toContain("Do not automatically rerun")
+  expect(text).not.toContain("Do not restart")
 })

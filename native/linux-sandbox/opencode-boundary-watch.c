@@ -60,8 +60,9 @@
  *     same teardown path (SIGKILL is uncatchable and remains a stated
  *     limitation: the payload survives us then).
  *   Block messages use the broker's rendered notice when available, including
- *   the observed trigger and refusal source for background jobs. Every runtime
- *   phase reports the same outcome: "The command was stopped."
+ *   the observed trigger and refusal source for background jobs. Runtime
+ *   denials report "The command was stopped."; cancellation without a broker
+ *   notice has a separate cancellation message and signal-style exit code.
  *
  *   helper -> broker (terminal, no reply expected):
  *     {"version":1,"type":"exit","token":"...","exit":<0..255>}
@@ -1444,13 +1445,13 @@ static void kill_everything(void)
     }
 }
 
-/* Deny/cancel teardown: kill the whole tree, report the truthful exit code
+/* Denial and cancellation both kill the whole tree and report its exit code
  * to the broker (only a genuine exit 0 may update the background cache —
- * on a broker-EOF path the channel is dead and the write simply fails),
- * then exit with the canonical blocked message.
+ * on a broker-EOF path the channel is dead and the write simply fails).
  *
- * The stop phase is retained by callers for review evidence, not for the
- * agent-facing outcome: all runtime refusals use the same stopped wording. */
+ * stderr is agent-facing: only denial uses the blocked envelope and 126.
+ * Cancellation uses its own notice and signal-style exit code instead.
+ * A broker-rendered notice takes precedence in either case. */
 static void kill_tree(const char *msg, int op_blocked)
 {
     kill_everything();
@@ -1464,6 +1465,20 @@ static void kill_tree(const char *msg, int op_blocked)
                 "or bypass this denial. Any revised request requires a fresh check.\n", msg);
     }
     exit(126);
+}
+
+static void cancel_tree(void)
+{
+    kill_everything();
+    broker_send_exit(128 + SIGKILL);
+    if (g_deny_message[0]) {
+        fprintf(stderr, "%s\n", g_deny_message);
+    } else {
+        fprintf(stderr, "Command cancelled: the run was terminated before it finished; "
+                "this is not a security denial.\n");
+    }
+    /* Control-frame cancellation has no host signal; use the SIGINT-style 130. */
+    exit(g_term_signal ? 128 + g_term_signal : 130);
 }
 
 /* 'allow': detach every live tracee. Detached != dead: entries stay in the
@@ -1497,7 +1512,7 @@ static void detach_all(void)
     int spins = 0;
     while (pending > 0 && spins++ < MAX_TIDS * 4 + 64) {
         if (g_term_signal)
-            kill_tree("the supervisor was terminated (cancelled)", 0);
+            cancel_tree();
         int st;
         pid_t p = waitpid(-1, &st, __WALL | WNOHANG);
         if (p <= 0) { usleep(200); continue; }
@@ -1772,8 +1787,8 @@ static const char *sc_name(long nr)
 /* ------------------------------------------------------------------ */
 
 /* apply_decision: returns 0 when the tid should be resumed ('continue'),
- * RC_DETACHED when the whole tree was detached ('allow'). deny / timeout /
- * EOF paths never return (kill_tree exits).
+ * RC_DETACHED when the whole tree was detached ('allow'). deny / cancel /
+ * timeout / EOF paths never return (kill_tree or cancel_tree exits).
  * g_at_exit_stop marks decisions made on a syscall-EXIT stop (recvmsg cmsg
  * inspection): there the audited operation already ran, so the denial text
  * may not claim it was blocked before execution. */
@@ -1781,7 +1796,7 @@ static int apply_decision(Tracee *t, int decision, int *exit_code)
 {
     (void)t; (void)exit_code;
     if (g_term_signal || decision == -3)
-        kill_tree("the command was cancelled", 0);
+        cancel_tree();
     if (decision == -2 && g_fail_open) {
         char frame[200];
         int n = snprintf(frame, sizeof(frame),
@@ -1806,8 +1821,8 @@ static int apply_decision(Tracee *t, int decision, int *exit_code)
 
 static int observer_failure(const char *code, const char *reason, int at_entry)
 {
+    if (g_term_signal) cancel_tree();
     if (!g_fail_open) kill_tree(reason, at_entry);
-    if (g_term_signal) kill_tree("the command was cancelled", 0);
     char frame[200];
     int n = snprintf(frame, sizeof(frame),
         "{\"version\":1,\"type\":\"fail_open\",\"token\":\"%s\",\"code\":\"%s\"}\n", g_token, code);
@@ -3078,6 +3093,8 @@ static int handle_stop(Tracee *t, int st, int *exit_code)
  *   >0  pid with a pending waitpid status (in *st_out)
  *   -1  no children remain (ECHILD)
  *   -2  broker socket EOF/HUP/ERR or unexpected unsolicited traffic
+ *   -3  host signal or explicit/incomplete cancellation control frame
+ *   -4  supervision poll failure
  * 0 is impossible. */
 static int g_sigfd = -1;
 
@@ -3411,7 +3428,7 @@ int main(int argc, char **argv)
             continue;
         }
         if (p == -3)
-            kill_tree("the supervisor was terminated (cancelled)", 0);
+            cancel_tree();
         if (p == -4) {
             observer_failure("observer_poll", "supervision failed (poll error)", 0);
             continue;

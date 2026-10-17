@@ -9,7 +9,10 @@ export const NO_REROUTE = `${REPORT_BLOCK} Do not bypass this denial through ano
 export const RECHECK = `${REPORT_BLOCK} Any resubmission requires a fresh check under the current permissions.`
 export const RETRY_LATER = `${REPORT_BLOCK} Retry only after the check is available.`
 export const WITHIN_MODE = `${REPORT_BLOCK} Do not bypass this limit. Continue only with actions allowed by the current mode and safety rules.`
-export const CANCEL_ADVICE = `${REPORT_BLOCK} Do not restart without a new user instruction.`
+/** Cancellation is not a refusal: the same abort signal covers a user
+ *  interrupt and a host deadline, so the notice neither frames a denial nor
+ *  forbids a retry. */
+export const CANCEL_ADVICE = "Tell the user the run was cancelled; this is not a security denial."
 
 export type RuntimeBlockDetails = {
   trigger?: string
@@ -48,13 +51,16 @@ export function nativeActionTrigger(tool: NativeBoundaryTool, plan: FileBoundary
   return action
 }
 
-/** All runtime phases use the same outcome. The trigger is an observation,
- *  not a claim that this effect alone caused the whole-command verdict. */
+/** All runtime denial phases use the same outcome. The trigger is an
+ *  observation, not a claim that this effect alone caused the whole-command
+ *  verdict. A cancellation is not a denial: the same abort signal covers a
+ *  user interrupt and a host deadline, so it says so and forbids nothing. */
 export function runtimeBlockedText(reason: string, details: RuntimeBlockDetails = {}): string {
-  const heading = details.cancelled ? "Command cancelled." : "Command blocked: runtime check."
   const trigger = details.trigger ? `\nTrigger: ${details.trigger}.` : ""
   const advice = details.advice ?? NO_REROUTE
-  return `${heading}${trigger}\n${sentence(reason)}.\nThe command was stopped.\nDo not automatically rerun. ${advice}`
+  if (details.cancelled)
+    return `Command cancelled.${trigger}\n${sentence(reason)}.\nThe run was cancelled before it finished; this is not a security denial.\n${advice}`
+  return `Command blocked: runtime check.${trigger}\n${sentence(reason)}.\nThe command was stopped.\nDo not automatically rerun. ${advice}`
 }
 
 export function cancelledText(): string {

@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.7.5 (2026-10-17)
+
+- 修复运行时边界监督器把"取消"误报成"安全拒绝"：命令被宿主超时或中断
+  终止时，`bin/opencode-boundary-watch` 原先输出拒绝信封
+  （`Command blocked: … The command was stopped … Do not automatically rerun
+  or bypass this denial`）并以 126 退出，等于把纯粹的超时报告成安全拒绝，
+  还与宿主自身的 `Retry with a larger timeout` 自相矛盾。现在取消单独输出
+  一行 `Command cancelled: the run was terminated before it finished; this is
+  not a security denial.`，退出码为 `128 + 信号`（TERM 143／INT 130／HUP 129），
+  无信号的显式 cancel 帧、已开始但截断／超限／超时的控制帧为 130。真拒绝
+  （deny、审批超时、通道 EOF、检查未完成、边界拒绝失败）保持退出码 126 与
+  `Command blocked` 信封；broker 已给出的文案仍原样输出。
+- 修复 TS 侧同类误报：`runtimeBlockedText(cancelled)` 不再输出
+  `The command was stopped.`，也不再携带"不得自动重跑／需重新审查"这类拒绝
+  协议措辞，改为 `Command cancelled.` + "这不是安全拒绝"；`CANCEL_ADVICE`
+  同步去掉"未经新指令不得重启"的禁止重试指令。同一中止信号既覆盖用户中断
+  也覆盖宿主超时，两者无法区分，因此取消文案不做拒绝式断言、也不禁止重试。
+- 增补回归覆盖：宿主 SIGTERM 的取消文案与 143 退出码、显式／未完成 cancel
+  帧的取消语义、deny 与取消在 fail-open 下的分流，以及 TS 侧
+  `runtimeBlockedText(cancelled)`／`cancelledText()` 不含拒绝与重试措辞。
+- 验证：`native/linux-sandbox/test-boundary-watch.py` 62 项通过；
+  `tests/agent-messages.test.ts` 4 项、`tests/runtime-host-integration.test.ts`
+  56 项通过。未执行全量测试；未做真实宿主超时的端到端验证（运行中的插件仍
+  加载 1.7.4 的二进制）。
+
 ## 1.7.4 (2026-10-17)
 
 - 浮动提示（toast）只响应 `/bypass`、`/perm` 的成功执行结果。RPC 的

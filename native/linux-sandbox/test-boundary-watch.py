@@ -1130,7 +1130,15 @@ print("sent")
         proc.send_signal(15)  # SIGTERM — the host spawner's .kill()
         rc, out, err = wait_proc(proc, timeout=15)
         br.close()
-        self.assertEqual(rc, 126, err)
+        self.assertEqual(rc, 143, err)
+        self.assertEqual(err, "Command cancelled: the run was terminated before it finished; "
+                         "this is not a security denial.\n")
+        self.assertNotIn("Command blocked", err)
+        self.assertNotIn("stopped", err)
+        self.assertNotIn("Do not automatically rerun or bypass this denial", err)
+        self.assertNotIn("Report this block to the user", err)
+        self.assertNotIn("Any revised request requires a fresh check", err)
+        self.assertNotIn("retry", err.lower())
         with open(pidfile) as f:
             sidpid = int(f.read().strip())
         time.sleep(0.3)
@@ -1548,9 +1556,10 @@ print("sent")
         self.assertNotRegex(out + err, r"blocked|cannot|could not")
 
     def test_55_fail_open_keeps_denial_and_explicit_cancellation(self):
-        for policy in [lambda ev, idx: "deny",
-                       lambda ev, idx: {"version": 1, "type": "cancel"}]:
-            with self.subTest(policy=policy):
+        for action, policy in [
+                ("deny", lambda ev, idx: "deny"),
+                ("cancel", lambda ev, idx: {"version": 1, "type": "cancel"})]:
+            with self.subTest(action=action):
                 fresh_tree()
                 target = os.path.join(OUT, "must-not-run.txt")
                 proc, broker = run_watch(
@@ -1558,9 +1567,20 @@ print("sent")
                     extra_args=["--fail-open"])
                 code, out, err = wait_proc(proc)
                 broker.close()
-                self.assertEqual(code, 126, err)
                 self.assertFalse(os.path.exists(target))
-                self.assertIn("Command blocked:", err)
+                if action == "deny":
+                    self.assertEqual(code, 126, err)
+                    self.assertIn("Command blocked:", err)
+                else:
+                    self.assertEqual(code, 130, err)
+                    self.assertEqual(err, "Command cancelled: the run was terminated before it finished; "
+                                     "this is not a security denial.\n")
+                    self.assertNotIn("Command blocked", err)
+                    self.assertNotIn("stopped", err)
+                    self.assertNotIn("Do not automatically rerun or bypass this denial", err)
+                    self.assertNotIn("Report this block to the user", err)
+                    self.assertNotIn("Any revised request requires a fresh check", err)
+                    self.assertNotIn("retry", err.lower())
 
     def test_56_fail_open_idle_eof_releases_whole_tree(self):
         fresh_tree()
@@ -1583,9 +1603,16 @@ print("sent")
             idle_control=[b'{"version":1,"type":"can', b'cel"}\n'])
         code, out, err = wait_proc(proc)
         broker.close()
-        self.assertEqual(code, 126, err)
+        self.assertEqual(code, 130, err)
         self.assertFalse(os.path.exists(target))
-        self.assertIn("cancelled", err)
+        self.assertEqual(err, "Command cancelled: the run was terminated before it finished; "
+                         "this is not a security denial.\n")
+        self.assertNotIn("Command blocked", err)
+        self.assertNotIn("stopped", err)
+        self.assertNotIn("Do not automatically rerun or bypass this denial", err)
+        self.assertNotIn("Report this block to the user", err)
+        self.assertNotIn("Any revised request requires a fresh check", err)
+        self.assertNotIn("retry", err.lower())
         self.assertEqual(broker.events, [])
 
     def test_58_unfinished_idle_control_frame_uses_bounded_cancel(self):
@@ -1597,9 +1624,16 @@ print("sent")
             idle_control=[b'{"version":1,"type":"cancel"}'])
         code, out, err = wait_proc(proc)
         broker.close()
-        self.assertEqual(code, 126, err)
+        self.assertEqual(code, 130, err)
         self.assertFalse(os.path.exists(target))
-        self.assertIn("cancelled", err)
+        self.assertEqual(err, "Command cancelled: the run was terminated before it finished; "
+                         "this is not a security denial.\n")
+        self.assertNotIn("Command blocked", err)
+        self.assertNotIn("stopped", err)
+        self.assertNotIn("Do not automatically rerun or bypass this denial", err)
+        self.assertNotIn("Report this block to the user", err)
+        self.assertNotIn("Any revised request requires a fresh check", err)
+        self.assertNotIn("retry", err.lower())
         self.assertEqual(broker.events, [])
 
 if __name__ == "__main__":
