@@ -68,7 +68,7 @@ describe("append-only user state notifications", () => {
     host.notices.setBypass("s1", "filesystem,network")
     await host.notices.deliverWithPrompt("s1", "steer")
     expect(host.notifications).toHaveLength(1)
-    expect(host.notifications[0].text).toBe("opencode-v2-security: Auto\nfilesystem,network")
+    expect(host.notifications[0].text).toBe("[opencode-v2-security] Auto\nfilesystem,network")
   })
 
   test("a state that returns to the delivered text before the next prompt adds nothing", async () => {
@@ -125,25 +125,26 @@ describe("append-only user state notifications", () => {
     await notices.deliverWithPrompt("s1", "steer")
     fail = false
     await notices.deliverWithPrompt("s1", "steer")
-    expect(received).toEqual(["opencode-v2-security: Read only"])
+    expect(received).toEqual(["[opencode-v2-security] Read only"])
   })
 
-  test("a mid-run change rides the next tool result once and is not repeated at the prompt", async () => {
+  test("a transient model notice repeats until a real prompt durably admits it", async () => {
     const host = harness()
-    expect(host.notices.takeForToolResult("s1")).toBeUndefined()
+    expect(host.notices.forModelContext("s1")).toBeUndefined()
     host.notices.setPerm("s1", "Security mode: [Read only].")
-    expect(host.notices.takeForToolResult("s1")).toBe("opencode-v2-security: Security mode: [Read only].")
-    expect(host.notices.takeForToolResult("s1")).toBeUndefined()
+    expect(host.notices.forModelContext("s1")).toBe("[opencode-v2-security] Security mode: [Read only].")
+    expect(host.notices.forModelContext("s1")).toContain("[Read only]")
     await host.notices.deliverWithPrompt("s1", "steer")
-    expect(host.notifications).toHaveLength(0)
+    expect(host.notifications).toHaveLength(1)
+    expect(host.notices.forModelContext("s1")).toBeUndefined()
     host.notices.setPerm("s1", "Security mode: [Auto mode].")
-    expect(host.notices.takeForToolResult("s1")).toContain("[Auto mode]")
+    expect(host.notices.forModelContext("s1")).toContain("[Auto mode]")
   })
 
-  test("a notice already admitted with a prompt is not injected into a tool result", async () => {
+  test("a notice already admitted with a prompt is not repeated in model context", async () => {
     const host = harness()
     host.notices.setPerm("s1", "Read only")
     await host.notices.deliverWithPrompt("s1", "steer")
-    expect(host.notices.takeForToolResult("s1")).toBeUndefined()
+    expect(host.notices.forModelContext("s1")).toBeUndefined()
   })
 })

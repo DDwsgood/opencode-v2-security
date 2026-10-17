@@ -293,9 +293,9 @@ static void die(const char *fmt, ...)
     if (g_root_pid > 0) kill(g_root_pid, SIGKILL);
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "opencode-boundary-watch: ");
+    fprintf(stderr, "[opencode-v2-security] Command failed: runtime observer error: ");
     vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
+    fprintf(stderr, ". Restore the runtime observer, recheck authorization and any partial effects, then retry if still authorized.\n");
     va_end(ap);
     exit(125);
 }
@@ -1013,6 +1013,7 @@ static int proc_check(const char *path, pid_t *pid_out)
 static unsigned long g_event_id;
 static char g_deny_reason[240]; /* broker 'reason' carried to the kill text */
 static char g_deny_message[4096]; /* full agent notice, including the trigger */
+static const char *g_failure_code; /* trusted source of an observer-terminated run */
 static int g_at_exit_stop;      /* decision made at a syscall-EXIT check */
 
 /* The broker renders this field; decode its JSON escaping without allowing
@@ -1338,10 +1339,16 @@ static int broker_decide(Tracee *t, const char *syscall, const char *kind,
 static void broker_send_exit(int code)
 {
     if (g_broker_fd < 0) return;
-    char b[160];
-    int n = snprintf(b, sizeof(b),
-        "{\"version\":1,\"type\":\"exit\",\"token\":\"%s\",\"exit\":%d}\n",
-        g_token, code & 0xff);
+    char b[256];
+    int n;
+    if (g_failure_code)
+        n = snprintf(b, sizeof(b),
+            "{\"version\":1,\"type\":\"exit\",\"token\":\"%s\",\"exit\":%d,\"failure\":\"%s\"}\n",
+            g_token, code & 0xff, g_failure_code);
+    else
+        n = snprintf(b, sizeof(b),
+            "{\"version\":1,\"type\":\"exit\",\"token\":\"%s\",\"exit\":%d}\n",
+            g_token, code & 0xff);
     if (n > 0) write_all(g_broker_fd, b, (size_t)n);
 }
 
@@ -1455,14 +1462,16 @@ static void kill_everything(void)
 static void kill_tree(const char *msg, int op_blocked)
 {
     kill_everything();
+    if (!g_failure_code && !g_deny_message[0]) g_failure_code = "observer_failure";
     broker_send_exit(128 + SIGKILL);
     (void)op_blocked;
     if (g_deny_message[0]) {
         fprintf(stderr, "%s\n", g_deny_message);
     } else {
-        fprintf(stderr, "Command blocked: %s. The command was stopped. "
-                "Report this block to the user. Do not automatically rerun "
-                "or bypass this denial. Any revised request requires a fresh check.\n", msg);
+        fprintf(stderr, "[opencode-v2-security] Command failed: %s. "
+                "The command was stopped; earlier effects may remain and were not rolled back. "
+                "Report the failure to the user. Restore the runtime check, recheck current "
+                "authorization and partial effects, then retry if still authorized.\n", msg);
     }
     exit(126);
 }
@@ -1474,8 +1483,9 @@ static void cancel_tree(void)
     if (g_deny_message[0]) {
         fprintf(stderr, "%s\n", g_deny_message);
     } else {
-        fprintf(stderr, "Command cancelled: the run was terminated before it finished; "
-                "this is not a security denial.\n");
+        fprintf(stderr, "[opencode-v2-security] Command failed: the run was cancelled before it finished; "
+                "this is not a security denial. Earlier effects may remain and were not rolled back. "
+                "Recheck current authorization and partial effects, then retry if still authorized.\n");
     }
     /* Control-frame cancellation has no host signal; use the SIGINT-style 130. */
     exit(g_term_signal ? 128 + g_term_signal : 130);
@@ -1822,7 +1832,10 @@ static int apply_decision(Tracee *t, int decision, int *exit_code)
 static int observer_failure(const char *code, const char *reason, int at_entry)
 {
     if (g_term_signal) cancel_tree();
-    if (!g_fail_open) kill_tree(reason, at_entry);
+    if (!g_fail_open) {
+        g_failure_code = code;
+        kill_tree(reason, at_entry);
+    }
     char frame[200];
     int n = snprintf(frame, sizeof(frame),
         "{\"version\":1,\"type\":\"fail_open\",\"token\":\"%s\",\"code\":\"%s\"}\n", g_token, code);

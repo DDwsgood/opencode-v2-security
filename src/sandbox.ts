@@ -32,7 +32,7 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 import type { Perm } from "./permissions"
 import { splitSimpleSegments } from "./security/classifier"
-import { blockedText, RECHECK } from "./agent-messages"
+import { blockedText, RECHECK, RETRY_LATER } from "./agent-messages"
 import { failureOrPass } from "./failure-policy"
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
@@ -1288,21 +1288,36 @@ export function applySandboxCreateBefore(
   },
   failPolicy: "fail_open" | "fail_close" = "fail_close",
   onFailure: (code: string) => void = () => {},
+  onRefusal: (message: string) => void = () => {},
 ): SandboxProfile | undefined {
   const pass = (code: string) => failureOrPass(failPolicy, code, () => { onFailure(code) })
+  const refuse = (message: string) => {
+    const hooks = Object.keys(ev.env).filter((key) =>
+      /^(BASH_ENV|ENV|BASHOPTS|SHELLOPTS|PROMPT_COMMAND|PS4|BASH_XTRACEFD|BASH_FUNC_[^%]*%%|LD_.*|DYLD_.*)$/.test(key))
+    if (hooks.length > 0) {
+      if (existsSync("/bin/sh")) ev.shell = "/bin/sh"
+      for (const key of hooks) ev.env[key] = ""
+    }
+    onRefusal(message)
+    ev.command = sandboxDenyCommand(message)
+  }
   if (marked.invalid) {
     if (pass("sandbox_marker")) {
       ev.command = stripSandboxMarker(ev.command)
       return undefined
     }
-    ev.command = sandboxDenyCommand(sandboxMarkerInvalidMessage())
+    refuse(sandboxMarkerInvalidMessage())
     return undefined
   }
   if (!marked.profile) return undefined
   ev.command = marked.command
   if (marked.runtimeWatch) {
     const watch = marked.runtimeWatch
-    if (!exists(watch.helperPath) && pass("observer_unavailable")) return undefined
+    if (!exists(watch.helperPath)) {
+      if (pass("observer_unavailable")) return undefined
+      refuse(blockedText("the runtime observer is unavailable", RETRY_LATER))
+      return undefined
+    }
     // Avoid incidental interpreter cache writes being mistaken for the
     // user's requested file effects. These are call-local, not host settings.
     ev.env.PYTHONDONTWRITEBYTECODE ??= "1"
@@ -1349,13 +1364,7 @@ export function applySandboxCreateBefore(
       // live LD_PRELOAD/LD_AUDIT would still load unmonitored code when the
       // deny script's shell starts. Emptying the names is loss-free here:
       // the payload never exists, so nothing needs the deferred values.
-      if (existsSync("/bin/sh")) ev.shell = "/bin/sh"
-      for (const key of Object.keys(ev.env)) {
-        if (/^(BASH_ENV|ENV|BASHOPTS|SHELLOPTS|PROMPT_COMMAND|PS4|BASH_XTRACEFD|BASH_FUNC_[^%]*%%|LD_.*|DYLD_.*)$/.test(key))
-          ev.env[key] = ""
-      }
-      ev.command = sandboxDenyCommand(
-        `Command blocked: the deferred environment hook '${deferOverflow}' could not be placed into supervised storage. The whole command was not run.`)
+      refuse(blockedText(`the deferred environment hook '${deferOverflow}' could not be placed into supervised storage`, RETRY_LATER))
       return undefined
     }
     for (const [storage, key] of deferredPairs) {
@@ -1380,7 +1389,11 @@ export function applySandboxCreateBefore(
     return "workspace"
   }
   if (marked.profile === "full") return "full"
-  if (!exists(sandbox.helperPath) && pass("sandbox_helper")) return marked.profile
+  if (!exists(sandbox.helperPath)) {
+    if (pass("sandbox_helper")) return marked.profile
+    refuse(blockedText("the OS sandbox helper is unavailable", RETRY_LATER))
+    return marked.profile
+  }
   if (marked.profile === "rw" && (sandbox.allowSudo || marked.hostDirect === true)) {
     // Host-direct route (config allowSudo, or the `privilege` bypass
     // category routing this one call out of the sandbox): no bwrap/Landlock.
@@ -1405,7 +1418,7 @@ export function applySandboxCreateBefore(
           : undefined
     if (reason !== undefined) {
       if (pass("sandbox_unavailable")) return marked.profile
-      ev.command = sandboxDenyCommand(reason)
+      refuse(reason)
       return marked.profile
     }
     wrapShellForSandbox(ev, marked.profile, sandbox, undefined, {
@@ -1417,7 +1430,7 @@ export function applySandboxCreateBefore(
   if (!probe?.available) {
     if (pass("sandbox_unavailable")) return marked.profile
     if (probe !== undefined && !probe.available && sandbox.onUnavailable === "fail_close") {
-      ev.command = sandboxDenyCommand(
+      refuse(
         sandboxUnavailableMessage(probe.reason ?? "probe did not run"),
       )
     }

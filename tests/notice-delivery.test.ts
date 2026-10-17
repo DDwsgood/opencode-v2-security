@@ -1,6 +1,4 @@
-// Delivery channels of the security-mode notice: a change during a run rides
-// the next completed tool result; an idle change waits for the next user
-// prompt. Ancestry lookups that failed earlier are re-verified at the prompt.
+// Mid-run notices are separate user messages, not tool output or inbox work.
 
 import { afterAll, describe, expect, mock, test } from "bun:test"
 import { mkdtemp, mkdir } from "node:fs/promises"
@@ -97,6 +95,11 @@ async function harness(failPolicy: "fail_open" | "fail_close" = "fail_open") {
     status: (sessionID = "s1") => Effect.runPromise(status!({ sessionID })),
     prompt: (sessionID = "s1") =>
       Effect.runPromise(hooks.get("session.prompt")!({ sessionID, messageID: "m", prompt: { text: "next" }, delivery: "steer" })),
+    context: async (sessionID = "s1") => {
+      const event = { sessionID, messages: [{ role: "tool", content: [{ type: "text", text: "fixture" }] }] }
+      await Effect.runPromise(hooks.get("session.context")!(event))
+      return event
+    },
     after: async (result: Record<string, unknown> | undefined, status: "completed" | "error" = "completed", sessionID = "s1") => {
       const event: any = { tool: "read", sessionID, agent: "build", messageID: "m", id: "c1", input: {}, status,
         ...(result ? { result } : {}) }
@@ -107,17 +110,18 @@ async function harness(failPolicy: "fail_open" | "fail_close" = "fail_open") {
 }
 
 describe("mid-run notice delivery", () => {
-  test("RO prompt → Auto tool result → RO again delivers the repeated mode", async () => {
+  test("RO prompt → Auto model context → RO again delivers the repeated mode", async () => {
     const host = await harness()
     await host.command("ro")
     await host.prompt()
     expect(host.notifications).toHaveLength(1)
     await host.command("auto")
-    const auto = await host.after({ content: "fixture" })
-    expect(auto.result.content[0].text).toContain("[Auto mode]")
+    const auto = await host.context()
+    expect(auto.messages.at(-1)?.role).toBe("user")
+    expect(auto.messages.at(-1)?.content[0].text).toContain("[Auto mode]")
     await host.command("ro")
-    const readonly = await host.after({ content: "fixture" })
-    expect(readonly.result.content[0].text).toContain("[Read only]")
+    const readonly = await host.context()
+    expect(readonly.messages.at(-1)?.content[0].text).toContain("[Read only]")
   })
 
   test("shared claims serialize different snapshots and release on success and failure", async () => {
@@ -138,42 +142,42 @@ describe("mid-run notice delivery", () => {
     await started
     second.setPerm("fixture", "Auto")
     const later = second.deliverWithPrompt("fixture", "steer")
-    expect(second.takeForToolResult("fixture")).toBeUndefined()
+    expect(second.forModelContext("fixture")).toBeUndefined()
     expect(published).toEqual([])
     release()
     await Promise.all([earlier, later])
-    expect(published).toEqual(["opencode-v2-security: ReadOnly", "opencode-v2-security: Auto"])
+    expect(published).toEqual(["[opencode-v2-security] ReadOnly", "[opencode-v2-security] Auto"])
     expect(store.claims.size).toBe(0)
     const failed = createSessionStateNotices(async () => { throw new Error("synthetic admission failure") }, store)
     failed.setPerm("fixture", "ReadOnly")
     await failed.deliverWithPrompt("fixture", "steer")
     expect(store.claims.size).toBe(0)
-    expect(second.takeForToolResult("fixture")).toContain("ReadOnly")
+    expect(second.forModelContext("fixture")).toContain("ReadOnly")
   })
 
-  test("a change during a run is prepended to the next completed tool result, once", async () => {
+  test("a mid-run change leaves tool results intact and reaches the next existing model request", async () => {
     const host = await harness()
     await host.command("ro")
     const first = await host.after({ output: "file body", content: "file body" })
-    expect(first.result.content[0].text).toContain("[Read only]")
-    expect(first.result.content[1]).toEqual({ type: "text", text: "file body" })
+    expect(first.result.content).toBe("file body")
     const second = await host.after({ output: "again", content: "again" })
     expect(second.result.content).toBe("again")
-    // Already seen by the model: the next prompt does not repeat it, and
-    // nothing was admitted to the inbox (no extra model request).
     expect(host.notifications).toHaveLength(0)
+    const context = await host.context()
+    expect(context.messages[0]).toEqual({ role: "tool", content: [{ type: "text", text: "fixture" }] })
+    expect(context.messages[1].role).toBe("user")
+    expect(context.messages[1].content[0].text).toContain("[Read only]")
+    expect((await host.context()).messages[1]).toEqual(context.messages[1])
     await host.prompt()
-    expect(host.notifications).toHaveLength(0)
+    expect(host.notifications).toHaveLength(1)
+    expect((await host.context()).messages).toHaveLength(1)
   })
 
-  test("an absent content keeps the host's output fallback after the notice", async () => {
+  test("an absent content keeps the host's output fallback unchanged", async () => {
     const host = await harness()
     await host.command("ro")
     const event = await host.after({ output: { lines: 2 } })
-    expect(event.result.content).toEqual([
-      { type: "text", text: expect.stringContaining("[Read only]") },
-      { type: "text", text: JSON.stringify({ lines: 2 }) },
-    ])
+    expect(event.result).toEqual({ output: { lines: 2 } })
   })
 
   test("a failed tool call does not consume the notice; the next prompt carries it", async () => {

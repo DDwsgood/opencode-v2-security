@@ -439,7 +439,8 @@ export function needsHostDirectPrivilege(command: string): boolean {
     ["sudo", "sudoedit", "doas", "pkexec", "su", "runuser"].includes(path.basename(item.words[0] ?? "")))
 }
 
-/** Only canonical host user messages authorize; synthetic/system/tool text never becomes user_request. */
+/** Canonical user messages and completed user-question answers authorize;
+ * ordinary tool output, synthetic messages and assistant text do not. */
 export function boundarySessionContext(raw: unknown): { userRequest: string; context: string[] } {
   const messages = Array.isArray(raw) ? raw : raw && typeof raw === "object" && "data" in raw && Array.isArray(raw.data) ? raw.data : []
   const recent: string[] = []
@@ -459,6 +460,24 @@ export function boundarySessionContext(raw: unknown): { userRequest: string; con
         const parts = Array.isArray(state.content) ? state.content : []
         const text = parts.filter((part) => part && part.type === "text" && typeof part.text === "string")
           .map((part) => part.text).join("\n").slice(-4_000)
+        if (["question", "askUserQuestion"].includes(item.name) && state.status === "completed" && text.trim()) {
+          const metadata = state.metadata && typeof state.metadata === "object" ? state.metadata as Record<string, unknown> : undefined
+          const answers = metadata?.answers
+          // Native question answers preserve empty/unanswered selections.
+          const hasStructuredAnswers = Array.isArray(answers)
+          const answered = !hasStructuredAnswers || answers.some((answer) =>
+            Array.isArray(answer) && answer.some((selection) => typeof selection === "string" && selection.trim()))
+          const formattedUserReply = text.startsWith("User has answered your questions:")
+          if (answered && (hasStructuredAnswers || formattedUserReply)) {
+            const response = `User response via trusted question tool ${JSON.stringify(item.name)}: ${JSON.stringify({
+              question_input: state.input,
+              ...(hasStructuredAnswers ? { user_answers: answers } : { formatted_user_response: text }),
+            })}`
+            userRequest = `${userRequest}\n\n${response}`.slice(-12_000)
+            recent.push(`user: ${response.slice(0, 4_000)}`)
+            continue
+          }
+        }
         recent.push(`tool ${JSON.stringify(item.name)} (${String(state.status)}): ${text}`)
       }
     }

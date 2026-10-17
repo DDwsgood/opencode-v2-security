@@ -42,12 +42,14 @@ function answers(overrides: Record<string, unknown> = {}): Record<string, any> {
 }
 
 describe("frozen effects wire contract", () => {
-  test("ships exactly the frozen header, 18 questions and model", () => {
+  test("keeps the frozen questions and adds the trusted user-answer contract", () => {
     const body = buildEffectReviewBody(request)
     expect(body.model).toBe("jev-latest")
     expect(body.questions).toEqual(frozen.questions)
     expect(Object.keys(body.questions)).toHaveLength(18)
-    expect(body.state.startsWith(`${frozen.header}\n\n<review_input>\n`)).toBe(true)
+    expect(body.state.startsWith(`${frozen.header}\n\n`)).toBe(true)
+    expect(body.state).toContain("User response via trusted question tool")
+    expect(body.state).toContain("offered or unselected options")
     expect(body.state.endsWith("\n</review_input>\n")).toBe(true)
   })
 

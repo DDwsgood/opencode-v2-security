@@ -109,7 +109,8 @@ describe("configured allowWrite roots", () => {
   test("per-target denied, protected, credential and sensitive exclusions win", () => {
     const guard = { ...policy, denyWrite: [`${logs}/denied`], protect: [`${logs}/protected`], credentialPaths: [`${logs}/credentials`] }
     expect(writeTargetExempt(`${logs}/plain.log`, guard)).toBe(true)
-    for (const target of [`${logs}/denied/file`, `${logs}/protected/file`, `${logs}/credentials/file`, `${logs}/.env`, logs]) {
+    expect(writeTargetExempt(`${logs}/[...404].css`, guard)).toBe(true)
+    for (const target of [`${logs}/denied/file`, `${logs}/protected/file`, `${logs}/credentials/file`, `${logs}/.env`, `${logs}/[route]/private.key`, logs]) {
       expect(writeTargetExempt(target, guard)).toBe(false)
     }
   })

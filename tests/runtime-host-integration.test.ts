@@ -64,6 +64,7 @@ async function harness(deny = false, options: {
   allowWrite?: string[]
   onSpawn?: () => void
   failContextRead?: number
+  slowCommands?: boolean
 } = {}) {
   // Security state is shared process-wide between plugin instances; each
   // simulated instance here must start from a clean registry.
@@ -109,7 +110,7 @@ async function harness(deny = false, options: {
     }),
   })
   const ctx: any = {
-    options: { sandbox: { enabled: true, mode: "auto", scratch, helperPath: probe }, slowCommands: false, logReviewerTrace: false,
+    options: { sandbox: { enabled: true, mode: "auto", scratch, helperPath: probe }, slowCommands: options.slowCommands ?? false, logReviewerTrace: false,
       failPolicy: options.failPolicy ?? "fail_open",
       dynamicReview: { jev: { enabled: false } }, permission: { registerTool: false },
       reviewCommand: async (request: EffectReviewRequest) => {
@@ -166,14 +167,14 @@ describe("real observer → broker → frozen reviewer → original process", ()
     for (const mode of ["auto", "ro"]) {
       const host = await harness(true, { allowWrite: [allowed] })
       if (mode === "ro") await host.command("ro")
-      const plain = path.join(allowed, `${mode}.log`)
+      const plain = path.join(allowed, mode === "auto" ? "[...404].css" : "ro.log")
       const ordinary = await host.run("shell", { command: python(`open(${JSON.stringify(plain)}, 'w').write('fixture')`) })
       expect(ordinary.output.exit).toBe(0)
       expect(host.calls).toHaveLength(0)
       const sensitive = path.join(allowed, `${mode}.key`)
-      const refused = await host.run("shell", { command: python(`open(${JSON.stringify(sensitive)}, 'w').write('FAKE TEST DATA')`) })
-      expect(refused.output.exit).toBe(126)
-      expect(refused.metadata.boundary.runtimeBlocked).toBe(true)
+      const refused = await host.failure("shell", { command: python(`open(${JSON.stringify(sensitive)}, 'w').write('FAKE TEST DATA')`) })
+      expect(refused._tag).toBe("Tool.Error")
+      expect(refused.message).toContain(mode === "auto" ? "Command blocked:" : "Command failed")
       await expect(readFile(sensitive)).rejects.toMatchObject({ code: "ENOENT" })
       expect(host.calls).toHaveLength(mode === "auto" ? 1 : 0)
     }
@@ -187,7 +188,7 @@ describe("real observer → broker → frozen reviewer → original process", ()
     try {
       const failure = await host.failure("write", { path: path.join(directory, "fixture.txt"), content: "fixture" })
       expect(failure._tag).toBe("Tool.Error")
-      expect(failure.message).toContain("Action blocked before execution:")
+      expect(failure.message).toContain("Command failed")
       expect(host.calls).toHaveLength(1)
       expect(host.calls[0].input_facts.join("\n")).toContain("EACCES")
       expect(host.executed).toBe(0)
@@ -254,34 +255,39 @@ describe("real observer → broker → frozen reviewer → original process", ()
     } })
     const counter = path.join(workspace, "before-refusal.txt"), target = path.join(outside, "denied.txt")
     await writeFile(target, "UNCHANGED")
-    const result = await host.run("shell", { command: python(`open(${JSON.stringify(counter)},'a').write('A'); open(${JSON.stringify(target)},'w').write('replacement')`) })
-    expect(result.output.exit).not.toBe(0)
+    const result = await host.failure("shell", { command: python(`import sys\nprint('OUT-before', flush=True)\nprint('ERR-before', file=sys.stderr, flush=True)\nfor index in range(1005): print(f'line-{index}', flush=True)\nopen(${JSON.stringify(counter)},'a').write('A')\nopen(${JSON.stringify(target)},'w').write('replacement')`) })
+    expect(result._tag).toBe("Tool.Error")
     expect(await readFile(counter, "utf8")).toBe("A")
     expect(await readFile(target, "utf8")).toBe("UNCHANGED")
-    expect(result.content).toContain("Command blocked:")
-    expect(result.content).toContain("Trigger: open for truncation (openat)")
-    expect(result.content).toContain("Command review - remote or shared-state effects: the commands contains effects that is unsafe or unauthorized.")
-    expect(result.content).toContain(JSON.stringify(target))
-    expect(result.content).toContain("Report this block to the user.")
-    expect(result.output.output.match(/Command blocked:/g)).toHaveLength(1)
-    expect(result.content).not.toContain("The whole command was not run.")
+    expect(result.message).toStartWith("[opencode-v2-security] Command blocked:")
+    expect(result.message).toContain("Trigger: open for truncation (openat)")
+    expect(result.message).toContain("remote or shared-state effects")
+    expect(result.message).toContain(JSON.stringify(target))
+    expect(result.message.match(/Command blocked:/g)).toHaveLength(1)
+    expect(result.message).not.toContain("The whole command was not run.")
+    expect(result.message).toContain("OUT-before")
+    expect(result.message).not.toContain("line-1004")
+    const fullOutput = result.message.match(/full collected output saved to (\S+output\.txt)/)?.[1]
+    expect(fullOutput).toBeDefined()
+    expect(await readFile(fullOutput!, "utf8")).toContain("ERR-before")
+    await cleanupTestArtifacts(path.dirname(fullOutput!), { recursive: true, force: true })
     expect(host.calls).toHaveLength(1)
     // The reviewer still receives the real entry phase; the agent sees
     // the same stopped outcome used for every runtime refusal.
     expect(host.calls[0].input_facts[0]).toContain("paused this operation before its boundary effect")
-    expect(result.content).toContain("The command was stopped.")
-    expect(result.content).not.toMatch(/was not performed|earlier steps|rolled back/)
+    expect(result.message).toMatch(/partial|earlier/i)
+    expect(result.message).toContain("rolled back")
   })
   test("a boundary event without atExit is reviewed and refused as phase-unknown", async () => {
     const host = await harness(true)
     const target = path.join(outside, "unknown-phase.txt")
     // Test-only helper switch: emit the event without details.atExit so
     // the phase-unknown path runs end to end.
-    const result = await host.run("shell", {
+    const result = await host.failure("shell", {
       command: python(`open(${JSON.stringify(target)},'w').write('x')`),
       env: { BW_TEST_OMIT_ATEXIT: "1" },
     })
-    expect(result.output.exit).not.toBe(0)
+    expect(result._tag).toBe("Tool.Error")
     expect(host.calls).toHaveLength(1)
     // Unknown phase must not claim the operation was paused before its
     // effect — it may or may not have run.
@@ -289,9 +295,8 @@ describe("real observer → broker → frozen reviewer → original process", ()
     expect(host.calls[0].input_facts[0]).not.toContain("paused this operation before its boundary effect")
     expect(host.calls[0].input_facts[0]).not.toContain("already ran")
     // Native output and the tool notice both use the same stopped wording.
-    expect(result.content).toContain("Command blocked:")
-    expect(result.content).toContain("The command was stopped")
-    expect(result.content).not.toContain("was not performed")
+    expect(result.message).toContain("Command blocked:")
+    expect(result.message).not.toContain("was not performed")
   })
   test("same outside object, changed contents reuses an event grant", async () => {
     const host = await harness()
@@ -442,12 +447,12 @@ describe("real observer → broker → frozen reviewer → original process", ()
     }
     for (let i = 0; i < 8; i++)
       env[i === 0 ? "OPENCODE_DEFER_BASH_ENV" : `OPENCODE_DEFER${i + 1}_BASH_ENV`] = `v${i}`
-    const run = await host.run("shell", { command: `touch ${marker}; echo RAN`, env })
-    expect(run.output.exit).toBe(126)
-    expect(run.output.output).toContain("could not be placed into supervised storage")
+    const run = await host.failure("shell", { command: `touch ${marker}; echo RAN`, env })
+    expect(run.message).toStartWith("[opencode-v2-security] Command failed")
+    expect(run.message).toContain("could not be placed into supervised storage")
     // The denial shell ran with LD_* emptied: no loader complaint about
     // the nonexistent preload library may appear in its output.
-    expect(run.output.output).not.toContain("cannot be preloaded")
+    expect(run.message).not.toContain("cannot be preloaded")
     // Neither the payload nor the hook ran — including inside the outer
     // shell (which the refusal pins to /bin/sh).
     await expect(readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" })
@@ -504,8 +509,8 @@ describe("real observer → broker → frozen reviewer → original process", ()
     const opaque = await host.run("shell", { command: python(`open(${JSON.stringify(temp)},'a').write('more')`) })
     expect(opaque.output.exit).toBe(0)
     expect(await readFile(temp, "utf8")).toBe("literal\nmore")
-    const blocked = await host.run("shell", { command: python(`open(${JSON.stringify(path.join(workspace, "ro-blocked.txt"))},'w').write('x')`) })
-    expect(blocked.output.exit).not.toBe(0)
+    const blocked = await host.failure("shell", { command: python(`open(${JSON.stringify(path.join(workspace, "ro-blocked.txt"))},'w').write('x')`) })
+    expect(blocked.message).toContain("Command failed")
     await expect(readFile(path.join(workspace, "ro-blocked.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" })
     await expect(host.run("shell", { command: "touch ro-literal.txt" })).rejects.toThrow("[Read only]")
     expect(host.calls).toHaveLength(0)
@@ -525,8 +530,8 @@ describe("real observer → broker → frozen reviewer → original process", ()
         const file = path.join(temp, `${mode}-shell.txt`)
         const result = await host.run("shell", { command: `printf fixture > ${quote(file)}; rm -- ${quote(file)}` })
         expect(result.output.exit).toBe(0)
-        const blocked = await host.run("shell", { command: `printf fixture > ${quote(path.join(reserved, "denied.txt"))}` })
-        expect(blocked.output.exit).toBe(126)
+        const blocked = await host.failure("shell", { command: `printf fixture > ${quote(path.join(reserved, "denied.txt"))}` })
+        expect(blocked.message).toContain("Command failed")
         await expect(readFile(path.join(reserved, "denied.txt"))).rejects.toMatchObject({ code: "ENOENT" })
         expect(host.calls).toHaveLength(0)
       }
@@ -568,14 +573,18 @@ describe("failPolicy at the original native executor", () => {
         } else {
           const failure = await host.failure("write", { path: target, content: "fixture" })
           expect(failure._tag).toBe("Tool.Error")
-          expect(failure.message).toContain("Command blocked:")
+          expect(failure.message).toContain("Command failed")
         }
-        const shell = await host.run("shell", { command: `printf fixture > ${quote(target)}` })
-        expect(shell.output.exit).toBe(failPolicy === "fail_open" ? 0 : 126)
         if (failPolicy === "fail_open") {
+          const shell = await host.run("shell", { command: `printf fixture > ${quote(target)}` })
+          expect(shell.output.exit).toBe(0)
           expect(shell.content).not.toMatch(/blocked|cannot|could not|raw-provider-secret/i)
           expect(shell.metadata.boundary.runtimeBlocked).toBeUndefined()
-        } else expect(shell.content).toContain("Command blocked:")
+        } else {
+          const shell = await host.failure("shell", { command: `printf fixture > ${quote(target)}` })
+          expect(shell.message).toStartWith("[opencode-v2-security] Command failed")
+          expect(shell.message).not.toContain("raw-provider-secret")
+        }
       })
     }
   }
@@ -588,7 +597,7 @@ describe("failPolicy at the original native executor", () => {
           const result = await host.run("write", input)
           expect(result.content).toBe("written")
           expect(result.metadata.boundary.failOpenPasses.length).toBeGreaterThan(0)
-        } else expect((await host.failure("write", input)).message).toContain("Command blocked:")
+        } else expect((await host.failure("write", input)).message).toContain("Command failed")
       })
     }
   }
@@ -601,7 +610,7 @@ describe("failPolicy at the original native executor", () => {
           const result = await host.run("shell", { command: "printf static-pass" })
           expect(result.content).toBe("static-pass")
           expect(result.metadata.boundary.executionRoute).toBe("host_direct_reviewed")
-        } else expect((await host.failure("shell", { command: "printf static-pass" })).message).toContain("Command blocked:")
+        } else expect((await host.failure("shell", { command: "printf static-pass" })).message).toContain("Command failed")
       } finally { classify.mockRestore() }
     })
     test(`missing or non-executable observer: ${failPolicy}`, async () => {
@@ -630,7 +639,7 @@ describe("failPolicy at the original native executor", () => {
         const host = await harness(false, { failPolicy })
         const input = { path: path.join(outside, `cache-fault-${failPolicy}.txt`), content: "fixture" }
         if (failPolicy === "fail_open") expect((await host.run("write", input)).content).toBe("written")
-        else expect((await host.failure("write", input)).message).toContain("Command blocked:")
+        else expect((await host.failure("write", input)).message).toContain("Command failed")
       } finally { faulty.mockRestore() }
     })
     test(`target identity changes during review: ${failPolicy}`, async () => {
@@ -647,10 +656,15 @@ describe("failPolicy at the original native executor", () => {
     })
     test(`observer setup failure before payload execution: ${failPolicy}`, async () => {
       const host = await harness(false, { failPolicy })
-      const result = await host.run("shell", { command: "printf setup-pass", env: { BW_TEST_SEIZE_FAIL: "1" } })
-      expect(result.output.exit).toBe(failPolicy === "fail_open" ? 0 : 125)
-      if (failPolicy === "fail_open") expect(result.content).toBe("setup-pass")
-      else expect(result.content).toContain("PTRACE_SEIZE")
+      if (failPolicy === "fail_open") {
+        const result = await host.run("shell", { command: "printf setup-pass", env: { BW_TEST_SEIZE_FAIL: "1" } })
+        expect(result.output.exit).toBe(0)
+        expect(result.content).toBe("setup-pass")
+      } else {
+        const failure = await host.failure("shell", { command: "printf setup-pass", env: { BW_TEST_SEIZE_FAIL: "1" } })
+        expect(failure.message).toStartWith("[opencode-v2-security] Command failed")
+        expect(failure.message).toContain("PTRACE_SEIZE")
+      }
     })
   }
   test("trace sink failures never turn a fail-open pass into an error", async () => {
@@ -664,27 +678,26 @@ describe("failPolicy at the original native executor", () => {
   })
   test("adjudicated model/floor denies remain refusals under fail_open", async () => {
     const host = await harness(true)
-    expect((await host.failure("write", { path: path.join(outside, "floor-deny.txt"), content: "fixture" })).message).toContain("Action blocked before execution:")
-    const result = await host.run("shell", { command: `printf x > ${quote(path.join(outside, "runtime-deny.txt"))}` })
-    expect(result.output.exit).toBe(126)
-    expect(result.metadata.boundary.runtimeBlocked).toBe(true)
+    expect((await host.failure("write", { path: path.join(outside, "floor-deny.txt"), content: "fixture" })).message).toContain("Command failed")
+    const result = await host.failure("shell", { command: `printf x > ${quote(path.join(outside, "runtime-deny.txt"))}` })
+    expect(result.message).toStartWith("[opencode-v2-security] Command blocked:")
   })
   test("a selected cached denial stays final before fallible context bookkeeping", async () => {
     const host = await harness(true, { failContextRead: 3 })
     const input = { command: `printf fixture > ${quote(path.join(outside, "cached-deny.txt"))}` }
-    expect((await host.run("shell", input)).output.exit).toBe(126)
-    expect((await host.run("shell", input)).output.exit).toBe(126)
+    expect((await host.failure("shell", input)).message).toContain("Command blocked:")
+    expect((await host.failure("shell", input)).message).toContain("Command blocked:")
     expect(host.calls).toHaveLength(1)
   })
   test("known read-only and configured denyWrite decisions remain final", async () => {
     const target = path.join(outside, "protected-fixture.txt")
     const protectedHost = await harness(false, { denyWrite: [target] })
     expect((await protectedHost.failure("write", { path: target, content: "fixture" })).message).toContain("protected")
-    expect((await protectedHost.run("shell", { command: `printf x > ${quote(target)}` })).output.exit).toBe(126)
+    expect((await protectedHost.failure("shell", { command: `printf x > ${quote(target)}` })).message).toContain("Command failed")
     const readonly = await harness()
     await readonly.command("ro")
     expect((await readonly.failure("write", { path: path.join(workspace, "readonly.txt"), content: "fixture" })).message).toContain("Read only")
-    expect((await readonly.failure("shell", { command: "printf x > readonly.txt" })).message).toContain("Command blocked:")
+    expect((await readonly.failure("shell", { command: "printf x > readonly.txt" })).message).toContain("Command failed")
   })
   test("a user mode change during a failing review remains a refusal", async () => {
     let host: Awaited<ReturnType<typeof harness>>
@@ -701,9 +714,18 @@ describe("failPolicy at the original native executor", () => {
     const started = new Promise<void>((resolve) => { spawned = resolve })
     const host = await harness(false, { sessionFailure: true, onSpawn: spawned })
     const execution = host.run("shell", { command: "exec python3 -c 'import time; time.sleep(30)'" })
-    const completed = execution.then(() => "finished", () => "interrupted")
+    const completed = execution.then(() => "finished", (error) => String(error))
     await started
     await host.command("ro")
-    expect(await completed).toBe("interrupted")
+    expect(await completed).toContain("Command failed")
+  })
+  test("the production slow gate fails before launch without claiming a security denial", async () => {
+    const host = await harness(false, { slowCommands: true })
+    const failure = await host.failure("shell", { command: "sleep 120" })
+    expect(failure._tag).toBe("Tool.Error")
+    expect(failure.message).toStartWith("[opencode-v2-security] Command blocked as it seems to be slow and unnecessary.")
+    expect(failure.message).not.toMatch(/Command denied|bypass this denial/)
+    expect(host.executed).toBe(0)
+    expect(host.calls).toHaveLength(0)
   })
 })

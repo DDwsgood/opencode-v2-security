@@ -204,6 +204,7 @@ export async function createRuntimeBoundaryBroker(options: {
   onError?(reason: string): void
   failPolicy?: "fail_open" | "fail_close"
   onFailure?(code: string): void
+  onTerminalFailure?(code: string): void
   onCancelFailure?(): void
 }): Promise<RuntimeBoundaryBroker> {
   const directory = await mkdtemp(path.join(options.directory, "security-boundary-"))
@@ -260,8 +261,16 @@ export async function createRuntimeBoundaryBroker(options: {
       try { raw = JSON.parse(line) } catch { invalid("the runtime observer returned invalid JSON"); return }
       if (record(raw) && raw.version === 1 && raw.type === "exit" && raw.token === token &&
         Number.isInteger(raw.exit) && Number(raw.exit) >= 0 && Number(raw.exit) <= 255) {
+        if (raw.failure !== undefined && (typeof raw.failure !== "string" || !/^[a-z][a-z0-9_]{0,63}$/.test(raw.failure))) {
+          invalid("the runtime observer returned an invalid terminal failure")
+          return
+        }
         active = socket
         terminalExit = Number(raw.exit)
+        if (typeof raw.failure === "string") {
+          brokerError = raw.failure
+          options.onTerminalFailure?.(raw.failure)
+        }
         return
       }
       if (record(raw) && raw.version === 1 && raw.type === "fail_open" && raw.token === token &&

@@ -1181,6 +1181,19 @@ export function checkPathSensitivity(raw: string, ctx: PathContext): { parseable
   return { parseable: true, sensitive: flags.critical || flags.credential || flags.systemWrite }
 }
 
+/** A canonical runtime path is a literal name, not a shell expression. */
+export function checkResolvedPathSensitivity(absolute: string): { parseable: boolean; sensitive: boolean } {
+  if (!path.isAbsolute(absolute) || absolute.includes("\0")) return { parseable: false, sensitive: false }
+  const home = getHome()
+  const foreignHome = absolute.match(/^\/(?:home|Users)\/([^/]+)(?:\/|$)/i)
+  if (home && foreignHome && foreignHome[1].toLowerCase() !== homeBaseName(home).toLowerCase()) {
+    return { parseable: true, sensitive: true }
+  }
+  const flags: SensitivityFlags = { critical: false, credential: false, systemWrite: false }
+  matchRegistry(absolute, home, flags)
+  return { parseable: true, sensitive: flags.critical || flags.credential || flags.systemWrite }
+}
+
 // --- segment analysis -------------------------------------------------------
 
 function escalate(current: PathFinding, next: PathFinding): PathFinding {

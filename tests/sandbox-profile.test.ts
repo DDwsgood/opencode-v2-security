@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import path from "node:path"
 import { resolvePluginConfig, resolveSandbox } from "../src/config"
 import {
-  applySandboxCreateBefore,
+  applySandboxCreateBefore as applySandboxCreateBeforeWithFilesystem,
   assertSandboxAvailable,
   buildSandboxSpawn,
   createSandboxMarkers,
@@ -22,6 +22,13 @@ import {
 import { PERM_FULL, type Perm } from "../src/permissions"
 
 const perm = (r: boolean, w: boolean, x = false): Perm => ({ r, w, x })
+
+// /pkg paths below are fixtures, not installed executables. Missing-helper
+// cases still supply their own explicit existence predicate.
+function applySandboxCreateBefore(...args: Parameters<typeof applySandboxCreateBeforeWithFilesystem>) {
+  args[4] ??= () => true
+  return applySandboxCreateBeforeWithFilesystem(...args)
+}
 
 const selection = (overrides: Partial<SandboxSelection> = {}): SandboxSelection => ({
   enabled: true,
@@ -712,7 +719,7 @@ describe("assertSandboxAvailable", () => {
 
   test("fail_close throws the §4.3 message; degrade reports degraded", () => {
     expect(() => assertSandboxAvailable("ro", unavailable, "fail_close")).toThrow(
-      /Command blocked:.*sandbox is not available.*The whole command was not run/s,
+      /Command failed.*sandbox is not available.*The whole command was not run/s,
     )
     expect(assertSandboxAvailable("ro", unavailable, "degrade")).toBe("degraded")
     expect(() => assertSandboxAvailable("rw", undefined, "fail_close")).toThrow(/sandbox is not available/)
@@ -765,7 +772,7 @@ describe("assertSandboxAvailable", () => {
 describe("fail modes", () => {
   test("§4.3 message shape", () => {
     const message = sandboxUnavailableMessage("bwrap: not found, Landlock: unavailable")
-    expect(message).toStartWith("Command blocked:")
+    expect(message).toStartWith("[opencode-v2-security] Command failed")
     expect(message).toContain("sandbox is not available")
     expect(message).toContain("The whole command was not run.")
     expect(message).toContain("Native file read tools still work.")

@@ -78,6 +78,20 @@ describe("runtime boundary broker", () => {
     expect(result.action).toBe("deny")
     expect(result.reason).toContain("could not be completed")
   })
+  test("terminal observer failures are distinct from an ordinary nonzero exit", async () => {
+    for (const failure of [undefined, "observer_registers"]) {
+      const failures: string[] = []
+      const host = await createRuntimeBoundaryBroker({ directory: "/tmp/opencode", onBoundary: async () => ({ action: "allow" }),
+        onTerminalFailure: (code) => { failures.push(code) } })
+      brokers.push(host)
+      const socket = await open(host)
+      socket.end(JSON.stringify({ version: 1, type: "exit", token: host.token, exit: 126, failure }) + "\n")
+      const result = await host.finished
+      expect(result.exit).toBe(126)
+      expect(result.error).toBe(failure)
+      expect(failures).toEqual(failure ? [failure] : [])
+    }
+  })
   test("fail_open callback exceptions allow without refusal text and report a safe code", async () => {
     const failures: string[] = []
     const host = await createRuntimeBoundaryBroker({ directory: "/tmp/opencode", failPolicy: "fail_open",

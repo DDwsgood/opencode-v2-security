@@ -8,8 +8,8 @@
 // the change would leave a pending steer item in the inbox: a runner that is
 // finishing its last step treats it as new input and starts another model
 // request (and a later wake would do the same for an idle session).
-// While a run is in progress, the latest text also rides the next completed
-// tool result, which that run's next model step reads anyway.
+// During a run, the next existing model request receives a separate user-role
+// notice. This does not admit inbox work or claim durable delivery.
 
 interface SessionState {
   perm?: string
@@ -24,11 +24,12 @@ interface SessionState {
 export interface NoticeStore {
   states: Map<string, SessionState>
   delivered: Map<string, string>
+  modelSnapshots: Map<string, string>
   claims: Map<string, { token: symbol; text: string; done: Promise<void> }>
 }
 
 export function createNoticeStore(): NoticeStore {
-  return { states: new Map(), delivered: new Map(), claims: new Map() }
+  return { states: new Map(), delivered: new Map(), modelSnapshots: new Map(), claims: new Map() }
 }
 
 export interface SessionStateNotification {
@@ -50,10 +51,8 @@ export interface SessionStateNotices {
    *  promoted one per turn, so a notice queued before it would get a model
    *  request of its own. The notice then rides the next steering prompt. */
   deliverWithPrompt(sessionID: string, delivery: string | undefined): Promise<void>
-  /** Take the latest undelivered notice for a tool result that the running
-   *  session's next model step will read anyway. Only exists mid-run, so it
-   *  never starts a request; the text then counts as delivered. */
-  takeForToolResult(sessionID: string): string | undefined
+  /** Repeat a transient user notice until a real prompt durably admits it. */
+  forModelContext(sessionID: string): string | undefined
   /** Wait for in-progress admissions. */
   flush(): Promise<void>
 }
@@ -62,7 +61,9 @@ export function createSessionStateNotices(
   publish?: (notice: SessionStateNotification) => Promise<unknown>,
   store: NoticeStore = createNoticeStore(),
 ): SessionStateNotices {
-  const { states, delivered, claims } = store
+  // Plugin instances can reuse a store created before this field existed.
+  store.modelSnapshots ??= new Map()
+  const { states, delivered, modelSnapshots, claims } = store
   let pending = Promise.resolve()
 
   const snapshot = (sessionID: string): string | undefined => {
@@ -71,7 +72,7 @@ export function createSessionStateNotices(
     const parts = [state.perm, state.bypass].filter(
       (text): text is string => typeof text === "string" && text.length > 0,
     )
-    return parts.length ? `opencode-v2-security: ${parts.join("\n")}` : undefined
+    return parts.length ? `[opencode-v2-security] ${parts.join("\n")}` : undefined
   }
 
   const set = (key: keyof SessionState) => (sessionID: string, text: string | undefined) => {
@@ -89,6 +90,7 @@ export function createSessionStateNotices(
     clear(sessionID) {
       states.delete(sessionID)
       delivered.delete(sessionID)
+      modelSnapshots.delete(sessionID)
       claims.delete(sessionID)
     },
     deliverWithPrompt(sessionID, delivery) {
@@ -112,7 +114,10 @@ export function createSessionStateNotices(
             resume: false,
             delivery: "steer",
           })
-          if (claims.get(sessionID)?.token === claim.token) delivered.set(sessionID, text)
+          if (claims.get(sessionID)?.token === claim.token) {
+            delivered.set(sessionID, text)
+            modelSnapshots.delete(sessionID)
+          }
         } finally {
           if (claims.get(sessionID)?.token === claim.token) claims.delete(sessionID)
           release()
@@ -124,15 +129,19 @@ export function createSessionStateNotices(
       pending = run
       return run
     },
-    takeForToolResult(sessionID) {
+    forModelContext(sessionID) {
       const text = snapshot(sessionID)
-      if (!text || delivered.get(sessionID) === text) return undefined
+      if (!text) return undefined
+      const previousModelSnapshot = modelSnapshots.get(sessionID)
+      if (delivered.get(sessionID) === text && (previousModelSnapshot === undefined || previousModelSnapshot === text)) return undefined
       // Another instance is admitting this exact text right now: the notice
       // is on its way into the transcript through that channel. Do NOT mark
       // it delivered yet — the publisher marks it on success; if that
       // admission fails, its claim clears and the next channel retries.
       if (claims.has(sessionID)) return undefined
-      delivered.set(sessionID, text)
+      // A return to the durable mode must correct a different transient mode.
+      // This tracks request assembly, not successful or durable delivery.
+      modelSnapshots.set(sessionID, text)
       return text
     },
     async flush() {

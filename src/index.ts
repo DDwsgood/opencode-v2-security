@@ -45,11 +45,11 @@
 
 import { createHash } from "node:crypto"
 import { realpathSync } from "node:fs"
-import { access, appendFile, lstat, mkdir, readFile } from "node:fs/promises"
+import { access, appendFile, lstat, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { homedir, release as osRelease } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { Effect, Latch, Stream } from "effect"
+import { Effect, Exit, Latch, Stream } from "effect"
 import type { Plugin } from "@opencode-ai/plugin/effect/plugin"
 import type { Scope } from "effect"
 import { resolveClassifierShell } from "./shell-dialect"
@@ -150,7 +150,9 @@ import {
   RECHECK,
   RETRY_LATER,
   reviewRefusal,
+  isReviewerDenial,
   reviewUnavailableReason,
+  slowCommandText,
   WITHIN_MODE,
   subagentBlockedText,
 } from "./agent-messages"
@@ -261,7 +263,7 @@ function toRejection(error: unknown): Error & { readonly _tag: "Tool.Error" } {
   }
   // Some pre-spawn helpers return the same centralized text as a plain
   // Error (their API is also used by create.before's deny-command rewrite).
-  if (error instanceof Error && error.message.startsWith("Command blocked: ") &&
+  if (error instanceof Error && error.message.startsWith("[opencode-v2-security] Command failed") &&
     error.message.includes("The whole command was not run.")) {
     return rejectionError(error.message)
   }
@@ -291,7 +293,37 @@ function conciseReason(reason: string, limit = 160) {
 function softSlowMessage(reason: string) {
   // This interception happens before launch too. The reason may suggest a
   // cheaper equivalent, but must not imply the original command ran.
-  return blockedRejection(conciseReason(reason, 300))
+  return rejectionError(slowCommandText(conciseReason(reason, 300)))
+}
+
+/** Error results bypass the host's normal output truncation. Keep the same
+ * head-first/50 KiB behavior, with the requested 1,000-line output limit. */
+async function executionFailureText(notice: string, rawOutput: string): Promise<string> {
+  const output = rawOutput.trimEnd().endsWith(notice)
+    ? rawOutput.trimEnd().slice(0, -notice.length).trimEnd() : rawOutput
+  if (!output) return notice
+  const lines = output.split("\n")
+  if (output.endsWith("\n")) lines.pop()
+  const kept: string[] = []
+  let bytes = 0
+  for (const line of lines.slice(0, 1_000)) {
+    const size = Buffer.byteLength(line, "utf8") + (kept.length ? 1 : 0)
+    if (bytes + size > 50 * 1024) break
+    kept.push(line)
+    bytes += size
+  }
+  let marker = ""
+  if (kept.length < lines.length || Buffer.byteLength(output, "utf8") > 50 * 1024) {
+    try {
+      const directory = await mkdtemp("/tmp/opencode/security-output-")
+      const fullOutputPath = path.join(directory, "output.txt")
+      await writeFile(fullOutputPath, output, { mode: 0o600 })
+      marker = `\n[opencode-v2-security] Output truncated to at most 1000 lines and 50 KiB; full collected output saved to ${fullOutputPath}.`
+    } catch {
+      marker = "\n[opencode-v2-security] Output truncated to at most 1000 lines and 50 KiB; saving the full collected output failed."
+    }
+  }
+  return `${notice}\n\nCollected command output (stdout/stderr):\n${kept.join("\n")}${marker}`
 }
 
 // --- small helpers ----------------------------------------------------------
@@ -561,12 +593,11 @@ interface EffectPluginContext {
        * so a host default change cannot silently alter notification semantics. */
       delivery?: "steer" | "queue"
     }) => Effect.Effect<unknown, unknown>
-    /** Session hooks (packages/plugin/src/effect/session.ts). Only "prompt"
-     *  is used: it runs while the host prepares a real user prompt, before
-     *  that prompt is admitted. Optional so older hosts still load. */
-    readonly hook?: (
-      name: "prompt",
-      callback: (event: { readonly sessionID: string; readonly delivery?: string }) => Effect.Effect<void, never>,
+    readonly hook?: <Name extends "prompt" | "context">(
+      name: Name,
+      callback: (event: Name extends "prompt"
+        ? { readonly sessionID: string; readonly delivery?: string }
+        : { readonly sessionID: string; messages: Array<{ role: string; content: unknown[] }> }) => Effect.Effect<void, never>,
     ) => Effect.Effect<unknown, never, Scope.Scope>
   }
   // Event-only RPC used to push bypass state changes to the TUI companion.
@@ -785,11 +816,9 @@ const plugin: Plugin = {
     yield* Effect.addFinalizer(() => Effect.sync(() => shared.unregisterLocationPolicy(instanceToken)))
 
     // --- append-only user-role state notices --------------------------------
-    // No session.context hook and no system/history mutation. A mode change
-    // is only recorded; it becomes a durable transcript item right before the
-    // next real user prompt, so it never starts a model request of its own.
-    // The snapshot store is shared across instances: whichever instance
-    // handles the session's prompt hook / tool result delivers it once.
+    // Durable notices accompany a real prompt. Mid-run notices are separate
+    // user messages in an already scheduled request, never tool output.
+    // The snapshot store is shared; only durable prompt admission marks delivery.
     const sessionNotices = createSessionStateNotices(
       (notice) => run(ctx.session.synthetic(notice)),
       shared.notices,
@@ -803,6 +832,10 @@ const plugin: Plugin = {
           await hydratePermAncestry(event.sessionID)
           await sessionNotices.deliverWithPrompt(event.sessionID, event.delivery)
         }))
+      yield* ctx.session.hook("context", (event) => Effect.sync(() => {
+        const notice = sessionNotices.forModelContext(event.sessionID)
+        if (notice) event.messages.push({ role: "user", content: [{ type: "text", text: notice }] })
+      }))
     }
 
     // --- temporary bypass state (fixed-expiry lease) ------------------------
@@ -2185,7 +2218,7 @@ const plugin: Plugin = {
         return { verdict: decision.verdict, rules: decision.rules }
       })
       const commandProofRules = () => proofRules
-      const recordBlock = (reason: string, event?: RuntimeBoundaryEvent, advice?: string, cancelled = false) => {
+      const recordBlock = (reason: string, event?: RuntimeBoundaryEvent, advice?: string, cancelled = false, reviewDenied = false) => {
         // First refusal reason wins: a downstream broker EOF/cancel must not
         // rewrite why the crossing was actually denied.
         if (!authorization.runtimeBlocked) {
@@ -2194,6 +2227,7 @@ const plugin: Plugin = {
             ...(event ? { trigger: runtimeBoundaryTrigger(event) } : {}),
             ...(advice ? { advice } : {}),
             ...(cancelled ? { cancelled: true } : {}),
+            ...(reviewDenied ? { reviewDenied: true } : {}),
           }
         }
         return {
@@ -2224,9 +2258,11 @@ const plugin: Plugin = {
         failPolicy: resolved.failPolicy,
         onError: () => { failure("broker_unavailable") },
         onFailure: (code) => { failure(code) },
+        // The observer has already stopped: fail-open cannot revive this run.
+        onTerminalFailure: (code) => { recordBlock(checkUnavailableReason(code), undefined, RETRY_LATER) },
         onCancelFailure: () => authorization.cancelExecution?.(),
         onBoundary: async (event: RuntimeBoundaryEvent, signal) => {
-          const blocked = (reason: string, advice?: string) => recordBlock(reason, event, advice)
+          const blocked = (reason: string, advice?: string, reviewDenied = false) => recordBlock(reason, event, advice, false, reviewDenied)
           const failed = (code: string) => failure(code, event)
           try {
           authorization.runtimeStats!.crossings++
@@ -2399,7 +2435,7 @@ const plugin: Plugin = {
             // context/cache inspection failure must not turn it into a pass.
             if (hit.decision === "deny") {
               const refusal = hit.result ? reviewRefusal(hit.result) : { reason: "Cached denial: a pervious review denied the similar operation" }
-              return blocked(refusal.reason, refusal.advice)
+              return blocked(refusal.reason, refusal.advice, hit.result ? isReviewerDenial(hit.result) : false)
             }
             const currentTargets = await currentCacheTargets(observed)
             // Positive cache reuse is not bound to the user message: a new
@@ -2445,7 +2481,7 @@ const plugin: Plugin = {
           // identity bookkeeping fails.
           if (result.decision !== "allow") {
             const review = reviewRefusal(result)
-            const refusal = blocked(review.reason, review.advice)
+            const refusal = blocked(review.reason, review.advice, isReviewerDenial(result))
             // Bookkeeping is best-effort after a real deny; its exception
             // must never erase or turn that completed decision into a pass.
             try { if (!hit) approvalCache.store(scope, facts, result) } catch {
@@ -2477,7 +2513,7 @@ const plugin: Plugin = {
           if (!hit && storable) approvalCache.store(scope, facts, result)
           if (result.decision !== "allow") {
             const refusal = reviewRefusal(result)
-            return blocked(refusal.reason, refusal.advice)
+            return blocked(refusal.reason, refusal.advice, isReviewerDenial(result))
           }
           rememberAllowedWrite(event)
           authorization.source = hit ? `cache:${hit.layer}` : result.source
@@ -2655,6 +2691,8 @@ const plugin: Plugin = {
       if (tool === "shell") {
         const command = commandFromArgs(raw)
         if (typeof command !== "string" || !command.trim()) throw blockedRejection("the shell command is empty")
+        const launchDirectory = typeof raw.workdir === "string" ? nativeAbsolutePath(cwd, raw.workdir) : cwd
+        maybeBlockSlow(command, raw, resolveClassifierShell(configuredShell), launchDirectory, cwd, bypass)
         if (!readOnly) {
           const floorCheck = await classifyShellCommand({
             script: command, cwd, worktree: cwd, shell: resolveClassifierShell(configuredShell),
@@ -2906,9 +2944,17 @@ const plugin: Plugin = {
         if (process.platform !== "linux") return
         const marked = extractSandboxMarker(sandboxMarkers, ev.command)
         const original = { command: marked.command, shell: ev.shell, env: { ...ev.env } }
+        const authorization = marked.runtimeWatch
+          ? [...boundaryCalls.values()].find((call) => call.runtimeBroker?.socketPath === marked.runtimeWatch!.socketPath)
+          : undefined
         try {
           applySandboxCreateBefore(ev, marked, resolved.sandbox, sandboxProbe, undefined, resolved.failPolicy,
-            (code) => { passFailure(code) })
+            (code) => { passFailure(code) }, (message) => {
+              if (authorization && !authorization.runtimeBlocked) {
+                authorization.runtimeBlocked = message
+                authorization.runtimeBlockDetails = { advice: RETRY_LATER }
+              }
+            })
         } catch (error) {
           if (!passFailure("sandbox_prepare")) throw error
           ev.command = original.command
@@ -3004,10 +3050,17 @@ const plugin: Plugin = {
                   try: (signal) => prepareBoundary(name, input, call, token, signal),
                   catch: toRejection,
                 })
-                const result = yield* Effect.withFiber((fiber) => {
+                const result = yield* Effect.uninterruptibleMask((restore) => restore(Effect.withFiber((fiber) => {
                   prepared.authorization.cancelExecution = () => fiber.interruptUnsafe()
                   return original(prepared.input, call)
-                })
+                })).pipe(Effect.exit, Effect.flatMap((exit) => {
+                  if (Exit.isSuccess(exit)) return Effect.succeed(exit.value)
+                  if (prepared.authorization.runtimeBlocked && Exit.hasInterrupts(exit)) {
+                    return Effect.fail(rejectionError(runtimeBlockedText(prepared.authorization.runtimeBlocked,
+                      prepared.authorization.runtimeBlockDetails)))
+                  }
+                  return Effect.failCause(exit.cause)
+                })))
                 prepared.authorization.cancelExecution = undefined
                 const shellResult = result && typeof result === "object" ? (result as { output?: { exit?: number; status?: string } }).output : undefined
                 // Only a runtime-watched shell may keep its authorization +
@@ -3036,26 +3089,32 @@ const plugin: Plugin = {
                 // Exclude our own pre-spawn denial text: a nested tool
                 // call's "Command blocked … The whole command was not run."
                 // output must not be dressed up as a post-launch OS error.
-                const runtimeRefusal = prepared.authorization.runtimeBlocked
-                  ? runtimeBlockedText(prepared.authorization.runtimeBlocked,
-                      prepared.authorization.runtimeBlockDetails) : undefined
+                let runtimeRefusal: string | undefined
+                if (prepared.authorization.runtimeBlocked) {
+                  runtimeRefusal = prepared.authorization.runtimeBlocked.startsWith("[opencode-v2-security]")
+                    ? prepared.authorization.runtimeBlocked
+                    : runtimeBlockedText(prepared.authorization.runtimeBlocked, prepared.authorization.runtimeBlockDetails)
+                }
+                const observerSetupError = !runtimeRefusal && prepared.authorization.executionRoute === "runtime_boundary_watch" &&
+                  output?.exit === 125 && typeof output.output === "string" &&
+                  output.output.startsWith("[opencode-v2-security] Command failed: runtime observer error:")
                 const accessError = !runtimeRefusal && name === "shell" && output && output.exit !== 0 &&
                   typeof output.output === "string" && !output.output.includes("The whole command was not run.") &&
                   /permission denied|read-only file system|device or resource busy|cross-device link|\bEACCES\b|\bEPERM\b|sudo:|bwrap:|opencode-sandbox:/i.test(output.output)
                 // Post-launch OS errors keep their raw output; the appended
                 // note (agent-messages.ts) only explains that this is an OS
                 // result, not a plugin block — never a retry hint.
-                const notice = runtimeRefusal ?? accessErrorNote(prepared.authorization.executionRoute === "host_direct_reviewed")
-                const appendNotice = runtimeRefusal
-                  ? !String(output?.output ?? "").includes(runtimeRefusal)
-                  : accessError
+                const notice = runtimeRefusal ?? (observerSetupError
+                  ? runtimeBlockedText(checkUnavailableReason("observer_setup"), { advice: RETRY_LATER })
+                  : accessErrorNote(prepared.authorization.executionRoute === "host_direct_reviewed"))
+                if (runtimeRefusal || accessError || observerSetupError) {
+                  let collectedOutput = toolResultContent(value)
+                    .flatMap((part: any) => part?.type === "text" ? [part.text] : []).join("\n")
+                  if (typeof output?.output === "string") collectedOutput = output.output
+                  return yield* Effect.fail(rejectionError(yield* Effect.promise(() => executionFailureText(notice, collectedOutput))))
+                }
                 return {
                   ...value,
-                  ...(appendNotice ? {
-                    output: { ...output, output: `${output!.output}\n\n${notice}` },
-                    content: typeof value.content === "string" ? `${value.content}\n\n${notice}`
-                      : [...(Array.isArray(value.content) ? value.content : []), { type: "text", text: notice }],
-                  } : {}),
                   metadata: {
                     ...value.metadata,
                     boundary: {
@@ -3065,8 +3124,6 @@ const plugin: Plugin = {
                       ...(prepared.authorization.executionRoute
                         ? { executionRoute: prepared.authorization.executionRoute }
                         : {}),
-                       ...(accessError ? { runtimeAccessError: true } : {}),
-                       ...(runtimeRefusal ? { runtimeBlocked: true } : {}),
                        ...(prepared.authorization.failOpenPasses ? { failOpenPasses: [...prepared.authorization.failOpenPasses] } : {}),
                        // Copy by value + mark finality: for a background
                        // command the counters keep mutating under the live
@@ -3107,13 +3164,6 @@ const plugin: Plugin = {
     // execute.after failure channel is `never`: any exception is swallowed so a
     // post-check error never fails the tool step.
     async function runAfter(ev: ExecuteAfterEvent): Promise<void> {
-      // A mode change during a run reaches the model with the next completed
-      // tool result instead of waiting for the next user prompt. Prepended:
-      // the host truncates long results from the tail.
-      if (ev.status === "completed" && ev.result) {
-        const notice = sessionNotices.takeForToolResult(ev.sessionID)
-        if (notice) ev.result.content = [{ type: "text", text: notice }, ...toolResultContent(ev.result)]
-      }
       // Only the tool result identifies a spawn's child authoritatively.
       if (ev.tool === "subagent") {
         const stash = permStash.get(ev.id)

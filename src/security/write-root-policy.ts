@@ -1,7 +1,7 @@
 import { lstatSync } from "node:fs"
 import path from "node:path"
 import { canonicalCandidate } from "./automatic-write-roots"
-import { checkPathSensitivity } from "./paths"
+import { checkResolvedPathSensitivity } from "./paths"
 
 export interface WriteRootPolicy {
   home: string
@@ -51,7 +51,7 @@ export function writeRootRejection(root: string, policy: WriteRootPolicy): strin
   if (policy.brokerBase && isRuntimeBrokerPath(root, policy.brokerBase)) {
     return "the root overlaps the runtime broker directory"
   }
-  const sensitivity = checkPathSensitivity(root, { cwd: policy.cwd, worktree: policy.cwd })
+  const sensitivity = checkResolvedPathSensitivity(root)
   if (!sensitivity.parseable || sensitivity.sensitive) return "the root is sensitive or unparseable"
   return undefined
 }
@@ -61,7 +61,7 @@ export function writeRootRejection(root: string, policy: WriteRootPolicy): strin
 export function writeTargetExempt(target: string, policy: WriteRootPolicy): boolean {
   if (protectedOverlap(target, policy)) return false
   if (policy.brokerBase && isRuntimeBrokerPath(target, policy.brokerBase)) return false
-  const sensitivity = checkPathSensitivity(target, { cwd: policy.cwd, worktree: policy.cwd })
+  const sensitivity = checkResolvedPathSensitivity(target)
   return sensitivity.parseable && !sensitivity.sensitive
 }
 
