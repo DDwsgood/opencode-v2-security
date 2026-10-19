@@ -356,10 +356,11 @@ describe("create.before authority (marker is the sole wrap source)", () => {
     const marked = extractSandboxMarker(markers, ev.command, 1000 + 60_001)
     expect(marked.profile).toBeUndefined()
     expect(marked.invalid).toBe(true)
-    applySandboxCreateBefore(ev, marked, selection(), available)
+    let refusal = ""
+    applySandboxCreateBefore(ev, marked, selection(), available, undefined, "fail_close", undefined, (message) => { refusal = message })
     expect(ev.shell).toBe("/bin/bash")
-    expect(ev.command).toContain("exit 126")
-    expect(ev.command).toContain("security authorization for this call is invalid")
+    expect(ev.command).toBe("exit 126")
+    expect(refusal).toContain("security authorization for this call is invalid")
   })
 
   test("unknown (forged) marker is denied, not run bare", () => {
@@ -377,15 +378,16 @@ describe("create.before authority (marker is the sole wrap source)", () => {
     const ev = spawn()
     ev.command = insertSandboxMarker(markers, "make", "rw", NONCE)
     const marked = extractSandboxMarker(markers, ev.command)
-    applySandboxCreateBefore(ev, marked, selection(), unavailable)
+    let refusal = ""
+    applySandboxCreateBefore(ev, marked, selection(), unavailable, undefined, "fail_close", undefined, (message) => { refusal = message })
     expect(ev.shell).toBe("/bin/bash") // no wrap
-    expect(ev.command).toContain("exit 126")
-    expect(ev.command).toContain("sandbox is not available")
+    expect(ev.command).toBe("exit 126")
+    expect(refusal).toContain("sandbox is not available")
     // State a pre-execution block without permission-elevation or manual
     // installation guidance; a native read tool remains available.
-    expect(ev.command).toContain("The whole command was not run.")
-    expect(ev.command).not.toContain("install bubblewrap")
-    expect(ev.command).not.toContain("Install bubblewrap")
+    expect(refusal).toContain("The whole command was not run.")
+    expect(refusal).not.toContain("install bubblewrap")
+    expect(refusal).not.toContain("Install bubblewrap")
   })
 
   test("degrade leaves marker-present spawn untouched when unavailable", () => {
@@ -482,16 +484,21 @@ describe("create.before authority (marker is the sole wrap source)", () => {
       const ev = spawn()
       ev.command = insertSandboxMarker(markers, "make", "workspace", NONCE)
       const marked = extractSandboxMarker(markers, ev.command)
+      let refusal = ""
       applySandboxCreateBefore(
         ev,
         marked,
         selection({ onUnavailable }),
         { available: true, path: "landlock-only", landlockAbi: 5 },
+        undefined,
+        "fail_close",
+        undefined,
+        (message) => { refusal = message },
       )
       expect(ev.shell).toBe("/bin/bash")
-      expect(ev.command).toContain("exit 126")
-      expect(ev.command).toContain("available OS sandbox backend cannot enforce")
-      expect(ev.command).toContain("The whole command was not run.")
+      expect(ev.command).toBe("exit 126")
+      expect(refusal).toContain("available OS sandbox backend cannot enforce")
+      expect(refusal).toContain("The whole command was not run.")
     }
   })
 
@@ -503,8 +510,7 @@ describe("create.before authority (marker is the sole wrap source)", () => {
       const marked = extractSandboxMarker(markers, ev.command)
       applySandboxCreateBefore(ev, marked, selection({ onUnavailable }), unavailable)
       expect(ev.shell).toBe("/bin/bash")
-      expect(ev.command).toContain("exit 126")
-      expect(ev.command).toContain("sandbox is not available")
+      expect(ev.command).toBe("exit 126")
     }
   })
 
@@ -513,16 +519,21 @@ describe("create.before authority (marker is the sole wrap source)", () => {
     const ev = spawn()
     ev.command = insertSandboxMarker(markers, "make", "workspace", NONCE)
     const marked = extractSandboxMarker(markers, ev.command)
+    let refusal = ""
     applySandboxCreateBefore(
       ev,
       marked,
       selection({ extraArgs: ["--bind", "/x", "/x"] }),
       available,
+      undefined,
+      "fail_close",
+      undefined,
+      (message) => { refusal = message },
     )
     expect(ev.shell).toBe("/bin/bash")
-    expect(ev.command).toContain("exit 126")
-    expect(ev.command).toContain("configured extra sandbox options are not supported")
-    expect(ev.command).toContain("The whole command was not run.")
+    expect(ev.command).toBe("exit 126")
+    expect(refusal).toContain("configured extra sandbox options are not supported")
+    expect(refusal).toContain("The whole command was not run.")
   })
 
   test("workspace + full/bwrap-only probe wraps normally", () => {
@@ -780,14 +791,14 @@ describe("fail modes", () => {
     expect(message).not.toContain("install bubblewrap")
   })
 
-  test("deny command exits 126 and prints the exact message (embedded quotes survive)", () => {
-    const message = sandboxUnavailableMessage("x")
-    const command = sandboxDenyCommand(message)
+  test("deny command exits 126 without writing interception text to either stream", () => {
+    const command = sandboxDenyCommand()
     expect(command).toContain("exit 126")
     // Semantic check, not quoting trivia: run it in a real bash.
     const result = Bun.spawnSync(["bash", "-c", command])
     expect(result.exitCode).toBe(126)
-    expect(result.stderr.toString().trim()).toBe(message)
+    expect(result.stdout.toString()).toBe("")
+    expect(result.stderr.toString()).toBe("")
   })
 })
 
@@ -823,12 +834,13 @@ describe("runtime watch deferred-hook refusal (spawn boundary)", () => {
     for (let i = 0; i < 8; i++)
       env[i === 0 ? "OPENCODE_DEFER_BASH_ENV" : `OPENCODE_DEFER${i + 1}_BASH_ENV`] = `user-slot-${i}`
     const ev = spawn(env)
-    const result = applySandboxCreateBefore(ev, { ...marked }, selection(), probe)
-    // Refused before the payload exists: the deny text replaces the whole
-    // command — the payload marker must not appear in it at all.
+    let refusal = ""
+    const result = applySandboxCreateBefore(ev, { ...marked }, selection(), probe, undefined, "fail_close", undefined, (message) => { refusal = message })
+    // Refused before the payload exists: only a silent exit replaces the
+    // command; the notice is carried separately to the enclosing tool.
     expect(result).toBeUndefined()
-    expect(ev.command).toContain("exit 126")
-    expect(ev.command).toContain("could not be placed into supervised storage")
+    expect(ev.command).toBe("exit 126")
+    expect(refusal).toContain("could not be placed into supervised storage")
     expect(ev.command).not.toContain("PAYLOAD-MARKER")
     expect(ev.command).not.toContain("exec ")
     // The refusal pins /bin/sh (dash ignores BASH_ENV) AND still empties
@@ -851,8 +863,7 @@ describe("runtime watch deferred-hook refusal (spawn boundary)", () => {
     const ev = spawn(env)
     const result = applySandboxCreateBefore(ev, { ...marked }, selection(), probe)
     expect(result).toBeUndefined()
-    expect(ev.command).toContain("exit 126")
-    expect(ev.command).toContain("could not be placed into supervised storage")
+    expect(ev.command).toBe("exit 126")
     expect(ev.command).not.toContain("PAYLOAD-MARKER")
     expect(ev.shell).toBe("/bin/sh")
     for (let i = 0; i < 260; i++) expect(ev.env[`LD_HOOK_${i}`]).toBe("")

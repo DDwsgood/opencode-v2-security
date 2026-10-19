@@ -215,7 +215,7 @@ describe("security mode commands", () => {
     await host.command("perm", "auto")
     await host.prompt()
     expect(host.notifications).toHaveLength(2)
-    expect(host.hooks.has("session.context")).toBe(false)
+    expect(host.hooks.has("session.context")).toBe(true)
   })
   test("default session reports Auto mode", async () => {
     const host = await harness()
@@ -602,7 +602,11 @@ describe("security mode commands", () => {
       const error = await host.setPermissionError(bad, "child")
       expect(error).toContain("Permission change rejected")
       expect(error).toContain('"readonly" or "auto"')
-      expect(error).not.toContain(bad)
+      if (bad === "all") {
+        expect(error).not.toMatch(/\ball\b/i)
+      } else {
+        expect(error).not.toContain(bad)
+      }
     }
   })
 })

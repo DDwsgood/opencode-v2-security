@@ -3,7 +3,8 @@ import { mkdtemp, mkdir, writeFile, symlink } from "node:fs/promises"
 import { cleanupTestArtifacts as rm } from "./artifacts"
 import os from "node:os"
 import path from "node:path"
-import { classifyShellCommand, type Strictness } from "../src/security/classifier"
+import { classifyBoundaryCommand, classifyShellCommand, type Strictness } from "../src/security/classifier"
+import { isFloorRule } from "../src/security/bypass"
 import { requestForPolicy } from "../src/security/reviewer"
 import { analyzeSlowCommand } from "../src/security/slow-command"
 import { BYPASS_CATEGORIES } from "../src/categories"
@@ -88,6 +89,115 @@ for (const command of ["rm -rf /", "dd if=/dev/zero of=/dev/sda", "bash -c 'bash
     expect(d.verdict).toBe("DENY")
   })
 }
+
+describe("non-shell script text is not a proven shell floor", () => {
+  test("JS/TS/Python classifier probes keep literal destructive strings reviewable", async () => {
+    const javascript = 'console.log(classifyShellCommand("rm -rf /*"));\nconsole.log(classifyShellCommand("find / -delete"));\n'
+    const python = 'from classifier_probe import classifyShellCommand\nprint(classifyShellCommand("rm -rf /*"))\nprint(classifyShellCommand("find / -delete"))\n'
+    for (const [interpreter, extension, body] of [
+      ["bun", "ts", javascript], ["node", "js", javascript],
+      ["node", "mjs", javascript], ["python3", "py", python],
+    ]) {
+      const script = path.join(tempArea, `classifier-probe.${extension}`)
+      await writeFile(script, body)
+      const input = { script: `${interpreter} '${script}'`, cwd: tempArea, worktree: tempArea, shell: "/bin/bash", strictness: "LOOSE" as const }
+      for (const decision of [await classifyShellCommand(input), await classifyBoundaryCommand(input)]) {
+        expect(decision.verdict).toBe("ASK")
+        expect(decision.rules).toContain("execution.local-script-signal")
+        expect(decision.rules.some(isFloorRule)).toBe(false)
+      }
+      const outside = await classifyShellCommand({ ...input, cwd: root, worktree: root })
+      expect(outside.verdict).toBe("ASK")
+      expect(outside.rules.some(isFloorRule)).toBe(false)
+    }
+  })
+
+  test("generated language source is reviewed while actual shell deletion retains floors", async () => {
+    const pending = path.join(tempArea, "pending-classifier-probe.js")
+    const script = `cat > '${pending}' <<'EOF'\nconsole.log(classifyShellCommand("rm -rf /*"));\nEOF\nnode '${pending}'`
+    const decision = await classifyShellCommand({ script, cwd: tempArea, worktree: tempArea, shell: "/bin/bash", strictness: "LOOSE" })
+    expect(decision.verdict).toBe("ASK")
+    expect(decision.rules).toContain("execution.local-script-signal")
+    expect(decision.rules.some(isFloorRule)).toBe(false)
+    for (const command of ["rm -rf /*", "find / -delete", "bash -c 'rm -rf /*'"]) {
+      const actual = await classify(command, "LOOSE", { bypassedCategories: new Set(BYPASS_CATEGORIES) })
+      expect(actual.verdict).toBe("DENY")
+      expect(actual.rules.some(isFloorRule)).toBe(true)
+    }
+    const shellFile = path.join(tempArea, "actual-shell-source.sh")
+    await writeFile(shellFile, "rm -rf /*\n")
+    const actualFile = await classifyShellCommand({ script: `bash '${shellFile}'`, cwd: tempArea, worktree: tempArea, shell: "/bin/bash", strictness: "LOOSE" })
+    expect(actualFile.rules.some(isFloorRule)).toBe(true)
+  })
+})
+
+describe("deletion floors distinguish roots from scoped descendants", () => {
+  test("bound and literal descendant globs never become synthetic root operands", async () => {
+    for (const script of [
+      'DIR=/home/u/project/build; rm -rf "$DIR"/*',
+      'DIR=/home/u/project/build; rm -rf "$DIR/"',
+      "rm -rf /home/u/project/build/*",
+      "rm -rf /opt/app/build/*",
+      "rm -rf ~/project/build/*",
+      "find /home/u/project/build -delete",
+      "find /mnt/c/Users/me/AppData/Local/Temp/x -delete",
+      "find /opt/app/build -delete",
+    ]) {
+      const decision = await classify(script, "LOOSE")
+      expect(decision.rules.some((rule) => ["filesystem.root-delete", "filesystem.root-glob-delete", "filesystem.find-delete-root"].includes(rule))).toBe(false)
+      expect(decision.verdict).not.toBe("ALLOW")
+    }
+  })
+
+  test("actual roots, direct root globs and normalized root traversals remain floors", async () => {
+    for (const script of [
+      "rm -rf /etc/*",
+      "rm -rf /home/*",
+      "rm -rf /e*",
+      "rm -rf ~/*",
+      "find /home -delete",
+      'find -L "/etc" -delete',
+      "find /home/u/project /var -delete",
+      "find /opt/app/.. -delete",
+    ]) {
+      const decision = await classify(script, "LOOSE", { bypassedCategories: new Set(BYPASS_CATEGORIES) })
+      expect(decision.verdict).toBe("DENY")
+      expect(decision.rules.some((rule) => ["filesystem.root-delete", "filesystem.root-glob-delete", "filesystem.find-delete-root"].includes(rule))).toBe(true)
+    }
+  })
+
+  test("PowerShell path parameters and pipeline deletes retain review without false root floors", async () => {
+    for (const payload of [
+      'Remove-Item -Recurse -Force "$DIR\\*"',
+      'Remove-Item -Recurse -Force "C:\\Users\\me\\project\\build\\*"',
+      'Remove-Item -Path "C:\\Users\\me\\project\\build\\*" -Recurse -Force',
+      'Remove-Item -LiteralPath "C:\\*" -Recurse -Force',
+      'Remove-Item -Path "C:\\Users\\me\\project\\build\\*" -Recurse -Force -ErrorAction /',
+      'Remove-Item -Path "C:\\Users\\me\\project\\build\\*" -Recurse:$false -Force',
+      'Get-ChildItem "C:\\Users\\me\\project\\build" | Remove-Item -Recurse -Force',
+    ]) {
+      for (const [script, shell] of [[payload, "pwsh"], [`powershell.exe -NoProfile -Command '${payload}'`, "/bin/bash"]]) {
+        const decision = await classify(script, "LOOSE", { shell })
+        expect(decision.rules.some((rule) => ["filesystem.root-delete", "filesystem.root-glob-delete"].includes(rule))).toBe(false)
+        expect(decision.verdict).not.toBe("ALLOW")
+      }
+    }
+  })
+
+  test("PowerShell explicit drive-root deletion remains a floor through native and wrapped calls", async () => {
+    for (const payload of [
+      'Remove-Item -Path "C:\\" -Recurse -Force',
+      'Remove-Item -Path "C:\\*" -Recurse -Force',
+      'ri -Path "C:\\*" -Recurse:$true -Force:$true',
+    ]) {
+      for (const [script, shell] of [[payload, "pwsh"], [`pwsh.exe -NoProfile -Command '${payload}'`, "/bin/bash"]]) {
+        const decision = await classify(script, "LOOSE", { shell, bypassedCategories: new Set(BYPASS_CATEGORIES) })
+        expect(decision.verdict).toBe("DENY")
+        expect(decision.rules.some((rule) => ["filesystem.root-delete", "filesystem.root-glob-delete"].includes(rule))).toBe(true)
+      }
+    }
+  })
+})
 
 // --- bypassable DENY wording ------------------------------------------------
 // Every deny reason that a bypass category can switch off must describe a

@@ -5,6 +5,7 @@ import path from "node:path"
 import type { ApprovalCacheTarget, ApprovalCacheWriteEffect } from "./security/approval-cache"
 import { scan } from "./security/shell-scan"
 import { inspectionErrorCode, isMissingPathError } from "./security/inspection"
+import { registerRuntimeBrokerDirectory } from "./security/write-root-policy"
 import { failureOrPass } from "./failure-policy"
 
 export type RuntimeBoundaryEvent = {
@@ -22,14 +23,13 @@ export type RuntimeBoundaryEvent = {
 export type RuntimeBoundaryResponse = {
   action: "allow" | "continue" | "deny"
   reason?: string
-  /** Rendered, bounded agent notice for the observer's background output. */
-  message?: string
 }
 
 export interface RuntimeBoundaryBroker {
   socketPath: string
   token: string
   signal: AbortSignal
+  readonly terminalExit: number | undefined
   finished: Promise<{ exit?: number; error?: string }>
   close(): Promise<void>
 }
@@ -124,10 +124,9 @@ export async function staticCrossingReview(input: {
   if (input.readonly === true) {
     return (await input.commandVerdict()) === "ALLOW" ? "ALLOW" : "ASK"
   }
-  if (knownSafeRuntimeBoundary(event, input.command, input.trustedGitReader)) return "ALLOW"
-  if (event.kind !== "network") return "ASK"
-  if (input.workspaceNetwork === "on") return "ALLOW"
-  return input.commandVerdict()
+   if (event.kind !== "network") return "ASK"
+   // Network access and a trusted image do not authorize the command's effects.
+   return input.commandVerdict()
 }
 
 const O_APPEND = 0o2000
@@ -208,10 +207,12 @@ export async function createRuntimeBoundaryBroker(options: {
   onCancelFailure?(): void
 }): Promise<RuntimeBoundaryBroker> {
   const directory = await mkdtemp(path.join(options.directory, "security-boundary-"))
+  const unregisterDirectory = registerRuntimeBrokerDirectory(directory)
   try {
     await chmod(directory, 0o700)
   } catch (error) {
     await rmdir(directory).catch(() => {})
+    unregisterDirectory()
     throw error
   }
   const socketPath = path.join(directory, "observer.sock")
@@ -295,7 +296,7 @@ export async function createRuntimeBoundaryBroker(options: {
           const pass = failureOrPass(options.failPolicy ?? "fail_close", "broker_protocol", () => { options.onFailure?.("broker_protocol") })
           action = pass ? "allow" : "deny"
         }
-        socket.write(JSON.stringify({ version: 1, eventID: event.eventID, action, reason: response.reason, message: response.message }) + "\n")
+        socket.write(JSON.stringify({ version: 1, eventID: event.eventID, action, reason: response.reason }) + "\n")
       }).catch(() => {
         const pass = failureOrPass(options.failPolicy ?? "fail_close", "broker_callback", () => { options.onFailure?.("broker_callback") })
         if (!closed && !socket.destroyed) socket.write(JSON.stringify({
@@ -308,6 +309,7 @@ export async function createRuntimeBoundaryBroker(options: {
   const cleanup = async () => {
     await unlink(socketPath).catch(() => {})
     await rmdir(directory).catch(() => {})
+    unregisterDirectory()
   }
   try {
     await new Promise<void>((resolve, reject) => {
@@ -323,6 +325,7 @@ export async function createRuntimeBoundaryBroker(options: {
   server.on("error", () => { fail("the runtime observer listener failed"); for (const socket of sockets) socket.destroy() })
   return {
     socketPath, token, signal: controller.signal, finished,
+    get terminalExit() { return terminalExit },
     async close() {
       if (closed) return
       closed = true

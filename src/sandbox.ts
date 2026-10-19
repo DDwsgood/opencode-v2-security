@@ -1299,7 +1299,7 @@ export function applySandboxCreateBefore(
       for (const key of hooks) ev.env[key] = ""
     }
     onRefusal(message)
-    ev.command = sandboxDenyCommand(message)
+    ev.command = sandboxDenyCommand()
   }
   if (marked.invalid) {
     if (pass("sandbox_marker")) {
@@ -1560,9 +1560,8 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
-/** create.before cannot reject (failure channel `never`), so the fail_close
- * deny is expressed as a command that prints the §4.3 message and exits 126
- * (POSIX "cannot execute") in the real shell. */
-export function sandboxDenyCommand(message: string): string {
-  return `printf '%s\\n' ${shellQuote(message)} >&2; exit 126`
+/** create.before cannot reject (failure channel `never`). Stop silently;
+ *  onRefusal carries the notice to the enclosing tool's Tool.Error. */
+export function sandboxDenyCommand(): string {
+  return "exit 126"
 }

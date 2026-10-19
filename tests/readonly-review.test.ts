@@ -5,7 +5,7 @@ import path from "node:path"
 import * as os from "node:os"
 import { Effect, Scope, Stream } from "effect"
 import plugin from "../src/index"
-import frozen from "../src/security/v10-8-pipeexec.json"
+import frozen from "../src/security/v11-gold-prompt.json"
 import { resetSharedSecurityStateForTests } from "../src/security/shared-state"
 import {
   adjudicateEffectAnswers,
@@ -49,25 +49,26 @@ function answers(conformance?: "read_only" | "writes" | "unclear", overrides: Re
 }
 
 describe("frozen write-mode body and read-only variant", () => {
-  test("write-mode serialized body is byte-identical to the frozen contract", () => {
+  test("write mode has ten questions and compact trusted-answer authorization", () => {
     const facts = '{"bypass":{"categories":[],"custom":null},"command":"printf hello","cwd":"/workspace","environment":"Linux","files":[],"input_facts":[],"sandbox":{"domain":null,"error":null,"resolved_writes":[],"trigger":"none"},"session_context":[],"user_request":"Inspect"}'
-    const expected = JSON.stringify({
-      model: frozen.model,
-      state: `${frozen.header}\n\n<review_input>\n${facts}\n</review_input>\n`,
-      questions: frozen.questions,
-    })
-    expect(Buffer.from(JSON.stringify(buildEffectReviewBody(request)))).toEqual(Buffer.from(expected))
-    expect(JSON.stringify(buildEffectReviewBody(request, false))).toBe(expected)
+    const body = buildEffectReviewBody(request)
+    expect(body.questions).toEqual(frozen.questions)
+    expect(Object.keys(body.questions)).toHaveLength(10)
+    expect(body.state).toContain("User response via trusted question tool")
+    expect(body.state).toEndWith(`<review_input>\n${facts}\n</review_input>\n`)
+    expect(buildEffectReviewBody(request, false)).toEqual(body)
   })
 
   test("RO keeps all frozen questions and appends the paragraph and one choice", () => {
     const body = buildEffectReviewBody(request, true)
     const { readonly_conformance, ...originalQuestions } = body.questions
     expect(originalQuestions).toEqual(frozen.questions)
-    expect(Object.keys(body.questions)).toHaveLength(19)
-    expect(body.state.startsWith(`${frozen.header}\n\nREAD-ONLY SESSION.`)).toBe(true)
+    expect(Object.keys(body.questions)).toHaveLength(11)
+    expect(body.state.startsWith(`${frozen.header}\n\n`)).toBe(true)
+    expect(body.state).toContain("READ-ONLY SESSION [Read only]")
     expect(body.state).toContain("[Read only]")
-    expect(body.state).toContain("denyWrite, protected paths, or credential paths")
+    expect(body.state).toContain("denyWrite, protected/credential paths or floors")
+    expect(body.state).toContain("No outside-root cache/history exemption")
     expect(body.state.slice(body.state.indexOf("<review_input>"))).toBe(
       buildEffectReviewBody(request).state.slice(buildEffectReviewBody(request).state.indexOf("<review_input>")),
     )
@@ -75,11 +76,11 @@ describe("frozen write-mode body and read-only variant", () => {
     expect(Object.keys((readonly_conformance as any).criteria)).toEqual(["read_only", "writes", "unclear"])
   })
 
-  test("writes and unclear deny as readonly even with authorization or floor=yes", () => {
+  test("the floor wins first, then writes and unclear deny as readonly", () => {
     for (const conformance of ["writes", "unclear"] as const) {
       for (const floor of ["no", "yes", "unclear"]) {
         expect(adjudicateEffectAnswers(answers(conformance, { floor: { choice: floor } }), true)).toMatchObject({
-          decision: "deny", source: "readonly", policyVersion: EFFECTS_POLICY_VERSION_READONLY,
+          decision: "deny", source: floor === "yes" ? "floor" : "readonly", policyVersion: EFFECTS_POLICY_VERSION_READONLY,
         })
       }
     }
@@ -229,9 +230,19 @@ async function harness(options: HostOptions = {}) {
               version: 1, type: "boundary", token, eventID: 1, pid: process.pid,
               syscall: input.event.syscall ?? "fixture", operation: "open", targets,
               kind: input.event.kind,
-              details: { atExit: false, requiresFullApproval: input.event.full === true },
-            }) + "\n")
-            return await reply
+               details: { atExit: false, requiresFullApproval: input.event.full === true },
+             }) + "\n")
+            const response = await reply
+            const disconnected = new Promise<void>((resolve) => { socket.once("close", resolve) })
+            if (response.action === "deny") {
+              // A refusal must survive an observer disconnect without an exit frame.
+              socket.destroy()
+            } else {
+              // Successful synthetic runs follow the real observer's terminal protocol.
+              socket.end(JSON.stringify({ version: 1, type: "exit", token, exit: 0 }) + "\n")
+            }
+            await disconnected
+            return response
           } finally {
             socket.destroy()
           }
@@ -386,8 +397,9 @@ describe("RO launch gate", () => {
     const paths = ["/tmp/opencode"]
     const mkdir = await host.run("true", { kind: "write", syscall: "mkdirat", paths })
     expect(mkdir.output.response.action).toBe("continue")
-    const removal = await host.run("true", { kind: "write", syscall: "rmdir", paths })
-    expect(removal.output.response.action).toBe("deny")
+    await expect(host.run("true", { kind: "write", syscall: "rmdir", paths })).rejects.toMatchObject({
+      _tag: "Tool.Error", message: expect.stringContaining("Write protection:"),
+    })
     expect(host.calls).toHaveLength(0)
   })
 
@@ -409,8 +421,25 @@ describe("RO observer routing through the plugin", () => {
       expect(result.output.spawn.command).toContain(`'--root' '${allowed}'`)
       expect(result.output.response.action).toBe("continue")
       expect(host.calls).toHaveLength(0)
-      const sensitive = await host.run("python3 -c 'import json'", { kind: "write", paths: [`${allowed}/private.key`] })
-      expect(sensitive.output.response.action).toBe(mode === "ro" ? "deny" : "allow")
+      const sensitive = host.run("python3 -c 'import json'", { kind: "write", paths: [`${allowed}/private.key`] })
+      if (mode === "ro") {
+        await expect(sensitive).rejects.toMatchObject({
+          _tag: "Tool.Error", message: expect.stringContaining("Read-only limit:"),
+        })
+      } else {
+        expect((await sensitive).output.response.action).toBe("allow")
+        const request = host.calls[0]
+        const observed = JSON.parse(request.input_facts.find((fact) => fact.startsWith("Observed boundary facts"))!.split(": ").slice(1).join(": "))
+        expect(observed.targets[0]).toMatchObject({ path: `${allowed}/private.key`, exists: false })
+        for (const field of ["dev", "ino", "parentDev", "parentIno", "mtimeNs", "ctimeNs"]) {
+          expect(observed.targets[0]).not.toHaveProperty(field)
+        }
+        expect(observed.details).not.toHaveProperty("argvDigest")
+        expect(request.input_facts.join("\n")).not.toContain("Executing image identity")
+        expect(request.input_facts.join("\n")).not.toContain("Current boundary object metadata")
+        expect(request.files).toEqual([])
+        expect(request.session_context).not.toContain("user: Inspect the synthetic fixtures.")
+      }
       expect(host.calls).toHaveLength(mode === "ro" ? 0 : 1)
     }
   })
@@ -462,16 +491,18 @@ describe("RO observer routing through the plugin", () => {
     await started
     expect(calls).toBe(1)
     await host.mode("ro")
-    const refused = await host.run("python3 -c 'import json'", { kind: "write", paths: [`${allowed}/readonly.log`] })
-    expect(refused.output.response.action).toBe("deny")
+    await expect(host.run("python3 -c 'import json'", { kind: "write", paths: [`${allowed}/readonly.log`] })).rejects.toMatchObject({
+      _tag: "Tool.Error", message: expect.stringContaining("Read-only limit:"),
+    })
     expect(calls).toBe(1)
   })
 
   test("non-exempt writes and privilege events refuse without review", async () => {
     for (const kind of ["write", "privilege"] as const) {
       const host = await harness()
-      const result = await host.run("python3 -c 'import json'", { kind, full: kind === "privilege" })
-      expect(result.output.response.action).toBe("deny")
+      await expect(host.run("python3 -c 'import json'", { kind, full: kind === "privilege" })).rejects.toMatchObject({
+        _tag: "Tool.Error", message: expect.stringContaining("Read-only limit:"),
+      })
       expect(host.calls).toHaveLength(0)
     }
   })
@@ -499,8 +530,10 @@ describe("RO observer routing through the plugin", () => {
   test("writes, unclear and missing conformance answers fail closed in the host", async () => {
     for (const conformance of ["writes", "unclear", "missing"] as const) {
       const host = await harness({ conformance, failPolicy: "fail_close" })
-      const result = await host.run("python3 -c 'import json'", { kind: "network" })
-      expect(result.output.response.action).toBe("deny")
+      await expect(host.run("python3 -c 'import json'", { kind: "network" })).rejects.toMatchObject({
+        _tag: "Tool.Error",
+        message: expect.stringContaining(conformance === "missing" ? "Check unavailable (review_protocol)" : "Command review — read-only"),
+      })
       expect(host.calls).toHaveLength(1)
     }
   })
@@ -525,8 +558,9 @@ describe("RO observer routing through the plugin", () => {
 
   test("disabled review layers do not waive RO conformance before detaching", async () => {
     const host = await harness({ securityEnabled: false, conformance: "writes" })
-    const result = await host.run("python3 -c 'import json'", { kind: "opaque", full: true })
-    expect(result.output.response.action).toBe("deny")
+    await expect(host.run("python3 -c 'import json'", { kind: "opaque", full: true })).rejects.toMatchObject({
+      _tag: "Tool.Error", message: expect.stringContaining("Command review — read-only limit:"),
+    })
     expect(host.calls).toHaveLength(1)
   })
 
@@ -561,15 +595,18 @@ describe("RO observer routing through the plugin", () => {
         path.join(home, ".cache/private.key"),
       ]) {
         const before = host.calls.length
-        const result = await host.run("python3 -c 'import json'", { kind: "write", paths: [target] })
+        const result = host.run("python3 -c 'import json'", { kind: "write", paths: [target] })
         // Configured/protected roots and the isolated HOME's actual credential
         // stores are hard refusals; sensitive cache leaves still need review.
         const configuredOrProtected = target.startsWith(`${deniedRoot}/`) || target.startsWith(`${home}/.aws/`) ||
           target === path.resolve(import.meta.dir, "../.pytest_cache/state")
         if (mode === "ro" || configuredOrProtected) {
-          expect(result.output.response.action).toBe("deny")
+          await expect(result).rejects.toMatchObject({
+            _tag: "Tool.Error", message: expect.stringContaining(mode === "ro" ? "Read-only limit:" : "Write protection:"),
+          })
           expect(host.calls.length).toBe(before)
         } else {
+          expect((await result).output.response.action).toBe("allow")
           expect(host.calls.length).toBe(before + 1)
         }
       }

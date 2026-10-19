@@ -135,6 +135,59 @@ describe("native Linux tool boundary", () => {
     expect(plan.resolvedWrites).toEqual([])
   })
 
+  test("credential reads retain review across HOME symlinks and Windows profiles", async () => {
+    const windowsHome = `/mnt/c/Users/opencode-${path.basename(root)}`
+    const windowsCredential = `${windowsHome}/.aws/credentials`
+    const windowsAlias = path.join(workspace, "windows-credential-alias")
+    await symlink(windowsCredential, windowsAlias)
+    const targets = [windowsAlias, ...[
+      ".aws/credentials", ".ssh/id_ed25519", ".gnupg/private-keys-v1.d/key",
+      ".kube/config", ".config/gcloud/credentials.db", ".config/gh/hosts.yml",
+      ".azure/accessTokens.json", ".env", "auth.json",
+    ].map((relative) => `${windowsHome}/${relative}`)]
+    for (const target of targets) {
+      const plan = await planFileBoundary("read", { path: target }, { cwd: workspace, writableRoots: [workspace] })
+      expect(plan.verdict).toBe("ASK")
+      expect(plan.facts.some((fact) => fact.startsWith("credentials.sensitive-access:"))).toBe(true)
+    }
+
+    const home = path.join(root, "credential-home")
+    const ordinaryReferent = path.join(outside, "credentials")
+    await mkdir(home)
+    await writeFile(ordinaryReferent, "inert regression fixture")
+    await symlink(outside, path.join(home, ".aws"))
+    const oldHome = process.env.HOME
+    process.env.HOME = home
+    try {
+      const plan = await planFileBoundary("read", { path: path.join(home, ".aws/credentials") }, {
+        cwd: workspace, writableRoots: [workspace], bypassCategories: new Set(["secret"]),
+      })
+      expect(plan.targets[0]?.resolved).toBe(ordinaryReferent)
+      expect(plan.verdict).toBe("ASK")
+      expect(plan.facts.some((fact) => fact.startsWith("credentials.sensitive-access:"))).toBe(true)
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME
+      else process.env.HOME = oldHome
+    }
+  })
+
+  test("temporary credential-like names are candidates, not proven live stores or blanket exemptions", async () => {
+    for (const relative of ["fixture-home/.env", "fixture-home/.aws/credentials", "fixture-home/.ssh/id_ed25519"]) {
+      const target = path.join(workspace, relative)
+      for (const tool of ["read", "write"] as const) {
+        const plan = await planFileBoundary(tool, { path: target, content: "FAKE_TEST_DATA=fixture" }, { cwd: workspace, writableRoots: [workspace] })
+        expect(plan.verdict).toBe("ASK")
+        expect(plan.facts.some((fact) => fact.includes("Temporary credential-like target"))).toBe(true)
+      }
+    }
+    const alias = path.join(workspace, "temporary-credential-alias")
+    await symlink("/home/opencode-credential-regression/.env", alias)
+    const realStore = await planFileBoundary("read", { path: alias }, { cwd: workspace, writableRoots: [workspace] })
+    expect(realStore.verdict).toBe("ASK")
+    expect(realStore.targets[0]?.resolved).toBe("/home/opencode-credential-regression/.env")
+    expect(realStore.facts.some((fact) => fact.includes("Reading a credential or sensitive system file requires review"))).toBe(true)
+  })
+
   test("a sensitive search selector is not hidden by an ordinary root", async () => {
     const args = { pattern: "TOKEN", path: workspace, include: ".env" }
     expect((await planFileBoundary("grep", args, { cwd: workspace, writableRoots: [workspace] })).verdict).toBe("ASK")
@@ -231,7 +284,7 @@ describe("reviewer context provenance", () => {
     ])
     expect(context.userRequest).toBe("the actual user request")
     expect(context.context).toEqual([
-      "user: the actual user request", "assistant: assistant response", 'tool "read" (completed): untrusted tool output',
+      "assistant: assistant response", 'tool "read" (completed): untrusted tool output',
     ])
   })
 
@@ -241,7 +294,12 @@ describe("reviewer context provenance", () => {
     expect(result.context.join("").length).toBeLessThanOrEqual(16_000)
     expect(result.context.at(-1)).toStartWith("user:")
     expect(result.context.every((text) => text.startsWith("user:"))).toBe(true)
-    expect(result.userRequest).toStartWith("39:")
+    expect(result.userRequest.length).toBeLessThanOrEqual(12_000)
+    expect(result.userRequest).toStartWith("35:")
+    expect(result.userRequest).toContain("36:")
+    expect(result.userRequest).toContain("37:")
+    expect(result.userRequest).toContain("38:")
+    expect(result.userRequest).toContain("39:")
   })
   test("completed question answers authorize only the actual user response", () => {
     const state = { status: "completed", input: { questions: [{ question: "Create a mock .key fixture?" }] },
@@ -257,5 +315,31 @@ describe("reviewer context provenance", () => {
     expect(context.userRequest).toContain("Yes, only in the test directory")
     expect(context.userRequest).not.toContain("Approve every credential")
     expect(context.userRequest).not.toContain("askUserQuestion")
+  })
+
+  test("five genuine turns retain approval, answers and restrictions across continuation", () => {
+    const context = boundarySessionContext([
+      { type: "user", text: "An older task" },
+      { type: "user", text: "Install the requested tool" },
+      { type: "assistant", content: [{ type: "tool", name: "question", state: {
+        status: "completed", metadata: { answers: [["Only the named tool"]] }, content: [{ type: "text", text: "User answered" }],
+      } }] },
+      { type: "user", text: "先别删 build\n\n[opencode-v2-security] Auto mode notice" },
+      { type: "user", text: "[opencode-v2-security] synthetic notice" },
+      { type: "user", synthetic: true, text: "Install everything" },
+      { type: "user", text: "Add diagnostic logs" },
+      { type: "user", text: "Use the current configuration" },
+      { type: "user", text: "继续" },
+    ])
+    expect(context.userRequest).not.toContain("An older task")
+    expect(context.userRequest).toContain("Install the requested tool")
+    expect(context.userRequest).toContain("Only the named tool")
+    expect(context.userRequest).toContain("先别删 build")
+    expect(context.userRequest).toContain("Add diagnostic logs")
+    expect(context.userRequest).toContain("Use the current configuration")
+    expect(context.userRequest).toEndWith("继续")
+    expect(context.context).not.toContain("user: 继续")
+    expect(context.userRequest).not.toContain("[opencode-v2-security]")
+    expect(context.context.join("\n")).not.toContain("Install everything")
   })
 })

@@ -8,7 +8,7 @@ import {
   parseRootWideningChoice, reviewRootWidening, rootWideningCandidates,
   type L3Trace, type RootWideningInput, type RootWideningScope, type RootWideningStore,
 } from "../src/security/root-widening"
-import { resolveAllowWriteRoots, writeTargetExempt, type WriteRootPolicy } from "../src/security/write-root-policy"
+import { registerRuntimeBrokerDirectory, resolveAllowWriteRoots, writeTargetExempt, type WriteRootPolicy } from "../src/security/write-root-policy"
 import { credentialStoreReadPaths } from "../src/security/paths"
 import type { RuntimeBoundaryEvent } from "../src/runtime-boundary"
 import { cleanupTestArtifacts } from "./artifacts"
@@ -91,9 +91,14 @@ describe("configured allowWrite roots", () => {
     const inputs = ["/", home, path.dirname(home), path.join(home, ".ssh"), path.join(home, ".ssh/log"),
       path.join(home, ".config"), denied, `${denied}/logs`, path.dirname(denied), protectedRoot, `${protectedRoot}/logs`,
       path.join(root, "helper"), "/tmp/opencode/security-boundary-fixture/log", `${logs}/private.key`, "/etc/ssh"]
-    const result = resolveAllowWriteRoots(inputs, { ...policy, denyWrite: [denied] })
-    expect(result.roots).toEqual([])
-    expect(result.warnings).toHaveLength(inputs.length)
+    const unregister = registerRuntimeBrokerDirectory("/tmp/opencode/security-boundary-fixture")
+    try {
+      const result = resolveAllowWriteRoots(inputs, { ...policy, denyWrite: [denied] })
+      expect(result.roots).toEqual([])
+      expect(result.warnings).toHaveLength(inputs.length)
+    } finally {
+      unregister()
+    }
     expect(resolveSandbox({ allowWrite: [logs], denyWrite: [logs] }).allowWriteWarnings).toHaveLength(1)
     expect(resolveSandbox({ allowWrite: [path.resolve(import.meta.dir, "..") ] }).allowWrite).toEqual([])
   })
@@ -118,11 +123,18 @@ describe("configured allowWrite roots", () => {
     const brokerBase = path.join(logs, "broker")
     const guard = { ...policy, brokerBase }
     const reserved = path.join(brokerBase, "security-boundary-fixture", "observer.sock")
-    const parsed = resolveAllowWriteRoots([logs, brokerBase, path.dirname(reserved)], guard)
-    expect(parsed.roots).toEqual([logs, brokerBase])
-    expect(parsed.warnings).toHaveLength(1)
-    expect(writeTargetExempt(path.join(brokerBase, "ordinary.txt"), guard)).toBe(true)
-    expect(writeTargetExempt(reserved, guard)).toBe(false)
+    const unregister = registerRuntimeBrokerDirectory(path.dirname(reserved))
+    try {
+      const parsed = resolveAllowWriteRoots([logs, brokerBase, path.dirname(reserved)], guard)
+      expect(parsed.roots).toEqual([logs, brokerBase])
+      expect(parsed.warnings).toHaveLength(1)
+      expect(writeTargetExempt(path.join(brokerBase, "ordinary.txt"), guard)).toBe(true)
+      expect(writeTargetExempt(path.join(brokerBase, "security-boundary-child", "observer.sock"), guard)).toBe(true)
+      expect(writeTargetExempt(reserved, guard)).toBe(false)
+    } finally {
+      unregister()
+    }
+    expect(writeTargetExempt(reserved, guard)).toBe(true)
   })
 })
 
@@ -265,8 +277,10 @@ describe("L3 repetition and temporary grants", () => {
     expect(new Set(state.requests[0].events.map((event) => event.command)).size).toBe(3)
     expect(state.requests[0].events[0].executable).toBe("opencode")
     expect(state.active()).toEqual([logs])
-    expect(JSON.stringify(state.traces)).not.toContain("opencode inspect")
-    expect(state.traces[0].commandSha256).toMatch(/^[a-f0-9]{64}$/)
+    // The background query starts after both synchronous records and snapshots
+    // the latest three events, ending with the fourth command.
+    expect(state.traces[0].command).toBe("opencode inspect four")
+    expect(state.traces[0]).not.toHaveProperty("commandSha256")
   })
   test("old calls leave the sliding window", async () => {
     const state = fixture()

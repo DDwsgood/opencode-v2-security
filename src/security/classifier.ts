@@ -221,18 +221,59 @@ const FORCED_RECURSIVE_COMMANDS = ["remove-item", "ri", "rm", "del", "erase", "r
 const CMD_STYLE_DELETE_COMMANDS = ["rmdir", "rd", "del", "erase"]
 const CMD_DELETE_FLAGS = /^\/[sfq]+$/i
 
+/** A quoted prefix and its unquoted suffix are one operand (`"$DIR"/*),
+ * not a variable operand followed by a synthetic filesystem-root glob. */
+function deletionInvocationTokens(invocation: string): string[] {
+  return invocation.match(/(?:"(?:[^"]|"")*"|'[^']*'|[^\s"'])+/g) ?? []
+}
+
 function forcedRecursiveShape(tokens: string[]) {
   const command = commandLeaf(stripMatchingQuotes(tokens[0] ?? ""))
-  const flags = tokens
-    .slice(1)
-    .filter((token) => token.startsWith("-"))
-    .map((token) => token.toLowerCase())
-  const cmdFlags = CMD_STYLE_DELETE_COMMANDS.includes(command ?? "")
-    ? tokens
-        .slice(1)
-        .filter((token) => CMD_DELETE_FLAGS.test(token))
-        .map((token) => token.toLowerCase())
-    : []
+  const flags: string[] = []
+  const cmdFlags: string[] = []
+  const operands: string[] = []
+  const wildcardOperands: string[] = []
+  const valueParameters = new Set([
+    "-erroraction", "-warningaction", "-informationaction", "-progressaction",
+    "-errorvariable", "-warningvariable", "-informationvariable", "-outvariable",
+    "-outbuffer", "-pipelinevariable", "-filter", "-include", "-exclude", "-credential",
+  ])
+  let optionsEnded = false
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = tokens[index]
+    const lower = token.toLowerCase()
+    if (!optionsEnded && token === "--") {
+      optionsEnded = true
+      continue
+    }
+    if (!optionsEnded && (lower === "-path" || lower === "-literalpath")) {
+      const target = tokens[++index]
+      if (target !== undefined) {
+        operands.push(target)
+        if (lower === "-path") wildcardOperands.push(target)
+      }
+      continue
+    }
+    if (!optionsEnded && valueParameters.has(lower)) {
+      index += 1
+      continue
+    }
+    if (!optionsEnded && token.startsWith("-")) {
+      flags.push(lower.replace(/:\$true$/, ""))
+      continue
+    }
+    if (!optionsEnded && CMD_STYLE_DELETE_COMMANDS.includes(command ?? "") && CMD_DELETE_FLAGS.test(token)) {
+      cmdFlags.push(lower)
+      continue
+    }
+    if (/^(?:\d*|&)>{1,2}$/.test(token)) {
+      index += 1
+      continue
+    }
+    if (isRedirectToken(token)) continue
+    operands.push(token)
+    wildcardOperands.push(token)
+  }
   const hasPowerShellPair =
     FORCED_RECURSIVE_COMMANDS.includes(command ?? "") &&
     flags.some((flag) => /^-r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?$/.test(flag)) &&
@@ -252,19 +293,7 @@ function forcedRecursiveShape(tokens: string[]) {
     ((command === "del" || command === "erase") && cmdHasS && cmdHasQ && cmdHasF)
   const forced = hasPowerShellPair || hasLongPair || hasShortPair || hasCmdPair
 
-  const targets: string[] = []
-  if (forced) {
-    for (let index = 1; index < tokens.length; index += 1) {
-      const token = tokens[index]
-      if (token === "--") continue
-      if (token.startsWith("-")) continue
-      if (CMD_STYLE_DELETE_COMMANDS.includes(command ?? "") && CMD_DELETE_FLAGS.test(token)) continue
-      if (isRedirectToken(token)) continue
-      if (/^(?:\d*|&)>{1,2}$/.test(token)) { index += 1; continue }
-      targets.push(token)
-    }
-  }
-  return { forced, targets }
+  return { forced, targets: forced ? operands : [], wildcardTargets: forced ? wildcardOperands : [] }
 }
 
 function hasForcedRecursiveDelete(text: string) {
@@ -272,7 +301,7 @@ function hasForcedRecursiveDelete(text: string) {
     text.match(/\b(?:remove-item|ri|rm|del|erase|rmdir|rd)\b(?:(?!"|'|`)[^\r\n;&|]|"(?:[^"]|"")*"|'[^']*'|`.)*/gi) ?? []
 
   return invocations.some((invocation) => {
-    const tokens = invocation.match(/"(?:[^"]|"")*"|'[^']*'|\S+/g) ?? []
+    const tokens = deletionInvocationTokens(invocation)
     if (tokens.length < 2) return false
     const shape = forcedRecursiveShape(tokens)
     return shape.forced && shape.targets.length > 0
@@ -284,7 +313,7 @@ function hasForcedRecursiveDeleteLiteralTarget(text: string): boolean {
     text.match(/\b(?:remove-item|ri|rm|del|erase|rmdir|rd)\b(?:(?!"|'|`)[^\r\n;&|]|"(?:[^"]|"")*"|'[^']*'|`.)*/gi) ?? []
 
   return invocations.some((invocation) => {
-    const tokens = invocation.match(/"(?:[^"]|"")*"|'[^']*'|\S+/g) ?? []
+    const tokens = deletionInvocationTokens(invocation)
     if (tokens.length < 2) return false
     const shape = forcedRecursiveShape(tokens)
     if (!shape.forced || shape.targets.length === 0) return false
@@ -434,7 +463,7 @@ function normalizeDots(operand: string): string {
 function normalizedRootDeleteText(text: string): string {
   const invocations = text.match(/\brm\b(?:(?!"|'|`)[^\r\n;&|]|"(?:[^"]|"")*"|'[^']*'|`.)*/gi) ?? []
   const allOperands = invocations.flatMap((invocation) => {
-    const tokens = invocation.match(/"(?:[^"]|"")*"|'[^']*'|\S+/g) ?? []
+    const tokens = deletionInvocationTokens(invocation)
     return tokens
       .slice(1)
       .filter((token) => !token.startsWith("-"))
@@ -446,20 +475,26 @@ function normalizedRootDeleteText(text: string): string {
 }
 
 function isDangerousFindRoot(root: string): boolean {
-  const r = root.replaceAll("\\", "/")
-  if (r === "~" || r.startsWith("~/")) return true
-  if (r === ".." || r.startsWith("../")) return true
-  const lower = r.toLowerCase()
-  if (lower === "/") return true
-  return SYSTEM_CRITICAL_ROOTS.some(
-    (p) => lower === `/${p}` || lower.startsWith(`/${p}/`),
-  )
+  const literal = stripMatchingQuotes(root).replaceAll("\\", "/")
+  if (/^(?:~|\.\.|[a-z]:)\/*$/i.test(literal)) return true
+  if (!literal.startsWith("/")) return false
+  if (/[$`%*?\["']/.test(literal)) return false
+  const normalized = normalizeDots(literal).toLowerCase()
+  return normalized === "/" || SYSTEM_CRITICAL_ROOTS.some((name) => normalized === `/${name}`)
 }
 
 function findDangerousDeleteRoot(text: string): boolean {
-  const match = text.match(/\bfind\s+(\S+)[\s\S]*?(?:\s|^)-(?:delete|exec|execdir|ok|okdir)(?:\s|$)/im)
-  if (!match) return false
-  return isDangerousFindRoot(match[1] ?? "")
+  const invocations = text.match(/\bfind\s+[^\r\n;&|]*/gi) ?? []
+  return invocations.some((invocation) => {
+    const tokens = deletionInvocationTokens(invocation)
+    if (!tokens.some((token) => /^-(?:delete|exec|execdir|ok|okdir)$/i.test(token))) return false
+    for (const token of tokens.slice(1)) {
+      if (/^-[HLP]$/.test(token)) continue
+      if (/^[-(!]/.test(token)) break
+      if (isDangerousFindRoot(token)) return true
+    }
+    return false
+  })
 }
 
 /** Kernel-floor write detection for a /proc target path: `> file` / `of=file`
@@ -644,7 +679,7 @@ function quoteStrippedDeleteSurface(segment: string): string | undefined {
     return undefined
   }
   const rest = firstSpace === -1 ? "" : trimmed.slice(firstSpace)
-  const tokens = simpleInvocationTokens(rest.trim())
+  const tokens = deletionInvocationTokens(rest.trim())
   const stripped = firstWord + (tokens.length > 0 ? " " + tokens.map(commandTokenUnquote).join(" ") : "")
   return stripped.trim() === trimmed ? undefined : stripped
 }
@@ -1853,23 +1888,46 @@ function executorCapabilityHazard(segment: string): ExecutorHazard | undefined {
   return undefined
 }
 
-/** Forced deletion whose target is an absolute or home glob outside temp areas (`rm -rf /etc*`, `rm -rf ~/*`). */
+/** Only broad globs at filesystem/home/system roots are floors. A scoped
+ * descendant such as `/home/u/project/build/*` still requires normal review. */
 function hasRootGlobDelete(text: string): boolean {
   const invocations =
     text.match(/\b(?:rm|remove-item|ri|del|erase|rmdir|rd)\b(?:(?!"|'|`)[^\r\n;&|]|"(?:[^"]|"")*"|'[^']*'|`.)*/gi) ?? []
   return invocations.some((invocation) => {
-    const tokens = invocation.match(/"(?:[^"]|"")*"|'[^']*'|\S+/g) ?? []
+    const tokens = deletionInvocationTokens(invocation)
     if (tokens.length < 2) return false
     const shape = forcedRecursiveShape(tokens)
     if (!shape.forced || shape.targets.length === 0) return false
-    return shape.targets.some((target) => {
+    return shape.wildcardTargets.some((target) => {
       const literal = stripMatchingQuotes(target).replaceAll("\\", "/").toLowerCase()
       if (!/[*?\[]/.test(literal)) return false
-      if (literal.startsWith("/")) {
-        return !(literal === "/tmp*" || literal.startsWith("/tmp/*") || literal === "/var/tmp*" || literal.startsWith("/var/tmp/*"))
+      if (literal.startsWith("~/") || literal.startsWith("$home/")) {
+        const relative = literal.slice(literal.indexOf("/") + 1)
+        return /^[^/]*[*?\[]/.test(relative)
       }
-      if (literal.startsWith("~/") || literal.startsWith("$home/")) return true
+      if (/[$`%"']/.test(literal)) return false
+      if (/^[a-z]:\/[^/]*[*?\[]/.test(literal)) return true
+      if (literal.startsWith("/")) {
+        const normalized = normalizeDots(literal)
+        if (normalized === "/tmp*" || normalized === "/var/tmp*") return false
+        const components = normalized.slice(1).split("/")
+        if (/[*?\[]/.test(components[0] ?? "")) return true
+        return SYSTEM_CRITICAL_ROOTS.includes(components[0]) && /[*?\[]/.test(components[1] ?? "")
+      }
       return false
+    })
+  })
+}
+
+function hasPowerShellRootDelete(text: string): boolean {
+  const invocations = text.match(/\b(?:remove-item|ri)\b(?:(?!"|'|`)[^\r\n;&|]|"(?:[^"]|"")*"|'[^']*'|`.)*/gi) ?? []
+  return invocations.some((invocation) => {
+    const shape = forcedRecursiveShape(deletionInvocationTokens(invocation))
+    return shape.targets.some((target) => {
+      const literal = stripMatchingQuotes(target).replaceAll("\\", "/")
+      if (literal === "." || literal === "./") return true
+      if (literal === "*" && shape.wildcardTargets.includes(target)) return true
+      return literal !== "" && isDangerousFindRoot(literal)
     })
   })
 }
@@ -2294,9 +2352,7 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
       ).test(normalizedRootDeleteText(text)) ||
       /\b(?:rmdir|rd)\s+\/s\s+\/q\s+(?:[a-z]:\\|\\|\/|\.\.?|\*)(?:\s|$)/im.test(text) ||
       /\bdel\s+\/[a-z]*s[a-z]*\s+\/[a-z]*q[a-z]*\s+(?:[a-z]:\\|\\|\/|\*)(?:\s|$)/im.test(text) ||
-      /\bremove-item\b[^\n]*(?:-recurse[^\n]*-force|-force[^\n]*-recurse)[^\n]*(?:[a-z]:\\(?:\*|$)|\/(?:\*|$)|~(?:\/|\s|$)|\.\.?(?:\/|\s|$)|\*)(?:\s|$)/im.test(
-        text,
-      ),
+      hasPowerShellRootDelete(text),
   },
   {
     id: "filesystem.disk-destruction",
@@ -2448,7 +2504,7 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
   },
   {
     id: "filesystem.root-glob-delete",
-    reason: "Forced recursive deletion of an absolute glob path outside temp areas",
+    reason: "Forced recursive deletion of a broad filesystem, home, or system-root glob",
     test: hasRootGlobDelete,
   },
   {
@@ -5063,6 +5119,7 @@ function invokedScriptPath(segment: string): string | undefined {
         return undefined
       }
       if (token.startsWith("-")) continue
+      if ((leaf === "bun" || leaf === "deno") && token === "run") continue
       return token
     }
     return undefined
@@ -6232,8 +6289,10 @@ async function inspectTargetDirectory(candidate: string, cwd: string, worktree: 
   }
 }
 
+type LocalScriptKind = "shell" | "language" | "direct"
+
 function localScriptCandidates(script: string, shell: string) {
-  const candidates = new Set<string>()
+  const candidates = new Map<string, LocalScriptKind>()
   const segments = splitSimpleSegments(script, shell) ?? [script]
 
   for (const segment of segments) {
@@ -6254,6 +6313,7 @@ function localScriptCandidates(script: string, shell: string) {
 
     const command = commandLeaf(tokens[0]) ?? ""
     let candidate: string | undefined
+    let kind: LocalScriptKind = "language"
     if (["python", "python3", "py"].includes(command)) {
       for (let index = 1; index < tokens.length; index += 1) {
         const token = tokens[index]
@@ -6265,11 +6325,13 @@ function localScriptCandidates(script: string, shell: string) {
         candidate = token
         break
       }
-    } else if (["node", "bash", "sh", "zsh"].includes(command)) {
-      if (command === "node" && tokens.slice(1).some((token) => token.toLowerCase() === "--test")) {
+    } else if (["node", "bun", "deno", "bash", "sh", "zsh"].includes(command)) {
+      if ((command === "node" && tokens.slice(1).some((token) => token.toLowerCase() === "--test")) ||
+        (["bun", "deno"].includes(command) && tokens[1] === "test")) {
         candidate = undefined
         continue
       }
+      if (["bash", "sh", "zsh"].includes(command)) kind = "shell"
       for (let index = 1; index < tokens.length; index += 1) {
         const token = tokens[index]
         if (["-c", "-e"].includes(token.toLowerCase())) {
@@ -6277,21 +6339,35 @@ function localScriptCandidates(script: string, shell: string) {
           break
         }
         if (token.startsWith("-")) continue
+        if ((command === "bun" || command === "deno") && token === "run") continue
         candidate = token
         break
       }
     } else if (["powershell", "pwsh"].includes(command)) {
+      kind = "shell"
       const fileIndex = tokens.findIndex((token) => token.toLowerCase() === "-file")
       if (fileIndex >= 0) candidate = tokens[fileIndex + 1]
     } else if (/^\.{1,2}[\\/]/.test(tokens[0])) {
+      kind = "direct"
       candidate = tokens[0]
     }
 
     if (!candidate || candidate.startsWith("-") || /^(?:https?:|data:)/i.test(candidate)) continue
-    candidates.add(candidate)
-    if (candidates.size >= MAX_LOCAL_SCRIPTS) return [...candidates]
+    const previous = candidates.get(candidate)
+    if (previous === "shell" || kind === "shell") kind = "shell"
+    else if (previous === "direct" || kind === "direct") kind = "direct"
+    candidates.set(candidate, kind)
+    if (candidates.size >= MAX_LOCAL_SCRIPTS) break
   }
-  return [...candidates]
+  return [...candidates].map(([candidate, kind]) => ({ path: candidate, kind }))
+}
+
+function isShellScriptSource(kind: LocalScriptKind, content: string): boolean {
+  if (kind !== "direct") return kind === "shell"
+  const shebang = content.match(/^#!([^\r\n]+)/)?.[1]
+  if (!shebang) return true
+  const invocation = executableInvocation(shebang)
+  return invocation.unresolved || !LANG_INLINE_LEAVES.has(invocation.leaf ?? "")
 }
 
 /** `outsideWorktree` admits scripts anywhere the read policy allows; callers
@@ -11017,6 +11093,15 @@ async function classifySegments(
         : undefined
       const body = absolute ? writtenBodies.get(path.resolve(absolute)) : undefined
       if (body !== undefined) {
+        const candidate = localScriptCandidates(segment, input.shell).find((entry) => entry.path === invoked)
+        if (candidate && !isShellScriptSource(candidate.kind, body)) {
+          // Source strings are evidence, not proof that a shell primitive runs.
+          results.push({
+            verdict: "ASK", rules: ["execution.local-script-signal"],
+            reason: "A non-shell program written earlier in the command requires contextual review",
+          })
+          continue
+        }
         const hit = definiteDestructiveHit(body, input.bypassedCategories)
         if (hit) {
           results.push({ verdict: "DENY", rules: [hit.id], reason: hit.reason })
@@ -11271,7 +11356,7 @@ async function classifyShellCommandInScope(
       ? { ...input, cwd: resolvedWorkdir, baseUnverified: true }
       : input
 
-  const localScriptSurfaces: string[] = []
+  const localScriptSurfaces: Array<{ content: string; shell: boolean }> = []
   const fingerprints: ScriptFingerprint[] = []
   const localScripts: LocalScriptReviewContext[] = []
   const uninspectedLocalScripts: string[] = []
@@ -11282,7 +11367,8 @@ async function classifyShellCommandInScope(
   let cloudScriptChars = 0
   let provenLocalScripts = 0
 
-  for (const candidate of localScriptCandidates(scanView, input.shell)) {
+  for (const descriptor of localScriptCandidates(scanView, input.shell)) {
+    const candidate = descriptor.path
     let inspected = await fingerprintLocalScript(candidate, effectiveInput.cwd, input.worktree)
     let proven = inspected !== undefined && (await localPythonScriptProven(candidate, inspected, scanView, effectiveInput))
     if (!inspected && /\.py$/i.test(candidate)) {
@@ -11315,7 +11401,7 @@ async function classifyShellCommandInScope(
     }
     for (const module of localModules) {
       fingerprints.push(module.fingerprint)
-      localScriptSurfaces.push(normalized(module.content))
+      localScriptSurfaces.push({ content: normalized(module.content), shell: false })
       if (cloudScriptChars + module.content.length <= MAX_CLOUD_LOCAL_SCRIPT_CHARS) {
         localScripts.push({ path: module.reviewPath, content: module.content, sha256: module.fingerprint.sha256 })
         cloudScriptChars += module.content.length
@@ -11328,7 +11414,7 @@ async function classifyShellCommandInScope(
     if (proven) {
       provenLocalScripts += 1
     } else {
-      localScriptSurfaces.push(normalized(inspected.content))
+      localScriptSurfaces.push({ content: normalized(inspected.content), shell: isShellScriptSource(descriptor.kind, inspected.content) })
     }
     if (cloudScriptChars + inspected.content.length <= MAX_CLOUD_LOCAL_SCRIPT_CHARS) {
       localScripts.push({
@@ -11378,7 +11464,8 @@ async function classifyShellCommandInScope(
   }
   const decisionState = { fingerprints, reviewContext }
   const executableCombined = executableSurfaces.join("\n\n")
-  const localScriptCombined = localScriptSurfaces.join("\n\n")
+  const localScriptCombined = localScriptSurfaces.filter((surface) => surface.shell).map((surface) => surface.content).join("\n\n")
+  const languageScriptCombined = localScriptSurfaces.filter((surface) => !surface.shell).map((surface) => surface.content).join("\n\n")
 
   const segmentDecision = await classifySegments(scanView, effectiveInput)
 
@@ -11455,6 +11542,19 @@ async function classifyShellCommandInScope(
     if (hasLocalScriptReviewSignal(localScriptCombined) && !ruleBypassed("execution.local-script-signal", bypassed)) {
       extraSignals.set("execution.local-script-signal", "Local script contains a review-requiring primitive")
     }
+  }
+
+  // Shell regex matches in JS/TS/Python text may be comments or test data.
+  // Keep them reviewable without attaching floor ids that the host treats as
+  // proven pre-launch denials. Actual shell invocations retain their floors.
+  if (languageScriptCombined && !ruleBypassed("execution.local-script-signal", bypassed) && (
+    SECURITY_SIGNAL_RULES.some((rule) => rule.test(languageScriptCombined)) ||
+    hasLocalScriptReviewSignal(languageScriptCombined) ||
+    hasExfilOrDangerousPerms(languageScriptCombined, languageScriptCombined, { cwd: input.cwd, worktree: input.worktree }) ||
+    hasCriticalDataDestruction(languageScriptCombined, input.shell) ||
+    hasGeneralDataDestruction(languageScriptCombined) || hasDestructiveOverwrite(languageScriptCombined)
+  )) {
+    extraSignals.set("execution.local-script-signal", "Non-shell source contains a possible primitive or literal test data requiring contextual review")
   }
 
   if (

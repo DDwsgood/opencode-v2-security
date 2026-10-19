@@ -196,20 +196,27 @@ export async function planFileBoundary(
       ? `${request.mode}: ${JSON.stringify(absolute)} has unavailable evidence: ${target.inspectionError}; the lexical path is not a canonical grant`
       : `${request.mode}: ${JSON.stringify(absolute)} resolves to ${JSON.stringify(resolved)}`)
     if (target.inspectionError) findings.push(target.inspectionError)
-    const finding = classifyPathTarget(resolved, request.mode, { cwd: options.cwd, worktree: options.cwd, strictness: "LOOSE" })
-    const publicSshResource = /\/.ssh\/(?:config|known_hosts(?:\.old)?|authorized_keys(?:2)?|[^/]+\.pub)$/.test(resolved)
+    const classificationPaths = absolute === resolved ? [absolute] : [absolute, resolved]
+    const publicSshPattern = /\/\.ssh\/(?:config|known_hosts(?:\.old)?|authorized_keys(?:2)?|[^/]+\.pub)$/
+    const publicSshResource = publicSshPattern.test(absolute) && publicSshPattern.test(resolved)
     const directoryListing = request.mode === "read" && (await stat(resolved).catch(() => undefined))?.isDirectory() === true
-    // Ignore only this finding, not the remaining path effects (e.g. patch
-    // preview reading a symlink's separate referent).
-    const riskOnly = finding.kind !== "pass" && (finding.rule === "filesystem.broad-scan" || finding.rule === "credentials.foreign-home" ||
-      request.mode === "read" && (publicSshResource || directoryListing || resolved.startsWith("/proc/sys/")) ||
-      finding.rule === "persistence.git-hooks" && roots.some((root) => containsPath(root, resolved)))
-    if (finding.kind !== "pass" && !riskOnly) {
+    // A lexical credential-store name and its real referent are both evidence;
+    // resolving a symlink must not erase the sensitive origin of a read.
+    for (const classificationPath of classificationPaths) {
+      const finding = classifyPathTarget(classificationPath, request.mode, { cwd: options.cwd, worktree: options.cwd, strictness: "LOOSE" })
+      if (finding.kind === "pass") continue
+      const credentialRead = request.mode === "read" && finding.rule === "credentials.sensitive-access"
+      const riskOnly = finding.rule === "filesystem.broad-scan" || finding.rule === "credentials.foreign-home" ||
+        request.mode === "read" && (publicSshResource || directoryListing && !credentialRead ||
+          absolute.startsWith("/proc/sys/") && resolved.startsWith("/proc/sys/")) ||
+        finding.rule === "persistence.git-hooks" && roots.some((root) => containsPath(root, resolved))
+      if (riskOnly) continue
       const categories = ruleRequiredCategories(finding.rule) ?? []
-      const skipped = categories.length > 0 && categories.every((category) => options.bypassCategories?.has(category))
+      const skipped = !credentialRead && categories.length > 0 && categories.every((category) => options.bypassCategories?.has(category))
       if (skipped) facts.push(`static category check skipped by user bypass: ${finding.rule}`)
       else if (finding.rule !== "filesystem.outside-write" || !roots.some((root) => containsPath(root, resolved))) {
-        findings.push(`${finding.rule}: ${finding.reason}`)
+        const description = `${finding.rule}: ${finding.reason}`
+        if (!findings.includes(description)) findings.push(description)
       }
     }
     if (request.mode === "delete") {
@@ -444,13 +451,15 @@ export function needsHostDirectPrivilege(command: string): boolean {
 export function boundarySessionContext(raw: unknown): { userRequest: string; context: string[] } {
   const messages = Array.isArray(raw) ? raw : raw && typeof raw === "object" && "data" in raw && Array.isArray(raw.data) ? raw.data : []
   const recent: string[] = []
-  let userRequest = ""
+  const userTurns: string[][] = []
   for (const value of messages) {
     if (!value || typeof value !== "object") continue
     const message = value as Record<string, unknown>
     if (message.type === "user" && typeof message.text === "string") {
-      userRequest = message.text.slice(-12_000)
-      recent.push(`user: ${message.text.slice(-4_000)}`)
+      const text = message.text.split(/\n{2,}/).filter((block) => !block.trimStart().startsWith("[opencode-v2-security]")).join("\n\n").trim()
+      if (message.synthetic === true || !text) continue
+      userTurns.push([text])
+      recent.push(`user: ${text.slice(-4_000)}`)
     } else if (message.type === "assistant" && Array.isArray(message.content)) {
       for (const item of message.content) {
         if (!item || typeof item !== "object") continue
@@ -473,7 +482,8 @@ export function boundarySessionContext(raw: unknown): { userRequest: string; con
               question_input: state.input,
               ...(hasStructuredAnswers ? { user_answers: answers } : { formatted_user_response: text }),
             })}`
-            userRequest = `${userRequest}\n\n${response}`.slice(-12_000)
+            if (!userTurns.length) userTurns.push([])
+            userTurns.at(-1)!.push(response.slice(0, 4_000))
             recent.push(`user: ${response.slice(0, 4_000)}`)
             continue
           }
@@ -490,5 +500,23 @@ export function boundarySessionContext(raw: unknown): { userRequest: string; con
     context.unshift(text)
     remaining -= text.length
   }
+  const recentUserTurns = userTurns.slice(-5)
+  const separatorCharacters = Math.max(0, recentUserTurns.length - 1) * 2
+  const turnBudget = Math.min(3_998, Math.floor((12_000 - separatorCharacters) / Math.max(1, recentUserTurns.length)))
+  const retainedTurns = recentUserTurns.map((turn) => {
+    const text = turn.join("\n\n")
+    if (text.length <= turnBudget) return text
+    // Preserve both the opening scope and later restrictions/selected answers.
+    const marker = "\n...[truncated user turn]...\n"
+    const headCharacters = Math.floor((turnBudget - marker.length) / 2)
+    const tailCharacters = turnBudget - marker.length - headCharacters
+    return `${text.slice(0, headCharacters)}${marker}${text.slice(-tailCharacters)}`
+  })
+  const userRequest = retainedTurns.join("\n\n")
+  // Remove only a complete, verbatim duplicate; truncated turns and question
+  // answers keep their context entry so no authorization evidence is lost.
+  const latestTurn = retainedTurns.at(-1)
+  const duplicate = latestTurn === undefined ? -1 : context.lastIndexOf(`user: ${latestTurn}`)
+  if (duplicate >= 0) context.splice(duplicate, 1)
   return { userRequest, context }
 }

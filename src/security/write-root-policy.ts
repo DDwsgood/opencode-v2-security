@@ -21,8 +21,21 @@ function overlaps(root: string, target: string): boolean {
   return containsWritePath(root, target) || containsWritePath(target, root)
 }
 
-export function isRuntimeBrokerPath(target: string, base = "/tmp/opencode"): boolean {
-  return containsWritePath(base, target) && path.relative(base, target).split(path.sep)[0]?.startsWith("security-boundary-") === true
+const BROKER_DIRECTORIES_KEY = Symbol.for("opencode-v2-security.runtime-broker-directories.v1")
+const processState = globalThis as typeof globalThis & { [BROKER_DIRECTORIES_KEY]?: Set<string> }
+const activeBrokerDirectories = processState[BROKER_DIRECTORIES_KEY] ??= new Set<string>()
+
+/** Share protection across plugin instances without reserving other processes'
+ * broker names or preventing a traced child from creating its own broker. */
+export function registerRuntimeBrokerDirectory(directory: string): () => void {
+  const normalized = path.resolve(directory)
+  activeBrokerDirectories.add(normalized)
+  return () => { activeBrokerDirectories.delete(normalized) }
+}
+
+export function isRuntimeBrokerPath(target: string, base?: string): boolean {
+  return [...activeBrokerDirectories].some((directory) =>
+    (!base || containsWritePath(base, directory)) && containsWritePath(directory, target))
 }
 
 /** A grant never follows a redirected root or a symlinked leaf, including a

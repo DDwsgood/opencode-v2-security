@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test"
 import { execFile } from "node:child_process"
-import { chmod, mkdtemp, mkdir, readFile, rename, writeFile } from "node:fs/promises"
+import { chmod, mkdtemp, mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises"
 import path from "node:path"
 import * as os from "node:os"
 import * as filesystem from "node:fs/promises"
@@ -9,9 +9,11 @@ import * as cache from "../src/security/approval-cache"
 import { DEFAULT_BOUNDARY_WATCH_HELPER } from "../src/sandbox"
 import { Cause, Effect, Exit, Option, Scope, Stream } from "effect"
 import plugin from "../src/index"
-import frozen from "../src/security/v10-8-pipeexec.json"
+import frozen from "../src/security/v11-gold-prompt.json"
 import { adjudicateEffectAnswers, EffectsReviewError, type EffectReviewRequest } from "../src/security/effects-reviewer"
 import { resetSharedSecurityStateForTests } from "../src/security/shared-state"
+import { createRuntimeBoundaryBroker } from "../src/runtime-boundary"
+import { NO_REROUTE } from "../src/agent-messages"
 import { cleanupTestArtifacts } from "./artifacts"
 
 let root: string, workspace: string, outside: string, scratch: string, probe: string
@@ -65,6 +67,8 @@ async function harness(deny = false, options: {
   onSpawn?: () => void
   failContextRead?: number
   slowCommands?: boolean
+  logReviewerTrace?: boolean
+  onOutput?: (stdout: string, stderr: string) => void
 } = {}) {
   // Security state is shared process-wide between plugin instances; each
   // simulated instance here must start from a clean registry.
@@ -73,6 +77,7 @@ async function harness(deny = false, options: {
   const commands = new Map<string, any>()
   const calls: EffectReviewRequest[] = []
   const notifications: any[] = []
+  const processOutputs: Array<{ stdout: string; stderr: string }> = []
   const retained = [{ type: "user", text: "Operate on the named fixture files and directories for this acceptance test." }]
   const tools = new Map<string, any>()
   let executed = 0, serial = 0, contextReads = 0
@@ -96,21 +101,29 @@ async function harness(deny = false, options: {
           // keeps the process alive; the exit frame arrives over the broker.
           execFile(spawn.shell === "/bin/sh" ? "/bin/sh" : "/bin/bash",
             ["-c", spawn.command],
-            { cwd: spawn.cwd, env: spawn.env, timeout: 15_000 })
+            { cwd: spawn.cwd, env: spawn.env, timeout: 15_000 },
+            (_error, stdout, stderr) => {
+              processOutputs.push({ stdout, stderr })
+              options.onOutput?.(stdout, stderr)
+            })
           resolve({ output: "", exit: 0, status: "running" })
           return
         }
         // Honor spawn.shell: the host resolves the shell before the hook
         // and spawns invocation.shell — the watcher wrap may switch it.
         const child = execFile(spawn.shell, ["-c", spawn.command], { cwd: spawn.cwd, env: spawn.env, signal, timeout: 15_000, maxBuffer: 1024 * 1024 },
-          (error, stdout, stderr) => resolve({ output: stdout + stderr, exit: typeof error?.code === "number" ? error.code : error ? 1 : 0 }))
+          (error, stdout, stderr) => {
+            processOutputs.push({ stdout, stderr })
+            options.onOutput?.(stdout, stderr)
+            resolve({ output: stdout + stderr, exit: typeof error?.code === "number" ? error.code : error ? 1 : 0 })
+          })
         child.once("spawn", () => options.onSpawn?.())
       }))
       return { output, content: output.output, metadata: {} }
     }),
   })
   const ctx: any = {
-    options: { sandbox: { enabled: true, mode: "auto", scratch, helperPath: probe }, slowCommands: options.slowCommands ?? false, logReviewerTrace: false,
+    options: { sandbox: { enabled: true, mode: "auto", scratch, helperPath: probe }, slowCommands: options.slowCommands ?? false, logReviewerTrace: options.logReviewerTrace ?? false,
       failPolicy: options.failPolicy ?? "fail_open",
       dynamicReview: { jev: { enabled: false } }, permission: { registerTool: false },
       reviewCommand: async (request: EffectReviewRequest) => {
@@ -128,6 +141,7 @@ async function harness(deny = false, options: {
     permission: { hook: (name: string, callback: any) => Effect.sync(() => { hooks.set(`permission.${name}`, callback) }) },
     command: { transform: (callback: any) => Effect.sync(() => callback({ add: (command: any) => commands.set(command.name, command.execute) })) },
     session: { get: () => Effect.succeed({ location: { directory: workspace } }), context: () => Effect.succeed(retained),
+      hook: (name: string, callback: any) => Effect.sync(() => { hooks.set(`session.${name}`, callback) }),
       synthetic: (input: any) => Effect.sync(() => { notifications.push(structuredClone(input)) }) },
     event: { subscribe: () => Stream.fromIterable([]) },
   }
@@ -146,7 +160,7 @@ async function harness(deny = false, options: {
   scopes.push(scope)
   await Effect.runPromise((plugin as any).effect(ctx).pipe(Scope.provide(scope)))
   return {
-    calls, notifications, get executed() { return executed },
+    calls, notifications, processOutputs, get executed() { return executed },
     run: (name: string, input: unknown) => Effect.runPromise(tools.get(name).execute(input, { sessionID: "acceptance", messageID: "m", id: `call-${++serial}`, agent: "build" })) as Promise<any>,
     failure: async (name: string, input: unknown) => {
       const effect = tools.get(name).execute(input, { sessionID: "acceptance", messageID: "m", id: `call-${++serial}`, agent: "build" })
@@ -157,10 +171,171 @@ async function harness(deny = false, options: {
     },
     command: (text: string) => Effect.runPromise(commands.get("perm")({ sessionID: "acceptance", prompt: { text } })),
     newUserMessage: (text: string) => { retained.push({ type: "user", text }) },
+    modelContext: async () => {
+      const event = { sessionID: "acceptance", messages: [] as any[] }
+      await Effect.runPromise(hooks.get("session.context")!(event))
+      return event.messages
+    },
+    after: async (result: Record<string, unknown>) => {
+      const event = { tool: "read", sessionID: "acceptance", agent: "build", messageID: "m", id: `after-${++serial}`,
+        input: {}, status: "completed", result }
+      await Effect.runPromise(hooks.get("tool.execute.after")!(event))
+      return event.result
+    },
   }
 }
 
 describe("real observer → broker → frozen reviewer → original process", () => {
+  test("first review inlines executable bodies, protects sensitive aliases and redacts expanded argv", async () => {
+    const literalToken = "fixture-literal-token-123456"
+    for (const kind of ["ordinary", "sensitive-alias", "build-wrapper"] as const) {
+      const host = await harness()
+      const scriptName = kind === "build-wrapper" ? "gradlew" : `${kind}.py`
+      const script = path.join(scratch, scriptName)
+      const source = kind === "sensitive-alias" ? path.join(scratch, ".env.payload") : script
+      const target = path.join(outside, `preinline-${kind}.txt`)
+      const marker = `payload-body-${kind}`
+      await writeFile(source, `# ${marker}\nopen(${JSON.stringify(target)}, 'w').write('fixture')\n`)
+      if (source !== script) await symlink(source, script)
+      const result = await host.run("shell", {
+        command: `python3 ${quote(script)} --token "$BOUNDARY_TEST_TOKEN"`,
+        env: { BOUNDARY_TEST_TOKEN: literalToken },
+      })
+      expect(result.output.exit).toBe(0)
+      expect(host.calls).toHaveLength(1)
+      const request = host.calls[0]
+      const facts = request.input_facts.join("\n")
+      expect(facts).not.toContain(literalToken)
+      const observed = JSON.parse(request.input_facts.find((fact) => fact.startsWith("Observed boundary facts"))!.split(": ").slice(1).join(": "))
+      expect(observed.details.argv).toContain("[redacted]")
+      expect(observed.details).not.toHaveProperty("argvDigest")
+      expect(observed.targets[0]).not.toHaveProperty("dev")
+      expect(observed.targets[0]).not.toHaveProperty("ino")
+      expect(observed.targets[0]).not.toHaveProperty("parentDev")
+      expect(observed.targets[0]).not.toHaveProperty("parentIno")
+      expect(observed.targets[0]).not.toHaveProperty("mtimeNs")
+      expect(observed.targets[0]).not.toHaveProperty("ctimeNs")
+      expect(observed.targets[0]).toHaveProperty("exists")
+      expect(request.input_facts.join("\n")).not.toContain("Executing image identity")
+      expect(request.files.some((file) => file.kind === "observed_boundary_target")).toBe(false)
+      if (kind === "ordinary") {
+        expect(facts).toContain(marker)
+        expect(request.files.some((file) => file.kind === "local_executable_payload" && file.path === script)).toBe(true)
+      } else {
+        expect(facts).not.toContain(marker)
+        expect(request.files.some((file) => file.kind === "local_executable_payload")).toBe(false)
+      }
+    }
+  })
+
+  test("expanded argv redacts every secret value and entire URL userinfo", async () => {
+    const host = await harness()
+    const script = path.join(scratch, "literal-argv-redaction.py")
+    const target = path.join(outside, "literal-argv-redaction.txt")
+    await writeFile(script, `open(${JSON.stringify(target)}, 'w').write('fixture')\n`)
+    const shellArguments = [
+      quote("API_KEY=abc123"), quote("--password=abc%12345"), "--token", quote("/abcdef123456"),
+      quote("https://opaque-token@example.com/"), quote("https://opaque-token:password@example.com/"),
+      "--client-secret", quote("a$%`"), quote("TOKEN="),
+    ]
+    const result = await host.run("shell", { command: `python3 ${quote(script)} ${shellArguments.join(" ")}` })
+    expect(result.output.exit).toBe(0)
+    expect(host.calls).toHaveLength(1)
+    const request = host.calls[0]
+    const observed = JSON.parse(request.input_facts.find((fact) => fact.startsWith("Observed boundary facts"))!.split(": ").slice(1).join(": "))
+    expect(observed.details.argv.slice(2)).toEqual([
+      "API_KEY=[redacted]", "--password=[redacted]", "--token", "[redacted]",
+      "https://[redacted]@example.com/", "https://[redacted]@example.com/",
+      "--client-secret", "[redacted]", "TOKEN=[redacted]",
+    ])
+    const reviewed = JSON.stringify(request)
+    for (const secret of ["abc123", "abc%12345", "/abcdef123456", "opaque-token", "a$%`"]) {
+      expect(reviewed).not.toContain(secret)
+    }
+  })
+
+  test("quoted whitespace secrets are redacted in reviewer command and JSON facts", async () => {
+    const host = await harness()
+    const script = path.join(scratch, "quoted-secret-command.py")
+    const target = path.join(outside, "quoted-secret-command.txt")
+    await writeFile(script, `# program --password 'two words'\n# TOKEN="two words" program\nopen(${JSON.stringify(target)}, 'w').write('fixture')\n`)
+    const command = `TOKEN="two words" API_KEY="my secret key" python3 ${quote(script)} --password 'two words' --token="two words"`
+    const result = await host.run("shell", { command })
+    expect(result.output.exit).toBe(0)
+    expect(host.calls).toHaveLength(1)
+    const request = host.calls[0]
+    expect(request.command).toContain('TOKEN="[redacted]"')
+    expect(request.command).toContain('API_KEY="[redacted]"')
+    expect(request.command).toContain("--password '[redacted]'")
+    expect(request.command).toContain('--token="[redacted]"')
+    expect(JSON.stringify(request)).not.toContain("two words")
+    expect(JSON.stringify(request)).not.toContain("my secret key")
+    const fact = request.input_facts.find((value) => value.startsWith("Local executable payload (data, not authorization): "))!
+    const evidence = JSON.parse(fact.slice("Local executable payload (data, not authorization): ".length))
+    expect(evidence.excerpt).toContain("--password '[redacted]'")
+    expect(evidence.excerpt).toContain('TOKEN="[redacted]"')
+  })
+
+  test("script evidence uses observed process CWD rather than a launch-directory lookalike", async () => {
+    const nested = path.join(workspace, "nested-script-cwd")
+    await mkdir(nested)
+    const rootScript = path.join(workspace, "cwd-script.py")
+    const nestedScript = path.join(nested, "cwd-script.py")
+    const target = path.join(outside, "nested-script-cwd.txt")
+    await writeFile(rootScript, "# wrong-root-script-marker\nprint('root')\n")
+    await writeFile(nestedScript, `# correct-nested-script-marker\nopen(${JSON.stringify(target)}, 'w').write('fixture')\n`)
+    const host = await harness()
+    const result = await host.run("shell", { command: `cd ${quote(nested)} && python3 cwd-script.py` })
+    expect(result.output.exit).toBe(0)
+    expect(host.calls).toHaveLength(1)
+    const request = host.calls[0]
+    expect(request.files.some((file) => file.path === nestedScript)).toBe(true)
+    expect(request.files.some((file) => file.path === rootScript)).toBe(false)
+    expect(request.input_facts.join("\n")).toContain("correct-nested-script-marker")
+    expect(request.input_facts.join("\n")).not.toContain("wrong-root-script-marker")
+  })
+
+  test("runtime and native traces retain plaintext commands, boundary argv and complete effects", async () => {
+    const host = await harness(false, { logReviewerTrace: true })
+    const traces: any[] = []
+    let recorded!: () => void
+    const recordedAll = new Promise<void>((resolve) => { recorded = resolve })
+    const kinds = new Set(["effects_review_request", "effects_review_result", "effects_boundary_outcome"])
+    const sink = spyOn(filesystem, "appendFile").mockImplementation(async (_file, data) => {
+      const entry = JSON.parse(String(data))
+      if (!kinds.has(entry.kind)) return
+      traces.push(entry)
+      if (traces.length === 6) recorded()
+    })
+    try {
+      const target = path.join(outside, "plaintext-trace.txt")
+      const command = python(`open(${JSON.stringify(target)},'w').write('fixture')`)
+      await host.run("shell", { command })
+      await host.run("write", { path: path.join(outside, "native-trace.txt"), content: "fixture" })
+      await recordedAll
+      for (const entry of traces) {
+        expect(entry.command).toBe(host.calls[entry.callID === "call-1" ? 0 : 1].command)
+        expect(entry).not.toHaveProperty("commandSha256")
+        if (entry.kind !== "effects_review_request") expect(entry.effects).toEqual(report())
+      }
+      const runtime = traces.find((entry) => entry.kind === "effects_review_request" && entry.callID === "call-1")
+      expect(runtime.command).toBe(command)
+      expect(runtime.boundary.targets[0].path).toBe(target)
+      expect(runtime.boundary.details.argv).toContain("python3")
+      expect(runtime.boundary.details).not.toHaveProperty("argvDigest")
+      expect(runtime.request.cwd).toBe(workspace)
+    } finally {
+      sink.mockRestore()
+    }
+  })
+
+  test("a payload's ordinary exit 125 is not an observer setup failure", async () => {
+    const host = await harness()
+    const result = await host.run("shell", { command: "printf payload-exit; exit 125" })
+    expect(result.output.exit).toBe(125)
+    expect(result.content).toBe("payload-exit")
+  })
+
   test("real allowWrite roots observe sensitive writes in Auto and ReadOnly, ordinary files skip review", async () => {
     const allowed = path.join(outside, "observed-allow-root")
     await mkdir(allowed)
@@ -188,7 +363,8 @@ describe("real observer → broker → frozen reviewer → original process", ()
     try {
       const failure = await host.failure("write", { path: path.join(directory, "fixture.txt"), content: "fixture" })
       expect(failure._tag).toBe("Tool.Error")
-      expect(failure.message).toContain("Command failed")
+      expect(failure.message).toContain("Command blocked")
+      expect(failure.message).toContain(NO_REROUTE)
       expect(host.calls).toHaveLength(1)
       expect(host.calls[0].input_facts.join("\n")).toContain("EACCES")
       expect(host.executed).toBe(0)
@@ -250,7 +426,6 @@ describe("real observer → broker → frozen reviewer → original process", ()
       answers.scope_coverage = { choice: "uncovered" }
       answers.uncovered_owner = { choice: "remote" }
       answers.remote_severity = { noul: 1 }
-      answers.remote_facts = { choice: "resolved_present" }
       return adjudicateEffectAnswers(answers)
     } })
     const counter = path.join(workspace, "before-refusal.txt"), target = path.join(outside, "denied.txt")
@@ -270,6 +445,8 @@ describe("real observer → broker → frozen reviewer → original process", ()
     const fullOutput = result.message.match(/full collected output saved to (\S+output\.txt)/)?.[1]
     expect(fullOutput).toBeDefined()
     expect(await readFile(fullOutput!, "utf8")).toContain("ERR-before")
+    expect(host.processOutputs[0].stdout).not.toContain("[opencode-v2-security]")
+    expect(host.processOutputs[0].stderr).toBe("ERR-before\n")
     await cleanupTestArtifacts(path.dirname(fullOutput!), { recursive: true, force: true })
     expect(host.calls).toHaveLength(1)
     // The reviewer still receives the real entry phase; the agent sees
@@ -294,7 +471,7 @@ describe("real observer → broker → frozen reviewer → original process", ()
     expect(host.calls[0].input_facts[0]).toContain("may or may not have run")
     expect(host.calls[0].input_facts[0]).not.toContain("paused this operation before its boundary effect")
     expect(host.calls[0].input_facts[0]).not.toContain("already ran")
-    // Native output and the tool notice both use the same stopped wording.
+    // Only the tool notice carries the stopped wording.
     expect(result.message).toContain("Command blocked:")
     expect(result.message).not.toContain("was not performed")
   })
@@ -392,6 +569,71 @@ describe("real observer → broker → frozen reviewer → original process", ()
     expect(second.metadata.boundary.source).toBe("cache:L2")
     expect(host.calls).toHaveLength(1)
   })
+  test("a cancelled background review writes no interception text to either process stream", async () => {
+    let reviewing!: () => void
+    const entered = new Promise<void>((resolve) => { reviewing = resolve })
+    let completed!: () => void
+    const processExited = new Promise<void>((resolve) => { completed = resolve })
+    const host = await harness(false, {
+      review: async () => {
+        reviewing()
+        return new Promise(() => {})
+      },
+      onOutput: () => { completed() },
+    })
+    const target = path.join(outside, "background-cancelled.txt")
+    await host.run("shell", { command: `printf fixture > ${quote(target)}`, background: true })
+    await entered
+    await host.command("ro")
+    await processExited
+    expect(host.processOutputs).toEqual([{ stdout: "", stderr: "" }])
+    await expect(readFile(target)).rejects.toMatchObject({ code: "ENOENT" })
+  })
+
+  test("a late background reviewer denial is audited and delivered to the agent without child stderr", async () => {
+    let reviewing!: () => void
+    const entered = new Promise<void>((resolve) => { reviewing = resolve })
+    let release!: () => void
+    const decision = new Promise<void>((resolve) => { release = resolve })
+    let completed!: () => void
+    const processExited = new Promise<void>((resolve) => { completed = resolve })
+    let recorded!: (entry: any) => void
+    const audited = new Promise<any>((resolve) => { recorded = resolve })
+    const sink = spyOn(filesystem, "appendFile").mockImplementation(async (_file, data) => {
+      const entry = JSON.parse(String(data))
+      if (entry.kind === "effects_background_blocked" && entry.reviewDenied) recorded(entry)
+    })
+    try {
+      const host = await harness(false, {
+        review: async () => { reviewing(); await decision; return report(true) },
+        onOutput: () => { completed() },
+      })
+      const target = path.join(outside, "background-reviewed-denial.txt")
+      const started = await host.run("shell", { command: `printf fixture > ${quote(target)}`, background: true })
+      expect(started.output.status).toBe("running")
+      await entered
+      release()
+      const entry = await audited
+      await processExited
+      expect(entry.sessionID).toBe("acceptance")
+      expect(entry.callID).toBe("call-1")
+      expect(entry.notice).toStartWith("[opencode-v2-security] Command blocked:")
+      expect(entry.notice).toContain(NO_REROUTE)
+      expect(entry).not.toHaveProperty("command")
+      expect(host.notifications).toHaveLength(0)
+      const context = await host.modelContext()
+      expect(context.some((message) => message.role === "user" && message.content[0]?.text === entry.notice)).toBe(true)
+      const next = await host.after({ content: "next tool body" })
+      expect(next.content).toEqual([{ type: "text", text: entry.notice }, { type: "text", text: "next tool body" }])
+      expect((await host.after({ content: "later tool body" })).content).toBe("later tool body")
+      expect((await host.modelContext()).some((message) => message.content[0]?.text === entry.notice)).toBe(false)
+      expect(host.processOutputs).toEqual([{ stdout: "", stderr: "" }])
+      await expect(readFile(target)).rejects.toMatchObject({ code: "ENOENT" })
+    } finally {
+      release?.()
+      sink.mockRestore()
+    }
+  })
   test("deferred env hooks reach the payload, not the wrapper shell", async () => {
     const host = await harness()
     // BASH_ENV pointing at a marker: only the TRACED payload may source it;
@@ -453,6 +695,7 @@ describe("real observer → broker → frozen reviewer → original process", ()
     // The denial shell ran with LD_* emptied: no loader complaint about
     // the nonexistent preload library may appear in its output.
     expect(run.message).not.toContain("cannot be preloaded")
+    expect(host.processOutputs).toEqual([{ stdout: "", stderr: "" }])
     // Neither the payload nor the hook ran — including inside the outer
     // shell (which the refusal pins to /bin/sh).
     await expect(readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" })
@@ -519,7 +762,9 @@ describe("real observer → broker → frozen reviewer → original process", ()
     const isolatedHome = process.env.HOME!
     process.env.HOME = systemHome
     const temp = await mkdtemp("/var/tmp/opencode-regression-")
-    const reserved = await mkdtemp("/tmp/opencode/security-boundary-regression-")
+    const protectedBroker = await createRuntimeBoundaryBroker({ directory: "/tmp/opencode", onBoundary: async () => ({ action: "deny" }) })
+    const reserved = path.dirname(protectedBroker.socketPath)
+    const unreserved = await mkdtemp("/tmp/opencode/security-boundary-regression-")
     try {
       for (const mode of ["auto", "ro"]) {
         const host = await harness(true)
@@ -530,6 +775,8 @@ describe("real observer → broker → frozen reviewer → original process", ()
         const file = path.join(temp, `${mode}-shell.txt`)
         const result = await host.run("shell", { command: `printf fixture > ${quote(file)}; rm -- ${quote(file)}` })
         expect(result.output.exit).toBe(0)
+        const ownBroker = path.join(unreserved, `${mode}-child-broker.txt`)
+        expect((await host.run("shell", { command: `printf fixture > ${quote(ownBroker)}` })).output.exit).toBe(0)
         const blocked = await host.failure("shell", { command: `printf fixture > ${quote(path.join(reserved, "denied.txt"))}` })
         expect(blocked.message).toContain("Command failed")
         await expect(readFile(path.join(reserved, "denied.txt"))).rejects.toMatchObject({ code: "ENOENT" })
@@ -538,7 +785,8 @@ describe("real observer → broker → frozen reviewer → original process", ()
     } finally {
       process.env.HOME = isolatedHome
       await cleanupTestArtifacts(temp, { recursive: true, force: true })
-      await cleanupTestArtifacts(reserved, { recursive: true, force: true })
+      await protectedBroker.close()
+      await cleanupTestArtifacts(unreserved, { recursive: true, force: true })
     }
   })
   test("ReadOnly Python reads do not enter JEV", async () => {
@@ -662,8 +910,10 @@ describe("failPolicy at the original native executor", () => {
         expect(result.content).toBe("setup-pass")
       } else {
         const failure = await host.failure("shell", { command: "printf setup-pass", env: { BW_TEST_SEIZE_FAIL: "1" } })
+        expect(failure._tag).toBe("Tool.Error")
         expect(failure.message).toStartWith("[opencode-v2-security] Command failed")
-        expect(failure.message).toContain("PTRACE_SEIZE")
+        expect(failure.message).toContain("observer_setup")
+        expect(host.processOutputs).toEqual([{ stdout: "", stderr: "" }])
       }
     })
   }
@@ -678,7 +928,9 @@ describe("failPolicy at the original native executor", () => {
   })
   test("adjudicated model/floor denies remain refusals under fail_open", async () => {
     const host = await harness(true)
-    expect((await host.failure("write", { path: path.join(outside, "floor-deny.txt"), content: "fixture" })).message).toContain("Command failed")
+    const native = await host.failure("write", { path: path.join(outside, "floor-deny.txt"), content: "fixture" })
+    expect(native.message).toContain("Command blocked")
+    expect(native.message).toContain(NO_REROUTE)
     const result = await host.failure("shell", { command: `printf x > ${quote(path.join(outside, "runtime-deny.txt"))}` })
     expect(result.message).toStartWith("[opencode-v2-security] Command blocked:")
   })

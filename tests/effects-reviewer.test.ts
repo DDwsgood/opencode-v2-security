@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import frozen from "../src/security/v10-8-pipeexec.json"
+import frozen from "../src/security/v11-gold-prompt.json"
 import {
   adjudicateEffectAnswers,
   buildEffectReviewBody,
@@ -46,10 +46,10 @@ describe("frozen effects wire contract", () => {
     const body = buildEffectReviewBody(request)
     expect(body.model).toBe("jev-latest")
     expect(body.questions).toEqual(frozen.questions)
-    expect(Object.keys(body.questions)).toHaveLength(18)
+    expect(Object.keys(body.questions)).toHaveLength(10)
     expect(body.state.startsWith(`${frozen.header}\n\n`)).toBe(true)
     expect(body.state).toContain("User response via trusted question tool")
-    expect(body.state).toContain("offered or unselected options")
+    expect(body.state).toContain("unselected question/options")
     expect(body.state.endsWith("\n</review_input>\n")).toBe(true)
   })
 
@@ -119,7 +119,7 @@ describe("strict effects answers", () => {
   })
 })
 
-describe("frozen adjudication order", () => {
+describe("Variant B adjudication order", () => {
   const covered: EffectCoverage[] = ["within_request", "covered_by_bypass", "mixed_coverage"]
 
   test("floor yes is never covered by authorization", () => {
@@ -144,22 +144,25 @@ describe("frozen adjudication order", () => {
     })).decision).toBe("collect_evidence")
   })
 
-  test("preserves no-material early return before unclear-floor/external-gap", () => {
+  test("unclear floor collects before the no-material early return", () => {
     expect(adjudicateEffectAnswers(answers({
       floor: { choice: "unclear" }, gap_reach: { choice: "external_unresolvable" },
-    })).decision).toBe("allow")
+    })).decision).toBe("collect_evidence")
   })
 
-  test("single effect threshold is inclusive, indirect opacity is not material", () => {
-    for (const [score, expected] of [[0.49, "allow"], [0.5, "deny"], [1, "deny"]] as const) {
+  test("single effect threshold is inclusive and removed diagnostics are not synthesized", () => {
+    for (const [score, expected] of [[0.35, "allow"], [0.39, "allow"], [0.4, "deny"], [0.49, "deny"], [1, "deny"]] as const) {
       expect(adjudicateEffectAnswers(answers({ filesystem_severity: { noul: score }, scope_coverage: { choice: "uncovered" } })).decision).toBe(expected)
     }
-    expect(adjudicateEffectAnswers(answers({ indirection_severity: { noul: 1 }, scope_coverage: { choice: "uncovered" } })).decision).toBe("allow")
+    const result = adjudicateEffectAnswers(answers())
+    expect(result.severity).not.toHaveProperty("indirection")
+    expect(result).not.toHaveProperty("facts")
+    expect(() => parseEffectAnswers(answers({ indirection_severity: { noul: 1 } }))).toThrow(EffectsReviewError)
   })
 
   test("does not add score summation or diagnostic-owner overrides", () => {
     expect(adjudicateEffectAnswers(answers({
-      filesystem_severity: { noul: 0.4 }, host_severity: { noul: 0.4 }, scope_coverage: { choice: "uncovered" },
+      filesystem_severity: { noul: 0.39 }, host_severity: { noul: 0.39 }, scope_coverage: { choice: "uncovered" },
     })).decision).toBe("allow")
     expect(adjudicateEffectAnswers(answers({
       filesystem_severity: { noul: 1 }, scope_coverage: { choice: "uncovered" }, uncovered_owner: { choice: "filesystem" },
@@ -172,19 +175,24 @@ describe("frozen adjudication order", () => {
     })).decision).toBe("deny")
   })
 
-  test("exhausted collection accepts unknowns only with floor no", () => {
+  test("exhausted collection settles unclear floor without fabricating a concrete primitive", () => {
     for (const floor of ["no", "unclear", "yes"] as EffectFloor[]) {
       const result = adjudicateEffectAnswers(answers({ floor: { choice: floor }, scope_coverage: { choice: "external_fact_missing" } }))
       expect(resolveUncollectableEffects(result, false)).toBe(result)
       const terminal = resolveUncollectableEffects(result, true)
-      expect(terminal.decision).toBe(floor === "no" ? "allow" : floor === "yes" ? "deny" : "collect_evidence")
-      if (floor === "no") expect(terminal.source).toBe("accepted_unknown")
+      expect(terminal.decision).toBe(floor === "yes" ? "deny" : "allow")
+      if (floor !== "yes") expect(terminal.source).toBe("accepted_unknown")
     }
   })
 
   test("uncovered explicit denial never becomes accepted unknown", () => {
     const denial = adjudicateEffectAnswers(answers({ filesystem_severity: { noul: 1 }, scope_coverage: { choice: "uncovered" } }))
     expect(resolveUncollectableEffects(denial, true)).toBe(denial)
+    const unresolved = adjudicateEffectAnswers(answers({ scope_coverage: { choice: "uncovered" }, gap_reach: { choice: "local_resolvable" } }))
+    expect(unresolved.decision).toBe("collect_evidence")
+    expect(resolveUncollectableEffects(unresolved, true)).toMatchObject({ decision: "deny", source: "effect" })
+    const material = adjudicateEffectAnswers(answers({ floor: { choice: "unclear" }, filesystem_severity: { noul: 0.7 }, scope_coverage: { choice: "uncovered" } }))
+    expect(material).toMatchObject({ decision: "deny", source: "effect" })
   })
 
   test("exhausted evidence has configurable allow/deny with default allow", () => {
@@ -194,8 +202,8 @@ describe("frozen adjudication order", () => {
     expect(resolveUncollectableEffects(result, true, "deny")).toMatchObject({ decision: "deny", source: "evidence_limit", floor: "no" })
     expect(resolveUncollectableEffects(result, false, "deny")).toBe(result)
     const unclear = adjudicateEffectAnswers(answers({ floor: { choice: "unclear" }, scope_coverage: { choice: "external_fact_missing" } }))
-    expect(resolveUncollectableEffects(unclear, true, "allow")).toBe(unclear)
-    expect(resolveUncollectableEffects(unclear, true, "deny")).toBe(unclear)
+    expect(resolveUncollectableEffects(unclear, true, "allow")).toMatchObject({ decision: "allow", source: "accepted_unknown" })
+    expect(resolveUncollectableEffects(unclear, true, "deny")).toMatchObject({ decision: "deny", source: "evidence_limit" })
   })
 })
 

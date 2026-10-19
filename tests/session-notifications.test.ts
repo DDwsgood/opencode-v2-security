@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { createSessionStateNotices, type SessionStateNotification } from "../src/session-notifications"
+import { createNoticeStore, createSessionStateNotices, type SessionStateNotification } from "../src/session-notifications"
 
 function harness() {
   const history = [{ role: "user", text: "Original user request" }]
@@ -87,10 +87,12 @@ describe("append-only user state notifications", () => {
     await host.notices.deliverWithPrompt("s1", "steer")
     const history = structuredClone(host.history)
     host.notices.setPerm("s1", "Bypass")
+    host.notices.recordBackgroundBlock("s1", "background refusal")
     host.notices.clear("s1")
     await host.notices.deliverWithPrompt("s1", "steer")
     expect(host.history).toEqual(history)
     expect(host.notices.snapshot("s1")).toBeUndefined()
+    expect(host.notices.backgroundForModelContext("s1")).toBeUndefined()
   })
 
   test("notifications are isolated per session", async () => {
@@ -139,6 +141,47 @@ describe("append-only user state notifications", () => {
     expect(host.notices.forModelContext("s1")).toBeUndefined()
     host.notices.setPerm("s1", "Security mode: [Auto mode].")
     expect(host.notices.forModelContext("s1")).toContain("[Auto mode]")
+  })
+
+  test("background refusals share state across instances without waking a model request", async () => {
+    const store = createNoticeStore()
+    const received: SessionStateNotification[] = []
+    const publisher = createSessionStateNotices(undefined, store)
+    const receiver = createSessionStateNotices(async (notice) => { received.push(notice) }, store)
+    publisher.recordBackgroundBlock("s1", "background refusal")
+    await publisher.flush()
+    expect(received).toHaveLength(0)
+    expect(receiver.backgroundForModelContext("s1")).toBe("background refusal")
+    expect(receiver.backgroundForModelContext("s1")).toBe("background refusal")
+    expect(receiver.takeBackgroundForToolResult("s1")).toBe("background refusal")
+    expect(publisher.takeBackgroundForToolResult("s1")).toBeUndefined()
+    publisher.recordBackgroundBlock("s1", "next background refusal")
+    await receiver.deliverWithPrompt("s1", "queue")
+    expect(received).toHaveLength(0)
+    await receiver.deliverWithPrompt("s1", "steer")
+    await publisher.deliverWithPrompt("s1", "steer")
+    expect(received).toHaveLength(1)
+    expect(received[0].text).toBe("next background refusal")
+    expect(received[0].resume).toBe(false)
+    expect(received[0].metadata.backgroundBlockNotice).toBe(true)
+    expect(publisher.backgroundForModelContext("s1")).toBeUndefined()
+  })
+
+  test("a prompt admission clears only the background notices it successfully published", async () => {
+    let entered!: () => void
+    const publishing = new Promise<void>((resolve) => { entered = resolve })
+    let release!: () => void
+    const admitted = new Promise<void>((resolve) => { release = resolve })
+    const notices = createSessionStateNotices(async () => { entered(); await admitted })
+    notices.recordBackgroundBlock("s1", "first refusal")
+    const delivery = notices.deliverWithPrompt("s1", "steer")
+    await publishing
+    notices.recordBackgroundBlock("s1", "second refusal")
+    expect(notices.takeBackgroundForToolResult("s1")).toBeUndefined()
+    release()
+    await delivery
+    expect(notices.backgroundForModelContext("s1")).toBe("second refusal")
+    expect(notices.takeBackgroundForToolResult("s1")).toBe("second refusal")
   })
 
   test("a notice already admitted with a prompt is not repeated in model context", async () => {

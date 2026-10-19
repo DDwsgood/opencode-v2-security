@@ -9,10 +9,11 @@
 // sessions that can write (Auto), never in ReadOnly, never for native file
 // tools. These tests use REAL temporary repositories under /tmp/opencode.
 
-import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test"
+import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from "bun:test"
 import { execFile } from "node:child_process"
 import { mkdtemp, mkdir, readFile, realpath, writeFile } from "node:fs/promises"
 import path from "node:path"
+import * as os from "node:os"
 import { promisify } from "node:util"
 import { Effect, Scope, Stream } from "effect"
 import { cleanupTestArtifacts } from "./artifacts"
@@ -35,7 +36,7 @@ const { linkedWorktreePrivateDir } = await import("../src/security/worktree-root
 const { rootWideningCandidates } = await import("../src/security/root-widening")
 const { adjudicateEffectAnswers } = await import("../src/security/effects-reviewer")
 import type { EffectReviewRequest } from "../src/security/effects-reviewer"
-const frozen = (await import("../src/security/v10-8-pipeexec.json")).default
+const frozen = (await import("../src/security/v11-gold-prompt.json")).default
 
 const exec = promisify(execFile)
 const git = (...args: string[]) => exec("git", args)
@@ -45,8 +46,16 @@ let main: string
 let linked: string
 let other: string
 let privateDir: string
+const oldHome = process.env.HOME
+const systemHome = os.homedir()
+let homeSpy: { mockRestore(): void }
 beforeAll(async () => {
   root = await mkdtemp("/tmp/opencode/worktree-roots-")
+  const home = path.join(root, "home")
+  await mkdir(home)
+  // Exclude /tmp from automatic grants so writes outside the private dir reach review.
+  process.env.HOME = home
+  homeSpy = spyOn(os, "homedir").mockImplementation(() => process.env.HOME ?? systemHome)
   main = path.join(root, "main")
   await mkdir(main)
   await git("-C", main, "init", "--quiet")
@@ -63,6 +72,9 @@ beforeAll(async () => {
 const scopes: Scope.Closeable[] = []
 afterAll(async () => {
   for (const scope of scopes) await Effect.runPromise(Scope.close(scope, undefined as never)).catch(() => {})
+  homeSpy.mockRestore()
+  if (oldHome === undefined) delete process.env.HOME
+  else process.env.HOME = oldHome
   await cleanupTestArtifacts(root, { recursive: true, force: true })
 })
 
@@ -216,8 +228,9 @@ describe("worktree private dir as a shell write root", () => {
     expect(plain.output.exit).toBe(0)
     expect(host.calls).toHaveLength(0)
     const sensitive = path.join(privateDir, "observed-private.key")
-    const refused = await host.run(`python3 -c 'open("${sensitive}", "w").write("FAKE TEST DATA")'`)
-    expect(refused.output.exit).toBe(126)
+    await expect(host.run(`python3 -c 'open("${sensitive}", "w").write("FAKE TEST DATA")'`)).rejects.toMatchObject({
+      _tag: "Tool.Error", message: expect.stringContaining("Command review — safety floor:"),
+    })
     expect(host.calls).toHaveLength(1)
     await expect(readFile(sensitive)).rejects.toMatchObject({ code: "ENOENT" })
   })
@@ -250,11 +263,8 @@ describe("worktree private dir as a shell write root", () => {
     const host = await harness()
     await host.command("ro")
     expect((await host.status()).mode).toBe("readonly")
-    // Under /tmp every path is inside a global ReadOnly temp root, so an RO
-    // write cannot observe the difference through the filesystem. What RO
-    // must not do is tell the reviewer the private dir is a permitted write
-    // root: trigger one reviewed outside read and inspect the advertised
-    // writable roots verbatim.
+    // Trigger a reviewed outside read and inspect the advertised writable
+    // roots: ReadOnly must not include the Auto-only private dir grant.
     const secret = path.join(host.outside, "ro.env")
     await writeFile(secret, "TOKEN=fixture")
     const read = await host.run(`wc -c < ${secret}`)

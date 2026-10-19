@@ -119,21 +119,29 @@ function capture(file: string, args: string[]): Promise<string | undefined> {
 
 let wslWindowsTemp: Promise<string[]> | undefined
 
-/** WSL only: the Windows user's %TEMP%/%TMP%, as seen through the drive
- *  mount. Probed once per process; any failure yields no extra root. */
+/** WSL only: use inherited Windows paths or the conventional profile temp
+ * directory. Never launch a Windows executable: discovery can itself run
+ * inside a watched command and must not trigger an interop boundary. */
 function wslWindowsTempDirs(): Promise<string[]> {
   return wslWindowsTemp ??= (async () => {
     if (!process.env.WSL_DISTRO_NAME && !existsSync("/proc/sys/fs/binfmt_misc/WSLInterop")) return []
-    let output: string | undefined
-    for (const cmd of ["cmd.exe", "/mnt/c/Windows/System32/cmd.exe"]) {
-      output = await capture(cmd, ["/d", "/c", "echo %TEMP%&echo %TMP%"])
-      if (output !== undefined) break
+    const candidates = [process.env.TEMP, process.env.TMP]
+    if (process.env.LOCALAPPDATA) {
+      candidates.push(path.win32.join(process.env.LOCALAPPDATA, "Temp"))
+    } else if (process.env.USERPROFILE) {
+      candidates.push(path.win32.join(process.env.USERPROFILE, "AppData", "Local", "Temp"))
+    } else {
+      const username = process.env.USERNAME ?? path.basename(homedir())
+      if (username && !/[\\/]/.test(username)) {
+        candidates.push(`/mnt/c/Users/${username}/AppData/Local/Temp`)
+      }
     }
     const dirs: string[] = []
-    for (const line of (output ?? "").split(/\r?\n/)) {
-      const value = line.trim()
-      if (!/^[A-Za-z]:\\/.test(value)) continue
-      const converted = (await capture("wslpath", ["-u", value]))?.trim()
+    for (const candidate of candidates) {
+      if (!candidate) continue
+      const converted = /^[A-Za-z]:[\\/]/.test(candidate)
+        ? (await capture("wslpath", ["-u", candidate]))?.trim()
+        : candidate
       if (converted && path.isAbsolute(converted)) dirs.push(converted)
     }
     return dirs

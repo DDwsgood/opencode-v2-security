@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { connect, type Socket } from "node:net"
+import path from "node:path"
 import { createRuntimeBoundaryBroker, knownSafeRuntimeBoundary, parseRuntimeBoundary, runtimeWriteEffect, staticCrossingReview, type RuntimeBoundaryBroker, type RuntimeBoundaryEvent } from "../src/runtime-boundary"
+import { isRuntimeBrokerPath } from "../src/security/write-root-policy"
 
 const brokers: RuntimeBoundaryBroker[] = []
 const sockets: Socket[] = []
@@ -35,6 +37,18 @@ async function broker(onBoundary: Parameters<typeof createRuntimeBoundaryBroker>
 }
 
 describe("runtime boundary broker", () => {
+  test("only active broker directories are reserved, independently for each broker", async () => {
+    expect(isRuntimeBrokerPath("/tmp/opencode/security-boundary-unregistered/observer.sock")).toBe(false)
+    const first = await broker(async () => ({ action: "continue" }))
+    const second = await broker(async () => ({ action: "continue" }))
+    expect(isRuntimeBrokerPath(path.dirname(first.socketPath))).toBe(true)
+    expect(isRuntimeBrokerPath(first.socketPath)).toBe(true)
+    expect(isRuntimeBrokerPath(second.socketPath)).toBe(true)
+    expect(isRuntimeBrokerPath(`${path.dirname(first.socketPath)}-sibling/observer.sock`)).toBe(false)
+    await first.close()
+    expect(isRuntimeBrokerPath(first.socketPath)).toBe(false)
+    expect(isRuntimeBrokerPath(second.socketPath)).toBe(true)
+  })
   test("an idle or in-boundary process makes no approval call", async () => {
     let calls = 0
     const host = await broker(async () => { calls++; return { action: "allow" } })
@@ -79,15 +93,17 @@ describe("runtime boundary broker", () => {
     expect(result.reason).toContain("could not be completed")
   })
   test("terminal observer failures are distinct from an ordinary nonzero exit", async () => {
-    for (const failure of [undefined, "observer_registers"]) {
+    for (const failure of [undefined, "observer_registers", "observer_setup", "observer_cancelled"]) {
       const failures: string[] = []
       const host = await createRuntimeBoundaryBroker({ directory: "/tmp/opencode", onBoundary: async () => ({ action: "allow" }),
         onTerminalFailure: (code) => { failures.push(code) } })
       brokers.push(host)
       const socket = await open(host)
-      socket.end(JSON.stringify({ version: 1, type: "exit", token: host.token, exit: 126, failure }) + "\n")
+      const exit = failure === "observer_setup" ? 125 : 126
+      socket.end(JSON.stringify({ version: 1, type: "exit", token: host.token, exit, failure }) + "\n")
       const result = await host.finished
-      expect(result.exit).toBe(126)
+      expect(result.exit).toBe(exit)
+      expect(host.terminalExit).toBe(exit)
       expect(result.error).toBe(failure)
       expect(failures).toEqual(failure ? [failure] : [])
     }
@@ -184,9 +200,10 @@ describe("static stage of a runtime crossing (ALLOW or ASK only)", () => {
     const full = crossing({ details: { requiresFullApproval: true } })
     expect(await review(full, "ALLOW", { workspaceNetwork: "on" })).toEqual({ result: "ASK", consulted: 0 })
   })
-  test("configured workspace network and trusted Git remote reads need no command proof", async () => {
-    expect(await review(crossing({}), "ASK", { workspaceNetwork: "on" })).toEqual({ result: "ALLOW", consulted: 0 })
-    expect(await review(crossing({}), "ASK", { trustedGitReader: true, command: "git fetch origin" })).toEqual({ result: "ALLOW", consulted: 0 })
+  test("configured network and trusted Git readers cannot bypass an ASK command", async () => {
+    expect(await review(crossing({}), "ASK", { workspaceNetwork: "on" })).toEqual({ result: "ASK", consulted: 1 })
+    expect(await review(crossing({}), "ASK", { trustedGitReader: true, command: "git fetch origin" })).toEqual({ result: "ASK", consulted: 1 })
+    expect(await review(crossing({}), "ALLOW", { workspaceNetwork: "on" })).toEqual({ result: "ALLOW", consulted: 1 })
   })
   test("RO ignores network/Git shortcuts and consults the RO command proof", async () => {
     for (const kind of ["read", "network"] as const) {

@@ -14,7 +14,7 @@ import {
   slowCommandText,
 } from "../src/agent-messages"
 import type { RuntimeBoundaryEvent } from "../src/runtime-boundary"
-import type { EffectReviewResult } from "../src/security/effects-reviewer"
+import { EFFECTS_POLICY_VERSION, type EffectReviewResult } from "../src/security/effects-reviewer"
 
 test("runtimeBlockedText: reviewDenied uses Command blocked while default runtime stops use Command failed", () => {
   for (const atExit of [false, true, undefined]) {
@@ -96,20 +96,32 @@ test("isReviewerDenial and reviewRefusal distinguish confirmed denials from uncl
     gapReach: "no_blocking_gap",
     uncoveredOwner: "none",
     severity: {} as EffectReviewResult["severity"],
-    facts: {} as EffectReviewResult["facts"],
     answers: {},
-    policyVersion: "v10-8-pipeexec-user-auth-v3",
+    policyVersion: EFFECTS_POLICY_VERSION,
     source: "effect",
   } satisfies EffectReviewResult
 
   expect(isReviewerDenial(base)).toBe(true)
   expect(reviewRefusal(base).reason).toContain("risk category not determined: the command contains effects that are unsafe or unauthorized")
+  expect(reviewRefusal({ ...base, severity: { filesystem: 0.39 } as EffectReviewResult["severity"] }).reason).toContain("risk category not determined")
+  for (const probability of [0.4, 0.49, 0.8]) {
+    expect(reviewRefusal({ ...base, severity: { filesystem: probability } as EffectReviewResult["severity"] }).reason).toContain("local durable content")
+  }
+  expect(reviewRefusal({ ...base, severity: { filesystem: 0.4, secret: 0.49 } as EffectReviewResult["severity"] }).reason).toContain("multiple effect categories")
   const effectDenial = { ...base, floor: "unclear" as const }
   const refusal = reviewRefusal(effectDenial)
   expect(refusal.reason).toContain("effects that are unsafe or unauthorized")
   const notice = runtimeBlockedText(refusal.reason, { reviewDenied: isReviewerDenial(effectDenial), advice: RECHECK })
   expect(notice).toContain(NO_REROUTE)
   expect(notice).not.toContain("then retry")
+  for (const preflight of [
+    blockedText(refusal.reason, RECHECK, true),
+    actionBeforeText(refusal.reason, "native write", RECHECK, true),
+  ]) {
+    expect(preflight).toStartWith("[opencode-v2-security] Command blocked:")
+    expect(preflight).toContain(NO_REROUTE)
+    expect(preflight).not.toContain("then retry")
+  }
   expect(isReviewerDenial({ ...base, source: "evidence_limit" })).toBe(false)
   expect(isReviewerDenial({ ...base, decision: "collect_evidence", floor: "unclear", source: "evidence" })).toBe(false)
   expect(isReviewerDenial({ ...base, source: "readonly", answers: { readonly_conformance: { choice: "unclear" } } })).toBe(false)

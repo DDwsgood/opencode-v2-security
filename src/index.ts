@@ -133,6 +133,7 @@ import { createRootWidening, reviewRootWidening, L3_POLICY_VERSION, type L3Trace
 import { boundaryCoreDigest, observedNetworkEndpoint, type ApprovalCacheFacts, type ApprovalCacheScope, type ApprovalCacheTarget } from "./security/approval-cache"
 import { createRuntimeBoundaryBroker, currentCacheTargets, targetIdentitiesMatch, runtimeWriteEffect, staticCrossingReview, type RuntimeBoundaryBroker, type RuntimeBoundaryEvent } from "./runtime-boundary"
 import { inspectRegularTextFileSync, inspectionErrorCode } from "./security/inspection"
+import { scan } from "./security/shell-scan"
 import { createSingleFlight } from "./security/single-flight"
 import {
   accessErrorNote,
@@ -162,6 +163,111 @@ import { collectBoundedEvidence } from "./security/automatic"
 // Package root, derived from this module's own URL so relative paths (native
 // supervisor, auditor) resolve no matter where the plugin is installed from.
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
+
+const PROJECT_BUILD_WRAPPERS = new Set(["gradlew", "gradlew.bat", "gradlew.sh", "mvnw", "mvnw.cmd", "mvnw.sh", "ant", "ant.bat"])
+const SCRIPT_EXTENSION = /\.(?:sh|bash|zsh|py|js|mjs|cjs|ts|tsx|ps1|rb|pl|php)$/i
+const SECRET_ARG_NAME = /(?:API[_-]?KEY|ACCESS[_-]?KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE[_-]?KEY|AUTH)/i
+const SECRET_ARG_FLAG = /^(--(?:password|passwd|token|api[-_]?key|apikey|secret|client[-_]?secret|access[-_]?(?:key|token)|refresh[-_]?token|credentials?|private[-_]?key|auth[-_]?token))(?:=([\s\S]*))?$/i
+
+/** Keep targets, empty operands and shell bindings visible without literal credentials. */
+function redactBoundaryText(text: string, placeholder = "[redacted]"): string {
+  return text
+    .replace(/\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|xox[abp]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b/g, placeholder)
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/\s"']*@/gi, (_match, scheme: string) => `${scheme}${placeholder}@`)
+    .replace(/\b(authorization\s*:\s*(?:bearer|basic|token)\s+|(?:x-api-key|x-auth-token|api-key)\s*[:=]\s*)([^\s"']+)/gi,
+      (_match, prefix: string) => `${prefix}${placeholder}`)
+    .replace(/(--(?:password|passwd|token|api-key|apikey|secret|client-secret|access-token|refresh-token|credentials?|private-key|auth-token))(["']?)(=|\s+)("(?:\\.|[^"\\])*"|'[^']*'|[^\s"';&|)]+)/gi,
+      (match, flag: string, flagQuote: string, separator: string, literal: string) => {
+        const quote = /^["']/.test(literal) ? literal[0]! : ""
+        const value = quote ? literal.slice(1, -1) : literal
+        if (quote !== "'" && /^\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[^}]*\})$/.test(value)) return match
+        return `${flag}${flagQuote}${separator}${quote}${placeholder}${quote}`
+      })
+    .replace(/\b([A-Za-z_][A-Za-z0-9_]*)=("(?:\\.|[^"\\])*"|'[^']*'|[^\s"';&|)]+)/g,
+      (match, name: string, literal: string) => {
+        if (!SECRET_ARG_NAME.test(name)) return match
+        const quote = /^["']/.test(literal) ? literal[0]! : ""
+        const value = quote ? literal.slice(1, -1) : literal
+        if (quote !== "'" && /^\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[^}]*\})$/.test(value)) return match
+        return `${name}=${quote}${placeholder}${quote}`
+      })
+}
+
+/** Facts can embed JSON containing escaped command/excerpt strings. Redact the
+ * decoded values rather than corrupting quoting by replacing escaped text. */
+function redactReviewText(text: string): string {
+  const trimmed = text.trimStart()
+  const separator = text.indexOf(": ")
+  let start = separator >= 0 ? separator + 2 : 0
+  if (/^[{["]/.test(trimmed)) start = text.length - trimmed.length
+  const data = text.slice(start)
+  if (!/^[{["]/.test(data.trimStart())) return redactBoundaryText(text)
+  try {
+    const parsed: unknown = JSON.parse(data)
+    return text.slice(0, start) + JSON.stringify(parsed, (_key, value: unknown) =>
+      typeof value === "string" ? redactBoundaryText(value) : value)
+  } catch {
+    return redactBoundaryText(text)
+  }
+}
+
+function redactBoundaryArgv(argv: readonly unknown[]): string[] {
+  let redactNext = false
+  const executable = typeof argv[0] === "string" ? path.basename(argv[0]).toLowerCase().replace(/\.exe$/, "") : ""
+  return argv.map((argument) => {
+    const value = typeof argument === "string" ? argument : ""
+    if (redactNext) {
+      redactNext = false
+      return "[redacted]"
+    }
+    const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(value)
+    if (assignment && SECRET_ARG_NAME.test(assignment[1]!)) return `${assignment[1]}=[redacted]`
+    const flag = SECRET_ARG_FLAG.exec(value)
+    if (flag) {
+      if (flag[2] !== undefined) return `${flag[1]}=[redacted]`
+      redactNext = true
+      return value
+    }
+    redactNext = ["curl", "wget"].includes(executable) && ["--user", "-u"].includes(value)
+    const header = /^(authorization\s*:\s*(?:bearer|basic|token)\s+|(?:x-api-key|x-auth-token|api-key)\s*[:=]\s*)[\s\S]*$/i.exec(value)
+    if (header) return `${header[1]}[redacted]`
+    return redactBoundaryText(value, "[redacted]")
+  })
+}
+
+/** Discover executable operands, not arbitrary data-file arguments. */
+function localScriptSubjects(command: string, argv?: readonly unknown[]): string[] {
+  const parsed = scan(command)
+  const commands = parsed.kind === "scanned" ? parsed.commands.map((item) => item.words) : []
+  if (argv?.every((argument) => typeof argument === "string")) commands.push(argv as string[])
+  const subjects = new Set<string>()
+  for (const original of commands) {
+    const words = [...original]
+    while (words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]!) || ["sudo", "env", "nohup", "command", "exec", "setsid"].includes(path.basename(words[0]!)))) words.shift()
+    const executable = words.shift()
+    if (!executable) continue
+    const leaf = path.basename(executable).toLowerCase().replace(/\.exe$/, "")
+    if (PROJECT_BUILD_WRAPPERS.has(leaf)) continue
+    let subject: string | undefined
+    if (/^(?:python[\d.]*|node|bun|deno|pwsh|powershell|perl|ruby|php|bash|sh|zsh|dash|fish|ksh)$/.test(leaf)) {
+      for (let index = 0; index < words.length; index++) {
+        const word = words[index]!
+        if (["-c", "-e", "-E", "--eval", "-m", "-Command", "-EncodedCommand", "-CommandWithArgs"].includes(word)) break
+        if (["-W", "-X", "-r", "--require", "--loader", "--import", "--preload", "--cwd", "--config", "-o", "-O", "-ExecutionPolicy", "-WorkingDirectory"].includes(word)) {
+          index++
+          continue
+        }
+        if (word.startsWith("-") || ["run", "test"].includes(word) && ["bun", "deno"].includes(leaf)) continue
+        if (SCRIPT_EXTENSION.test(word) || word.includes("/")) subject = word
+        break
+      }
+    } else if (executable.includes("/") && !/^\/(?:usr\/)?(?:s?bin)\//.test(executable)) {
+      subject = executable
+    }
+    if (subject && !/[$`*?\[\]{}\n]/.test(subject) && !PROJECT_BUILD_WRAPPERS.has(path.basename(subject).toLowerCase())) subjects.add(subject)
+  }
+  return [...subjects]
+}
 
 function runtimeProtectedPaths(workspace: string): string[] {
   // A session opened in the plugin source may develop it; unrelated sessions
@@ -816,8 +922,8 @@ const plugin: Plugin = {
     yield* Effect.addFinalizer(() => Effect.sync(() => shared.unregisterLocationPolicy(instanceToken)))
 
     // --- append-only user-role state notices --------------------------------
-    // Durable notices accompany a real prompt. Mid-run notices are separate
-    // user messages in an already scheduled request, never tool output.
+    // Durable notices accompany a real prompt. Mode snapshots use separate
+    // user messages; queued background failures can also ride the next result.
     // The snapshot store is shared; only durable prompt admission marks delivery.
     const sessionNotices = createSessionStateNotices(
       (notice) => run(ctx.session.synthetic(notice)),
@@ -835,6 +941,8 @@ const plugin: Plugin = {
       yield* ctx.session.hook("context", (event) => Effect.sync(() => {
         const notice = sessionNotices.forModelContext(event.sessionID)
         if (notice) event.messages.push({ role: "user", content: [{ type: "text", text: notice }] })
+        const background = sessionNotices.backgroundForModelContext(event.sessionID)
+        if (background) event.messages.push({ role: "user", content: [{ type: "text", text: background }] })
       }))
     }
 
@@ -1826,16 +1934,16 @@ const plugin: Plugin = {
     // final outcome are separate events, NOT separate JEV calls. Appended to
     // ~/.opencode/reviewer-trace.jsonl. Fire-and-forget — a logging failure
     // must never alter the review outcome or block a command.
-    // Failure passes always have an audit sink. With verbose tracing disabled,
-    // keep this minimal code-only trace in the configured scratch directory.
+    // Failure passes and late background stops always have an audit sink.
+    // Without verbose tracing, retain only their minimal code/notice records.
     const reviewerTraceFile = resolved.logReviewerTrace
       ? path.join(homedir(), ".opencode", "reviewer-trace.jsonl")
       : path.join(resolved.sandbox.scratch, "reviewer-trace.jsonl")
     function writeReviewerTrace(entry: Record<string, unknown>) {
-      if (!resolved.logReviewerTrace && entry.kind !== "fail_open_pass") return
+      if (!resolved.logReviewerTrace && entry.kind !== "fail_open_pass" && entry.kind !== "effects_background_blocked") return Promise.resolve()
       const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n"
-      void mkdir(path.dirname(reviewerTraceFile), { recursive: true })
-        .then(() => appendFile(reviewerTraceFile, line, "utf8"))
+      return mkdir(path.dirname(reviewerTraceFile), { recursive: true })
+        .then(() => appendFile(reviewerTraceFile, line, { encoding: "utf8", mode: 0o600 }))
         .catch(() => {})
     }
 
@@ -1988,20 +2096,16 @@ const plugin: Plugin = {
       })
     }
 
-    /** Digest-only audit context for the effects-review trace events. Never
-     *  carries the command text, user_request, custom bypass scopes, file
-     *  contents, provider error bodies, or credentials — the trace is a
-     *  user-readable verdict log, not a payload dump. */
+    /** Plaintext audit context for the opt-in reviewer trace. Cache keys and
+     *  security snapshots remain hashed independently of this log. */
     type BoundaryReviewAudit = {
       sessionID: string
       callID: string
-      commandSha256: string
+      command: string
       tool: NativeBoundaryTool
       staticRules: readonly string[]
       eventID?: number
-      /** Non-sensitive crossing shape so review volume can be attributed
-       *  without replaying commands: no argv, paths or command text. */
-      boundary?: { kind: string; syscall: string; operation: string; executable?: string }
+      boundary?: Pick<RuntimeBoundaryEvent, "kind" | "syscall" | "operation" | "targets" | "details">
       stats?: BoundaryAuthorization["runtimeStats"]
     }
 
@@ -2012,6 +2116,8 @@ const plugin: Plugin = {
       worktree: string,
       audit: BoundaryReviewAudit,
       readonly = false,
+      argv?: readonly unknown[],
+      processCwd = request.cwd,
     ): Promise<EffectReviewResult> {
       const policyVersion = readonly ? EFFECTS_POLICY_VERSION_READONLY : EFFECTS_POLICY_VERSION
       let round = 0
@@ -2022,22 +2128,28 @@ const plugin: Plugin = {
           kind: "effects_review_request",
           sessionID: audit.sessionID,
           callID: audit.callID,
-          commandSha256: audit.commandSha256,
+          command: audit.command,
           tool: audit.tool,
           staticRules: audit.staticRules,
           reviewer: injectedEffectsReview ? "test_injection" : "jev",
           ...(audit.eventID !== undefined ? { eventID: audit.eventID, phase: "runtime" } : { phase: "native_preflight" }),
           ...(audit.boundary ? { boundary: audit.boundary } : {}),
+          request: { cwd: payload.cwd, files: payload.files, sandbox: payload.sandbox },
           round,
           policyVersion,
         })
         try {
-          const verdict = await callEffectsReviewer(payload, signal, readonly)
+          const reviewPayload: EffectReviewRequest = {
+            ...payload,
+            command: redactReviewText(payload.command),
+            input_facts: payload.input_facts.map(redactReviewText),
+          }
+          const verdict = await callEffectsReviewer(reviewPayload, signal, readonly)
           writeReviewerTrace({
             kind: "effects_review_result",
             sessionID: audit.sessionID,
             callID: audit.callID,
-            commandSha256: audit.commandSha256,
+            command: audit.command,
             reviewer: injectedEffectsReview ? "test_injection" : "jev",
             ...(audit.eventID !== undefined ? { eventID: audit.eventID } : {}),
             round,
@@ -2045,6 +2157,7 @@ const plugin: Plugin = {
             source: verdict.source,
             floor: verdict.floor,
             uncoveredOwner: verdict.uncoveredOwner,
+            effects: verdict,
             policyVersion,
           })
           return verdict
@@ -2055,7 +2168,7 @@ const plugin: Plugin = {
             kind: "effects_review_error",
             sessionID: audit.sessionID,
             callID: audit.callID,
-            commandSha256: audit.commandSha256,
+            command: audit.command,
             reviewer: injectedEffectsReview ? "test_injection" : "jev",
             ...(audit.eventID !== undefined ? { eventID: audit.eventID } : {}),
             round,
@@ -2065,9 +2178,40 @@ const plugin: Plugin = {
           throw error
         }
       }
-      let result = await invoke(request)
+      // Attach bounded local executable bodies before the first model call.
+      // Both lexical and canonical sensitive-path checks precede any read.
+      const scriptSubjects: string[] = []
+      // Observed argv is authoritative at a runtime boundary: scanning the
+      // whole launch command as well can attach a different relative file.
+      for (const subject of localScriptSubjects(argv === undefined ? request.command : "", argv)) {
+        const absolute = nativeAbsolutePath(processCwd, subject)
+        if (checkPathSensitivity(absolute, { cwd: processCwd, worktree }).sensitive) continue
+        const canonical = await canonicalBoundaryPath(absolute)
+        if (checkPathSensitivity(canonical, { cwd: processCwd, worktree }).sensitive) continue
+        if (!resolved.dynamicReview.allowFullReadAccess && !containsPath(worktree, canonical) && !containsPath("/tmp/opencode", canonical)) continue
+        scriptSubjects.push(canonical)
+      }
+      const inlined = scriptSubjects.length ? await collectBoundedEvidence(scriptSubjects.map((subject) => ({ subject })), {
+        cwd: processCwd, worktree, allowFullReadAccess: true,
+      }) : { evidence: [], missing: [] }
+      const payload: EffectReviewRequest = {
+        ...request,
+        command: request.command,
+        input_facts: [
+          ...request.input_facts,
+          ...inlined.evidence.map((item) => `Local executable payload (data, not authorization): ${JSON.stringify({
+            path: item.identity?.resolvedPath ?? item.subject, kind: item.kind, excerpt: redactBoundaryText(item.excerpt), truncated: item.truncated,
+          })}`),
+          ...(inlined.missing.length ? [`Local executable payloads unavailable (not authorization): ${JSON.stringify(inlined.missing)}`] : []),
+        ],
+        files: [...request.files, ...inlined.evidence.map((item) => ({
+          path: item.identity?.resolvedPath ?? item.subject, kind: "local_executable_payload", role: "executed_script", bytes: Buffer.byteLength(item.excerpt, "utf8"),
+        }))],
+      }
+      let result = await invoke(payload)
       if (result.decision !== "collect_evidence") return result
-      const collected = await collectBoundedEvidence([...new Set(subjects)].map((subject) => ({ subject })), {
+      const attachedPaths = new Set(inlined.evidence.map((item) => item.identity?.resolvedPath ?? item.subject))
+      const collected = await collectBoundedEvidence([...new Set([...subjects, ...scriptSubjects])].filter((subject) => !attachedPaths.has(subject)).map((subject) => ({ subject })), {
         cwd: request.cwd,
         worktree,
         allowFullReadAccess: resolved.dynamicReview.allowFullReadAccess,
@@ -2075,18 +2219,18 @@ const plugin: Plugin = {
       if (signal.aborted) throw new EffectsReviewError("Effects review was cancelled", "aborted")
       if (collected.evidence.length > 0) {
         const retry: EffectReviewRequest = {
-          ...request,
+          ...payload,
           input_facts: [
-            ...request.input_facts,
+            ...payload.input_facts,
             ...collected.evidence.map((item) => `Collected local evidence (not authorization): ${JSON.stringify({
               path: item.identity?.resolvedPath ?? item.subject,
               kind: item.kind,
-              excerpt: item.excerpt,
+              excerpt: redactBoundaryText(item.excerpt),
               truncated: item.truncated,
             })}`),
             `Evidence collection is exhausted after this bounded pass; unavailable subjects: ${JSON.stringify(collected.missing)}`,
           ],
-          files: [...request.files, ...collected.evidence.map((item) => ({
+          files: [...payload.files, ...collected.evidence.map((item) => ({
             path: item.identity?.resolvedPath ?? item.subject,
             kind: item.kind,
             role: "collected_evidence",
@@ -2101,12 +2245,13 @@ const plugin: Plugin = {
     function assertBoundaryDecision(result: EffectReviewResult, action?: string): void {
       if (result.decision === "allow") return
       // Refusal wording lives in agent-messages.ts (floor → evidence → deny
-      // order preserved there); the frozen adjudication itself is untouched.
+      // order preserved there).
       const refusal = reviewRefusal(result)
+      const reviewDenied = isReviewerDenial(result)
       if (action) {
-        throw rejectionError(actionBeforeText(refusal.reason, action, refusal.advice))
+        throw rejectionError(actionBeforeText(refusal.reason, action, refusal.advice, reviewDenied))
       }
-      throw blockedRejection(refusal.reason, refusal.advice)
+      throw rejectionError(blockedText(refusal.reason, refusal.advice, reviewDenied))
     }
 
     /** `tempOnly`: every write of this native file call lands in a ReadOnly
@@ -2195,7 +2340,7 @@ const plugin: Plugin = {
             policy: writePolicy(), workspace: cwd, currentRoots: currentWriteRoots(retained.scope),
             context: () => rootWideningContext(call.sessionID) })
         }).catch(() => {
-          writeReviewerTrace({ kind: "l3_root_error", sessionID: call.sessionID, commandSha256: digest(command), policyVersion: L3_POLICY_VERSION })
+          writeReviewerTrace({ kind: "l3_root_error", sessionID: call.sessionID, command, policyVersion: L3_POLICY_VERSION })
         })
       }
       let eventPhase: "entry" | "exit" | "unknown" = "unknown"
@@ -2233,7 +2378,6 @@ const plugin: Plugin = {
         return {
           action: "deny" as const,
           reason: authorization.runtimeBlocked,
-          message: runtimeBlockedText(authorization.runtimeBlocked, authorization.runtimeBlockDetails),
         }
       }
       const failure = (code: string, event?: RuntimeBoundaryEvent) => {
@@ -2259,7 +2403,10 @@ const plugin: Plugin = {
         onError: () => { failure("broker_unavailable") },
         onFailure: (code) => { failure(code) },
         // The observer has already stopped: fail-open cannot revive this run.
-        onTerminalFailure: (code) => { recordBlock(checkUnavailableReason(code), undefined, RETRY_LATER) },
+        onTerminalFailure: (code) => {
+          if (code === "observer_cancelled") recordBlock("Cancellation: the call was cancelled", undefined, CANCEL_ADVICE, true)
+          else recordBlock(checkUnavailableReason(code), undefined, RETRY_LATER)
+        },
         onCancelFailure: () => authorization.cancelExecution?.(),
         onBoundary: async (event: RuntimeBoundaryEvent, signal) => {
           const blocked = (reason: string, advice?: string, reviewDenied = false) => recordBlock(reason, event, advice, false, reviewDenied)
@@ -2293,7 +2440,7 @@ const plugin: Plugin = {
               const retained = await rootWideningContext(call.sessionID)
               if (rootWidening.targetsExempt(retained.scope, event.targets.map((target) => target.path), writePolicy())) return { action: "continue" }
             } catch {
-              writeReviewerTrace({ kind: "l3_root_error", sessionID: call.sessionID, commandSha256: digest(command), policyVersion: L3_POLICY_VERSION })
+              writeReviewerTrace({ kind: "l3_root_error", sessionID: call.sessionID, command, policyVersion: L3_POLICY_VERSION })
             }
           }
           // Read-only hard denies: a non-exempt write or a privilege
@@ -2325,9 +2472,7 @@ const plugin: Plugin = {
           const executableIdentity = executableInfo
             ? `${executableInfo.dev}:${executableInfo.ino}:${executableInfo.size}:${executableInfo.mtimeNs}`
             : undefined
-          // argv can carry real secrets (passwords as flags are idiomatic):
-          // the reviewer and every trace/log sees only its digest, count and
-          // completeness — never the raw strings.
+          // Cache identity binds raw argv; the reviewer receives a redacted view.
           const rawArgv = event.details.argv
           const argvDigest = Array.isArray(rawArgv)
             ? digest(JSON.stringify(rawArgv.map((arg) => typeof arg === "string" ? arg : "")))
@@ -2336,10 +2481,10 @@ const plugin: Plugin = {
           const eventDetails = {
             ...event.details,
             ...(argvDigest !== undefined
-              ? { argvDigest, argc: (rawArgv as unknown[]).length }
+              ? { argv: redactBoundaryArgv(rawArgv as unknown[]), argc: (rawArgv as unknown[]).length }
               : {}),
           } as RuntimeBoundaryEvent["details"]
-          delete eventDetails.argv
+          delete eventDetails.argvDigest
           const trustedGitReader = executable !== undefined && ["git", "git-remote-http", "git-remote-https"].includes(path.basename(executable)) &&
             executableInfo?.isFile() === true && executableInfo.uid === 0 && (executableInfo.mode & 0o022) === 0
           // Stage 2 of observe → static → dynamic: ALLOW or ASK only. In a
@@ -2356,9 +2501,9 @@ const plugin: Plugin = {
             authorization.runtimeStats!.staticAllows++
             authorization.source = "runtime_static_allow"
             writeReviewerTrace({ kind: "effects_static_allow", sessionID: call.sessionID, callID: call.id,
-              commandSha256: digest(command), eventID: event.eventID,
+              command, eventID: event.eventID,
               boundary: { kind: event.kind, syscall: event.syscall, operation: event.operation,
-                ...(executable ? { executable: path.basename(executable) } : {}) } })
+                targets: event.targets, details: event.details } })
             return { action: "continue" }
           }
           if (!ctx.session.context) return failed("session_context")
@@ -2368,37 +2513,40 @@ const plugin: Plugin = {
           if (observed.some((target) => target.inspectionError) && resolved.failPolicy === "fail_open") {
             return failed("target_inspection")
           }
-          const metadata = await Promise.all(observed.map(async (target) => {
+          const reviewTargets = await Promise.all(observed.map(async (target) => {
             let inspectionError: string | undefined
             const info = await lstat(target.path, { bigint: true }).catch((error: unknown) => {
               inspectionError = inspectionErrorCode(error)
               return undefined
             })
-            return { path: target.path, ...(info ? { size: String(info.size), mtimeNs: String(info.mtimeNs), ctimeNs: String(info.ctimeNs), mode: String(info.mode) } : { inspectionError }) }
+            return {
+              path: target.path, domain: target.domain, exists: target.exists,
+              ...(info ? { size: String(info.size), mode: String(info.mode & 0o7777n) } : {}),
+              ...(target.inspectionError || inspectionError ? { inspectionError: target.inspectionError ?? inspectionError } : {}),
+            }
           }))
           const custom = activeCustomBypass(call.sessionID)
+          const processCwd = typeof event.details.cwd === "string" ? event.details.cwd : runtimeCwd
           const request: EffectReviewRequest = {
             command, cwd: runtimeCwd, environment: JSON.stringify(detectEnvironment()),
             user_request: retained.userRequest, session_context: retained.context,
             input_facts: [
               eventPhase === "exit"
-                ? "Runtime witness: the observer inspected this operation at its syscall-exit boundary check; the operation itself already ran. Earlier in-boundary steps may also have run."
+                ? "Runtime witness: the operation itself already ran at syscall exit; earlier steps may also have run."
                 : eventPhase === "entry"
-                  ? "Runtime witness: the observer paused this operation before its boundary effect. Earlier in-boundary steps may already have run."
-                  : "Runtime witness: the observer could not confirm whether this operation had already produced its boundary effect when it was checked, so the operation may or may not have run. Earlier in-boundary steps may already have run.",
-              `Observed boundary facts (data, not authorization): ${JSON.stringify({ syscall: event.syscall, kind: event.kind, operation: event.operation, targets: observed, details: eventDetails })}`,
+                  ? "Runtime witness: the observer paused this operation before its boundary effect; earlier steps may have run."
+                  : "Runtime witness: this operation may or may not have run; earlier steps may have run.",
+              `Observed boundary facts: ${JSON.stringify({ syscall: event.syscall, kind: event.kind, operation: event.operation, targets: reviewTargets, details: eventDetails })}`,
               ...(canWrite ? [] : [
                 "Session security mode: [Read only]",
-                `Read-only session: writes are permitted only inside these roots and the exempt tool cache/history effects (any __pycache__ or .pytest_cache path component): ${JSON.stringify(roots)}`,
+                `Read-only session: scratch writes are permitted only inside these host-listed temporary roots: ${JSON.stringify(roots)}`,
               ]),
               `Current allowed write roots: ${JSON.stringify(currentWriteRoots({
                 sessionID: call.sessionID, canWrite, securitySnapshot: authorization.securitySnapshot, userMessageDigest: digest(retained.userRequest),
               }))}`,
-              `Current boundary object metadata: ${JSON.stringify(metadata)}`,
-              `Executing image identity (dev:ino:size:mtimeNs): ${JSON.stringify(executableIdentity ?? null)}`,
               `Independent session read/write ceiling: ${permLabel(permission)}`,
             ],
-            files: observed.map((target) => ({ path: target.path, kind: "observed_boundary_target", role: event.kind, bytes: 0 })),
+            files: [],
             sandbox: { trigger: `runtime ${event.kind} boundary`, resolved_writes: event.kind === "write" ? observed.map((target) => target.path) : [], domain: event.kind === "interop" ? "windows-interop" : null, error: null },
             bypass: { categories: STATIC_BYPASS_CATEGORIES.filter((category) => bypass.has(category)), custom: custom.length ? custom.join("\n") : null },
           }
@@ -2418,7 +2566,7 @@ const plugin: Plugin = {
               targets: observed, executable, executableIdentity,
               network: event.kind === "network" ? event.details : undefined,
               argv: Array.isArray(rawArgv) ? rawArgv : undefined, argvDigest,
-              cwd: runtimeCwd, policyVersion: reviewPolicyVersion,
+              cwd: processCwd, policyVersion: reviewPolicyVersion,
               bypassCategories: request.bypass.categories, customBypass: custom,
               requiresFullApproval,
             }),
@@ -2450,7 +2598,7 @@ const plugin: Plugin = {
             }
             authorization.source = `cache:${hit.layer}`
             writeReviewerTrace({ kind: "effects_cache_hit", sessionID: call.sessionID, callID: call.id,
-              commandSha256: digest(command), eventID: event.eventID, layer: hit.layer, decision: hit.decision })
+              command, eventID: event.eventID, layer: hit.layer, decision: hit.decision })
             if (hit.layer === "L2" || !event.details.requiresFullApproval) {
               rememberAllowedWrite(event)
               authorization.cacheUpdates ??= []
@@ -2462,20 +2610,21 @@ const plugin: Plugin = {
             try {
               result = await sharedReviews.run(digest(JSON.stringify([scope, facts.coreDigest])), signal,
                 (sharedSignal) => reviewBoundaryRequest(request, observed.map((target) => target.path), sharedSignal, cwd, {
-                  sessionID: call.sessionID, callID: call.id, commandSha256: digest(command), tool: "shell",
+                  sessionID: call.sessionID, callID: call.id, command, tool: "shell",
                   staticRules: commandProofRules(), eventID: event.eventID,
                   boundary: { kind: event.kind, syscall: event.syscall, operation: event.operation,
-                    ...(executable ? { executable: path.basename(executable) } : {}) },
+                    targets: observed, details: event.details },
                   stats: authorization.runtimeStats,
-                }, !canWrite))
+                }, !canWrite, Array.isArray(rawArgv) ? rawArgv : undefined, processCwd))
             } catch (error) {
               if (preparationSignal.aborted) return recordBlock("Cancellation: the call was cancelled", undefined, CANCEL_ADVICE, true)
               if (error instanceof EffectsReviewError && error.kind === "aborted" && !signal.aborted) return recordBlock("Cancellation: the call was cancelled", undefined, CANCEL_ADVICE, true)
               return failed(error instanceof EffectsReviewError ? `review_${error.kind}` : "review_unavailable")
             }
             writeReviewerTrace({ kind: "effects_boundary_outcome", sessionID: call.sessionID, callID: call.id,
-              commandSha256: digest(command), eventID: event.eventID, decision: result.decision, source: result.source,
-              floor: result.floor, uncoveredOwner: result.uncoveredOwner, reviewer: injectedEffectsReview ? "test_injection" : "jev", policyVersion: reviewPolicyVersion })
+              command, eventID: event.eventID, decision: result.decision, source: result.source,
+              floor: result.floor, uncoveredOwner: result.uncoveredOwner, effects: result,
+              reviewer: injectedEffectsReview ? "test_injection" : "jev", policyVersion: reviewPolicyVersion })
           }
           // A completed deny remains final even if subsequent cache or
           // identity bookkeeping fails.
@@ -2797,7 +2946,7 @@ const plugin: Plugin = {
         const audit: BoundaryReviewAudit = {
           sessionID: call.sessionID,
           callID: call.id,
-          commandSha256: createHash("sha256").update(operation).digest("hex"),
+          command: operation,
           tool,
           staticRules: [],
         }
@@ -2837,7 +2986,7 @@ const plugin: Plugin = {
           if (cacheHit) {
             result = cacheHit.result!
             writeReviewerTrace({ kind: "effects_cache_hit", sessionID: call.sessionID, callID: call.id,
-              commandSha256: audit.commandSha256, layer: cacheHit.layer, decision: cacheHit.decision })
+              command: audit.command, layer: cacheHit.layer, decision: cacheHit.decision })
           } else {
             result = await sharedReviews.run(digest(JSON.stringify([cacheScope, cacheFacts.coreDigest])), signal,
               (sharedSignal) => reviewBoundaryRequest(request, subjects, sharedSignal, cwd, audit, readOnly))
@@ -2849,6 +2998,19 @@ const plugin: Plugin = {
           }
           throw new EffectsReviewError(reviewUnavailableReason(source), source)
         }
+        writeReviewerTrace({
+          kind: "effects_boundary_outcome",
+          sessionID: call.sessionID,
+          callID: call.id,
+          command: audit.command,
+          reviewer: cacheHit ? "approval_cache" : injectedEffectsReview ? "test_injection" : "jev",
+          decision: result.decision,
+          source: result.source,
+          floor: result.floor,
+          uncoveredOwner: result.uncoveredOwner,
+          effects: result,
+          policyVersion: fileReviewPolicyVersion,
+        })
         if (result.decision !== "allow") {
           try { if (!cacheHit) approvalCache.store(cacheScope, cacheFacts, result) } catch {
             passFailure("cache_store", call, authorization)
@@ -2864,18 +3026,6 @@ const plugin: Plugin = {
         }
         await verifyFileBoundaryPlan(filePlan)
         if (!cacheHit) approvalCache.store(cacheScope, cacheFacts, result)
-        writeReviewerTrace({
-          kind: "effects_boundary_outcome",
-          sessionID: call.sessionID,
-          callID: call.id,
-          commandSha256: audit.commandSha256,
-          reviewer: cacheHit ? "approval_cache" : injectedEffectsReview ? "test_injection" : "jev",
-          decision: result.decision,
-          source: result.source,
-          floor: result.floor,
-          uncoveredOwner: result.uncoveredOwner,
-          policyVersion: fileReviewPolicyVersion,
-        })
         assertBoundaryDecision(result, nativeActionTrigger(tool, filePlan))
         authorization.source = cacheHit ? `cache:${cacheHit.layer}` : result.source
         authorization.cacheUpdates = [{ scope: cacheScope, facts: cacheFacts }]
@@ -3078,6 +3228,25 @@ const plugin: Plugin = {
                   // A completed Promise also handles very short jobs whose
                   // terminal notification preceded this background result.
                   void prepared.authorization.runtimeBroker?.finished.then(async ({ exit }) => {
+                    if (prepared.authorization.runtimeBlocked) {
+                      const reason = prepared.authorization.runtimeBlocked
+                      const details = prepared.authorization.runtimeBlockDetails
+                      const notice = reason.startsWith("[opencode-v2-security]") ? reason : runtimeBlockedText(reason, details)
+                      // Session deletion removes its home registration; a late
+                      // completion must not revive notifications for it.
+                      if (shared.sessionLocations.has(prepared.authorization.sessionID)) {
+                        sessionNotices.recordBackgroundBlock(prepared.authorization.sessionID, notice)
+                      }
+                      await writeReviewerTrace({
+                        kind: "effects_background_blocked", sessionID: call.sessionID, callID: call.id,
+                        ...(resolved.logReviewerTrace ? { command: (input as { command: string }).command } : {}),
+                        exit, reason,
+                        notice,
+                        reviewDenied: details?.reviewDenied === true,
+                        cancelled: details?.cancelled === true,
+                        policyVersion: EFFECTS_POLICY_VERSION,
+                      })
+                    }
                     await recordCallCacheOutcome(prepared.authorization, exit).catch(() => { passFailure("cache_outcome", call, prepared.authorization) })
                     if (boundaryCalls.get(key)?.token === token) boundaryCalls.delete(key)
                     await prepared.authorization.runtimeBroker?.close()
@@ -3095,9 +3264,11 @@ const plugin: Plugin = {
                     ? prepared.authorization.runtimeBlocked
                     : runtimeBlockedText(prepared.authorization.runtimeBlocked, prepared.authorization.runtimeBlockDetails)
                 }
+                // Setup failures normally arrive over the broker's terminal
+                // frame. Exit 125 also covers failure before it can connect;
+                // a payload's own exit 125 has an ordinary terminal frame.
                 const observerSetupError = !runtimeRefusal && prepared.authorization.executionRoute === "runtime_boundary_watch" &&
-                  output?.exit === 125 && typeof output.output === "string" &&
-                  output.output.startsWith("[opencode-v2-security] Command failed: runtime observer error:")
+                  output?.exit === 125 && prepared.authorization.runtimeBroker?.terminalExit === undefined
                 const accessError = !runtimeRefusal && name === "shell" && output && output.exit !== 0 &&
                   typeof output.output === "string" && !output.output.includes("The whole command was not run.") &&
                   /permission denied|read-only file system|device or resource busy|cross-device link|\bEACCES\b|\bEPERM\b|sudo:|bwrap:|opencode-sandbox:/i.test(output.output)
@@ -3164,6 +3335,11 @@ const plugin: Plugin = {
     // execute.after failure channel is `never`: any exception is swallowed so a
     // post-check error never fails the tool step.
     async function runAfter(ev: ExecuteAfterEvent): Promise<void> {
+      if (ev.status === "completed" && ev.result && sessionNotices.backgroundForModelContext(ev.sessionID)) {
+        const content = toolResultContent(ev.result)
+        const notice = sessionNotices.takeBackgroundForToolResult(ev.sessionID)
+        if (notice) ev.result.content = [{ type: "text", text: notice }, ...content]
+      }
       // Only the tool result identifies a spawn's child authoritatively.
       if (ev.tool === "subagent") {
         const stash = permStash.get(ev.id)

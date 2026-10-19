@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto"
 import { opendir } from "node:fs/promises"
 import { isIP } from "node:net"
 import path from "node:path"
@@ -220,7 +219,7 @@ export interface L3Trace {
   policyVersion: typeof L3_POLICY_VERSION
   repeatedDirectory?: string
   root?: string
-  commandSha256?: string
+  command?: string
   reason?: string
 }
 
@@ -292,7 +291,7 @@ export function createRootWidening(options: {
     context: () => Promise<RootWideningContext>
   }): Promise<void> {
     const audit = { sessionID: input.scope.sessionID, repeatedDirectory: key,
-      commandSha256: createHash("sha256").update(repetition.events.at(-1)!.event.command).digest("hex") }
+      command: repetition.events.at(-1)!.event.command }
     try {
       const events = repetition.events.slice(-3).map(({ event }) => event)
       const candidates = await rootWideningCandidates(key, input.policy, input.workspace, input.currentRoots)

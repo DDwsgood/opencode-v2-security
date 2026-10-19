@@ -15,9 +15,10 @@
 //   - disposing an instance removes its change listener;
 //   - a reloaded instance (location re-boot) sees the existing state.
 
-import { afterAll, describe, expect, mock, setSystemTime, test } from "bun:test"
+import { afterAll, beforeAll, describe, expect, mock, setSystemTime, spyOn, test } from "bun:test"
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
+import * as os from "node:os"
 import { Effect, Scope, Stream } from "effect"
 import { cleanupTestArtifacts } from "./artifacts"
 
@@ -37,17 +38,29 @@ const { default: plugin } = await import("../src/index")
 const { getSharedSecurityState, resetSharedSecurityStateForTests } = await import("../src/security/shared-state")
 const { adjudicateEffectAnswers } = await import("../src/security/effects-reviewer")
 import type { EffectReviewRequest } from "../src/security/effects-reviewer"
-const frozen = (await import("../src/security/v10-8-pipeexec.json")).default
+const frozen = (await import("../src/security/v11-gold-prompt.json")).default
 
 const root = await mkdtemp("/tmp/opencode/shared-state-")
 const workspace = path.join(root, "workspace")
 const outside = path.join(root, "outside")
 const scratch = path.join(root, "scratch")
-await Promise.all([mkdir(workspace), mkdir(outside), mkdir(scratch)])
+const home = path.join(root, "home")
+await Promise.all([mkdir(workspace), mkdir(outside), mkdir(scratch), mkdir(home)])
+const oldHome = process.env.HOME
+const systemHome = os.homedir()
+let homeSpy: { mockRestore(): void }
+beforeAll(() => {
+  // Roots covering HOME are not automatic temp grants, keeping outside writes reviewable.
+  process.env.HOME = home
+  homeSpy = spyOn(os, "homedir").mockImplementation(() => process.env.HOME ?? systemHome)
+})
 
 const scopes: Scope.Closeable[] = []
 afterAll(async () => {
   for (const scope of scopes) await Effect.runPromise(Scope.close(scope, undefined as never)).catch(() => {})
+  homeSpy.mockRestore()
+  if (oldHome === undefined) delete process.env.HOME
+  else process.env.HOME = oldHome
   await cleanupTestArtifacts(root, { recursive: true, force: true })
 })
 

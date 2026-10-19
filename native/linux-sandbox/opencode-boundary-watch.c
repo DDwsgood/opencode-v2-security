@@ -59,10 +59,8 @@
  *     SIGTERM/INT/HUP arm a flag checked in every wait loop and take the
  *     same teardown path (SIGKILL is uncatchable and remains a stated
  *     limitation: the payload survives us then).
- *   Block messages use the broker's rendered notice when available, including
- *   the observed trigger and refusal source for background jobs. Runtime
- *   denials report "The command was stopped."; cancellation without a broker
- *   notice has a separate cancellation message and signal-style exit code.
+ *   Refusal notices belong exclusively to the host's Tool.Error. The helper
+ *   never writes interception messages to the payload's stdout/stderr.
  *
  *   helper -> broker (terminal, no reply expected):
  *     {"version":1,"type":"exit","token":"...","exit":<0..255>}
@@ -137,7 +135,6 @@
 #include <poll.h>
 #include <sched.h>
 #include <signal.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -279,7 +276,30 @@ static pid_t g_root_pid;
 static int g_fail_open;
 static char *const *g_payload_argv;
 static int g_broker_fd = -1;
+static const char *g_failure_code; /* trusted source of an observer-terminated run */
 static void setup_fail_open(void);
+static void broker_send_exit(int code);
+
+/* Setup can fail before the normal post-seizure connection. Use the same
+ * authenticated control channel to report that failure, never payload stdio. */
+static int connect_broker(void)
+{
+    if (g_broker_fd >= 0) return 0;
+    if (!g_broker_path) return -1;
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    if (strlen(g_broker_path) >= sizeof(address.sun_path)) return -1;
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", g_broker_path);
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        close(fd);
+        return -1;
+    }
+    g_broker_fd = fd;
+    return 0;
+}
 /* Set by the host's normal signals (TERM/INT/HUP). Checked in every wait
  * loop so a cancel tears down the WHOLE payload tree — traced, detached,
  * and orphaned — instead of letting detached survivors outlive us. */
@@ -291,12 +311,11 @@ static void die(const char *fmt, ...)
     if (g_fail_open && g_payload_argv && !g_term_signal)
         setup_fail_open();
     if (g_root_pid > 0) kill(g_root_pid, SIGKILL);
-    va_list ap;
-    va_start(ap, fmt);
-    fprintf(stderr, "[opencode-v2-security] Command failed: runtime observer error: ");
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, ". Restore the runtime observer, recheck authorization and any partial effects, then retry if still authorized.\n");
-    va_end(ap);
+    /* Raw setup details may contain sensitive paths; only a fixed code goes
+     * to the broker. Exit 125 remains the fallback if IPC itself is broken. */
+    (void)fmt;
+    g_failure_code = "observer_setup";
+    if (connect_broker() == 0) broker_send_exit(125);
     exit(125);
 }
 
@@ -1011,39 +1030,8 @@ static int proc_check(const char *path, pid_t *pid_out)
 /* ------------------------------------------------------------------ */
 
 static unsigned long g_event_id;
-static char g_deny_reason[240]; /* broker 'reason' carried to the kill text */
-static char g_deny_message[4096]; /* full agent notice, including the trigger */
-static const char *g_failure_code; /* trusted source of an observer-terminated run */
+static int g_explicit_deny;
 static int g_at_exit_stop;      /* decision made at a syscall-EXIT check */
-
-/* The broker renders this field; decode its JSON escaping without allowing
- * terminal controls. A missing/oversized notice never changes a deny verdict. */
-static void read_deny_message(const char *line)
-{
-    const char *value = strstr(line, "\"message\"");
-    if (!value || !(value = strchr(value, ':'))) return;
-    value++;
-    while (*value == ' ' || *value == '\t') value++;
-    if (*value++ != '"') return;
-    char message[sizeof(g_deny_message)];
-    size_t length = 0;
-    while (*value && *value != '"') {
-        unsigned char character = (unsigned char)*value++;
-        if (character == '\\') {
-            character = (unsigned char)*value++;
-            if (character == 'n') character = '\n';
-            else if (character == 'r' || character == 't') character = ' ';
-            else if (character != '"' && character != '\\' && character != '/') return;
-        }
-        if (length + 1 >= sizeof(message)) return;
-        if (character < 0x20 && character != '\n') character = ' ';
-        if (character == 0x7f) character = ' ';
-        message[length++] = (char)character;
-    }
-    if (*value != '"') return;
-    message[length] = 0;
-    memcpy(g_deny_message, message, length + 1);
-}
 
 static void json_escape(const char *in, char *out, size_t cap)
 {
@@ -1299,26 +1287,7 @@ static int broker_decide_argv(Tracee *t, const char *syscall, const char *kind,
     }
     if (strcmp(action, "allow") == 0) return 1;
     if (strcmp(action, "deny") == 0) {
-        read_deny_message(line);
-        /* Carry the broker's reason into the block message when present —
-         * bounded and flattened (no quotes/newlines/controls through). */
-        const char *rs = strstr(line, "\"reason\"");
-        if (rs && (rs = strchr(rs, ':')) && *++rs) {
-            while (*rs == ' ' || *rs == '\t') rs++;
-            if (*rs == '"') {
-                const char *e = strchr(rs + 1, '"');
-                size_t n = e ? (size_t)(e - rs - 1) : 0;
-                if (n > 0 && n < sizeof(g_deny_reason) - 4) {
-                    size_t o = 0;
-                    for (size_t i = 0; i < n; i++) {
-                        unsigned char c = (unsigned char)rs[1 + i];
-                        g_deny_reason[o++] = (c >= 0x20 && c != '"' && c != '\\')
-                                             ? (char)c : ' ';
-                    }
-                    g_deny_reason[o] = 0;
-                }
-            }
-        }
+        g_explicit_deny = 1;
         return -1;
     }
     if (strcmp(action, "continue") == 0) return full_approval ? -2 : 0;
@@ -1365,17 +1334,7 @@ static void setup_fail_open(void)
             ptrace(PTRACE_CONT, g_root_pid, 0, 0);
         }
     }
-    if (g_broker_fd < 0 && g_broker_path) {
-        struct sockaddr_un sa;
-        memset(&sa, 0, sizeof(sa));
-        sa.sun_family = AF_UNIX;
-        if (strlen(g_broker_path) < sizeof(sa.sun_path)) {
-            snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", g_broker_path);
-            g_broker_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-            if (g_broker_fd >= 0)
-                connect(g_broker_fd, (struct sockaddr *)&sa, sizeof(sa));
-        }
-    }
+    connect_broker();
     char frame[180];
     int n = snprintf(frame, sizeof(frame),
         "{\"version\":1,\"type\":\"fail_open\",\"token\":\"%s\",\"code\":\"observer_setup\"}\n", g_token);
@@ -1456,37 +1415,22 @@ static void kill_everything(void)
  * to the broker (only a genuine exit 0 may update the background cache —
  * on a broker-EOF path the channel is dead and the write simply fails).
  *
- * stderr is agent-facing: only denial uses the blocked envelope and 126.
- * Cancellation uses its own notice and signal-style exit code instead.
- * A broker-rendered notice takes precedence in either case. */
+ * All agent-facing notices are rendered by the enclosing tool, not stdio. */
 static void kill_tree(const char *msg, int op_blocked)
 {
     kill_everything();
-    if (!g_failure_code && !g_deny_message[0]) g_failure_code = "observer_failure";
+    if (!g_failure_code && !g_explicit_deny) g_failure_code = "observer_failure";
     broker_send_exit(128 + SIGKILL);
     (void)op_blocked;
-    if (g_deny_message[0]) {
-        fprintf(stderr, "%s\n", g_deny_message);
-    } else {
-        fprintf(stderr, "[opencode-v2-security] Command failed: %s. "
-                "The command was stopped; earlier effects may remain and were not rolled back. "
-                "Report the failure to the user. Restore the runtime check, recheck current "
-                "authorization and partial effects, then retry if still authorized.\n", msg);
-    }
+    (void)msg;
     exit(126);
 }
 
 static void cancel_tree(void)
 {
     kill_everything();
+    g_failure_code = "observer_cancelled";
     broker_send_exit(128 + SIGKILL);
-    if (g_deny_message[0]) {
-        fprintf(stderr, "%s\n", g_deny_message);
-    } else {
-        fprintf(stderr, "[opencode-v2-security] Command failed: the run was cancelled before it finished; "
-                "this is not a security denial. Earlier effects may remain and were not rolled back. "
-                "Recheck current authorization and partial effects, then retry if still authorized.\n");
-    }
     /* Control-frame cancellation has no host signal; use the SIGINT-style 130. */
     exit(g_term_signal ? 128 + g_term_signal : 130);
 }
@@ -1820,9 +1764,7 @@ static int apply_decision(Tracee *t, int decision, int *exit_code)
         return RC_DETACHED;
     }
     if (decision == -1)
-        kill_tree(g_deny_reason[0] ? g_deny_reason
-                                   : "boundary operation denied",
-                  !g_at_exit_stop);
+        kill_tree("boundary operation denied", !g_at_exit_stop);
     if (decision == -2)
         kill_tree("the boundary review did not complete",
                   !g_at_exit_stop);
@@ -3381,24 +3323,8 @@ int main(int argc, char **argv)
     /* Connect the broker channel now that the payload is seized (the child
      * never inherits the fd). If the broker is unreachable, kill the
      * stopped child and die before any payload instruction runs. */
-    {
-        struct sockaddr_un sa;
-        memset(&sa, 0, sizeof(sa));
-        sa.sun_family = AF_UNIX;
-        if (strlen(g_broker_path) >= sizeof(sa.sun_path)) {
-            if (g_fail_open) setup_fail_open();
-            kill(root, SIGKILL);
-            die("broker path too long");
-        }
-        snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", g_broker_path);
-        g_broker_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (g_broker_fd < 0 ||
-            connect(g_broker_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-            if (g_fail_open) setup_fail_open();
-            kill(root, SIGKILL);
-            die("cannot connect to broker socket: %s", strerror(errno));
-        }
-    }
+    if (connect_broker() < 0)
+        die("cannot connect to broker socket: %s", strerror(errno));
 
     Tracee *rt = tid_register(root);
     if (!rt) die("tracee table full");

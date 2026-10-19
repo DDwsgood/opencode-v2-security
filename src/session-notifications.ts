@@ -25,11 +25,12 @@ export interface NoticeStore {
   states: Map<string, SessionState>
   delivered: Map<string, string>
   modelSnapshots: Map<string, string>
+  backgroundBlocks: Map<string, string[]>
   claims: Map<string, { token: symbol; text: string; done: Promise<void> }>
 }
 
 export function createNoticeStore(): NoticeStore {
-  return { states: new Map(), delivered: new Map(), modelSnapshots: new Map(), claims: new Map() }
+  return { states: new Map(), delivered: new Map(), modelSnapshots: new Map(), backgroundBlocks: new Map(), claims: new Map() }
 }
 
 export interface SessionStateNotification {
@@ -53,6 +54,10 @@ export interface SessionStateNotices {
   deliverWithPrompt(sessionID: string, delivery: string | undefined): Promise<void>
   /** Repeat a transient user notice until a real prompt durably admits it. */
   forModelContext(sessionID: string): string | undefined
+  recordBackgroundBlock(sessionID: string, text: string): void
+  /** Transient context copies do not claim delivery; tool results/prompts do. */
+  backgroundForModelContext(sessionID: string): string | undefined
+  takeBackgroundForToolResult(sessionID: string): string | undefined
   /** Wait for in-progress admissions. */
   flush(): Promise<void>
 }
@@ -63,7 +68,8 @@ export function createSessionStateNotices(
 ): SessionStateNotices {
   // Plugin instances can reuse a store created before this field existed.
   store.modelSnapshots ??= new Map()
-  const { states, delivered, modelSnapshots, claims } = store
+  store.backgroundBlocks ??= new Map()
+  const { states, delivered, modelSnapshots, backgroundBlocks, claims } = store
   let pending = Promise.resolve()
 
   const snapshot = (sessionID: string): string | undefined => {
@@ -91,6 +97,7 @@ export function createSessionStateNotices(
       states.delete(sessionID)
       delivered.delete(sessionID)
       modelSnapshots.delete(sessionID)
+      backgroundBlocks.delete(sessionID)
       claims.delete(sessionID)
     },
     deliverWithPrompt(sessionID, delivery) {
@@ -99,8 +106,13 @@ export function createSessionStateNotices(
         // All location instances serialize on this session's shared claim.
         // Read the snapshot only after the preceding publisher finishes.
         while (claims.has(sessionID)) await claims.get(sessionID)!.done
-        const text = snapshot(sessionID)
-        if (!text || delivered.get(sessionID) === text) return
+        const stateText = snapshot(sessionID)
+        const statePending = stateText !== undefined && delivered.get(sessionID) !== stateText
+        const queued = backgroundBlocks.get(sessionID)
+        const background = queued ? [...queued] : []
+        if (!statePending && background.length === 0) return
+        const text = [statePending ? stateText : undefined, ...background]
+          .filter((part): part is string => typeof part === "string").join("\n\n")
         let release!: () => void
         const claim = { token: Symbol("notice-publisher"), text,
           done: new Promise<void>((resolve) => { release = resolve }) }
@@ -109,14 +121,25 @@ export function createSessionStateNotices(
           await publish({
             sessionID,
             text,
-            description: "Security mode changed",
-            metadata: { source: "opencode-v2-security", securityStateNotice: true },
+            description: background.length ? "Background command stopped" : "Security mode changed",
+            metadata: {
+              source: "opencode-v2-security",
+              ...(statePending ? { securityStateNotice: true } : {}),
+              ...(background.length ? { backgroundBlockNotice: true } : {}),
+            },
             resume: false,
             delivery: "steer",
           })
           if (claims.get(sessionID)?.token === claim.token) {
-            delivered.set(sessionID, text)
-            modelSnapshots.delete(sessionID)
+            if (statePending) {
+              delivered.set(sessionID, stateText!)
+              modelSnapshots.delete(sessionID)
+            }
+            const current = backgroundBlocks.get(sessionID)
+            if (current && current === queued) {
+              current.splice(0, background.length)
+              if (current.length === 0) backgroundBlocks.delete(sessionID)
+            }
           }
         } finally {
           if (claims.get(sessionID)?.token === claim.token) claims.delete(sessionID)
@@ -143,6 +166,22 @@ export function createSessionStateNotices(
       // This tracks request assembly, not successful or durable delivery.
       modelSnapshots.set(sessionID, text)
       return text
+    },
+    recordBackgroundBlock(sessionID, text) {
+      const queued = backgroundBlocks.get(sessionID) ?? []
+      queued.push(text)
+      backgroundBlocks.set(sessionID, queued)
+    },
+    backgroundForModelContext(sessionID) {
+      if (claims.has(sessionID)) return undefined
+      return backgroundBlocks.get(sessionID)?.join("\n\n")
+    },
+    takeBackgroundForToolResult(sessionID) {
+      if (claims.has(sessionID)) return undefined
+      const queued = backgroundBlocks.get(sessionID)
+      if (!queued?.length) return undefined
+      backgroundBlocks.delete(sessionID)
+      return queued.join("\n\n")
     },
     async flush() {
       for (;;) {

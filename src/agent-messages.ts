@@ -32,7 +32,8 @@ function nonDenialAdvice(advice?: string, fallback = WITHIN_MODE): string {
 }
 
 /** Only for pre-launch failures before the original operation starts. */
-export function blockedText(reason: string, advice?: string): string {
+export function blockedText(reason: string, advice?: string, reviewDenied = false): string {
+  if (reviewDenied) return `[opencode-v2-security] Command blocked: before launch.\n${sentence(reason)}.\nThe whole command was not run.\n${NO_REROUTE}`
   return `[opencode-v2-security] Command failed: before launch.\n${sentence(reason)}.\nThe whole command was not run.\n${nonDenialAdvice(advice)}`
 }
 
@@ -45,7 +46,8 @@ export function actionBlockedText(reason: string, advice?: string): string {
   return `[opencode-v2-security] Command failed.\n${sentence(reason)}.\nThis action was not performed; earlier steps of this tool call may already have run. Nothing was rolled back.\n${nonDenialAdvice(advice, RECHECK)}`
 }
 
-export function actionBeforeText(reason: string, action: string, advice?: string): string {
+export function actionBeforeText(reason: string, action: string, advice?: string, reviewDenied = false): string {
+  if (reviewDenied) return `[opencode-v2-security] Command blocked: before execution (${action}).\n${sentence(reason)}.\nThis action was not performed.\n${NO_REROUTE}`
   return `[opencode-v2-security] Command failed: before execution (${action}).\n${sentence(reason)}.\nThis action was not performed.\n${nonDenialAdvice(advice)}`
 }
 
@@ -166,7 +168,13 @@ export function reviewRefusal(result: EffectReviewResult): { reason: string; adv
     reason: "Command review — evidence limit: required facts remained unavailable; policy requires resolved checks. This is not a safety verdict",
     advice: RECHECK,
   }
-  const category = REVIEW_CATEGORIES[result.uncoveredOwner] ?? "risk category not determined"
+  const materialCategories = Object.entries(result.severity).filter(([, probability]) => probability >= 0.4).map(([category]) => category)
+  let owner = result.uncoveredOwner
+  if (owner === "none") {
+    owner = materialCategories[0] ?? "none"
+    if (materialCategories.length > 1) owner = "multiple"
+  }
+  const category = REVIEW_CATEGORIES[owner ?? ""] ?? "risk category not determined"
   return {
     reason: `Command review - ${category}: the command contains effects that are unsafe or unauthorized`,
     advice: NO_REROUTE,

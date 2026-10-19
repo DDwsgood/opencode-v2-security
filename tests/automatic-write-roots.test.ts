@@ -1,4 +1,5 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test"
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test"
+import * as childProcess from "node:child_process"
 import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { cleanupTestArtifacts } from "./artifacts"
@@ -57,11 +58,26 @@ describe("small automatic cache write scope", () => {
   })
 
   test("Read only temp roots are canonical existing directories and never cover HOME", async () => {
-    const roots = await globalTempWriteRoots([path.join(root, "missing"), workspace], "/nonexistent-home")
-    expect(roots).toContain(workspace)
-    expect(roots).toContain("/tmp")
-    expect(roots).not.toContain(path.join(root, "missing"))
-    expect(await globalTempWriteRoots([root], path.join(root, "home"))).not.toContain(root)
+    const oldDistro = process.env.WSL_DISTRO_NAME
+    const oldTemp = process.env.TEMP
+    process.env.WSL_DISTRO_NAME = "fixture"
+    process.env.TEMP = outside
+    const spawn = spyOn(childProcess, "execFile")
+    try {
+      const roots = await globalTempWriteRoots([path.join(root, "missing"), workspace], "/nonexistent-home")
+      expect(roots).toContain(workspace)
+      expect(roots).toContain("/tmp")
+      expect(roots).toContain(outside)
+      expect(roots).not.toContain(path.join(root, "missing"))
+      expect(await globalTempWriteRoots([root], path.join(root, "home"))).not.toContain(root)
+      expect(spawn.mock.calls.some(([file]) => /(?:^|[\\/])cmd\.exe$/i.test(String(file)))).toBe(false)
+    } finally {
+      spawn.mockRestore()
+      if (oldDistro === undefined) delete process.env.WSL_DISTRO_NAME
+      else process.env.WSL_DISTRO_NAME = oldDistro
+      if (oldTemp === undefined) delete process.env.TEMP
+      else process.env.TEMP = oldTemp
+    }
   })
 
   test("shell path relaxation is RW-only and credential checks still precede it", () => {

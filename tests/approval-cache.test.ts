@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { STATIC_BYPASS_CATEGORIES } from "../src/categories"
-import { EFFECTS_POLICY_VERSION, type EffectReviewResult } from "../src/security/effects-reviewer"
+import { EFFECT_CATEGORIES, EFFECTS_POLICY_VERSION, type EffectReviewResult } from "../src/security/effects-reviewer"
 import {
   boundaryCoreDigest,
   createApprovalCache,
@@ -25,8 +24,7 @@ function makeResult(overrides: Partial<EffectReviewResult> = {}): EffectReviewRe
     coverage: "no_material_effects",
     gapReach: "no_blocking_gap",
     uncoveredOwner: "none",
-    severity: Object.fromEntries(STATIC_BYPASS_CATEGORIES.map((cat) => [cat, 0])) as EffectReviewResult["severity"],
-    facts: Object.fromEntries(STATIC_BYPASS_CATEGORIES.map((cat) => [cat, ""])) as EffectReviewResult["facts"],
+    severity: Object.fromEntries(EFFECT_CATEGORIES.map((category) => [category, 0])) as EffectReviewResult["severity"],
     answers: {},
     policyVersion: EFFECTS_POLICY_VERSION,
     source: "bounded",

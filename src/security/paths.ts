@@ -3,6 +3,7 @@
 // Claude Code's pathValidation.ts: a command is only provably safe when every
 // read/write argument is known, literal, and inside an allowed area.
 import { AsyncLocalStorage } from "node:async_hooks"
+import { tmpdir } from "node:os"
 import path from "node:path"
 import { isStandardCacheWrite } from "./automatic-write-roots"
 
@@ -57,7 +58,7 @@ const CRITICAL_RE = [
   /^\/dev\/(?:sd|nvme|vd|hd|xvd|mmcblk|dasd)[a-z0-9-]*$/,
 ]
 
-const CREDENTIAL_HOME_DIRS = [".ssh", ".gnupg", ".aws", ".kube", ".azure", ".config/gcloud", ".config/azure-cli"]
+const CREDENTIAL_HOME_DIRS = [".ssh", ".gnupg", ".aws", ".kube", ".azure", ".config/gcloud", ".config/gh", ".config/azure-cli"]
 
 // `.bash_history`/`.zsh_history` and ordinary logs (reviewer traces,
 // `*.log`/`*.jsonl`) are NOT credential stores by path alone: reading them is
@@ -97,6 +98,7 @@ const CREDENTIAL_NAME_RE = [
   /\.(?:pem|key|p12|pfx|ppk|jks|keystore|kdbx|gpg|age)$/,
   /^\.env(?:$|[.])/i,
   /\.env$/i,
+  /^auth\.json$/i,
 ]
 
 const SYSTEM_WRITE_EXACT = [
@@ -172,7 +174,9 @@ const SENSITIVE_SUFFIXES: [string, SensitivityFlags][] = [
 // --- environment ------------------------------------------------------------
 
 function getHome(): string {
-  return process.env.USERPROFILE ?? process.env.HOME ?? ""
+  return process.platform === "win32"
+    ? process.env.USERPROFILE ?? process.env.HOME ?? ""
+    : process.env.HOME ?? process.env.USERPROFILE ?? ""
 }
 
 function stripQuotes(value: string): string {
@@ -285,6 +289,7 @@ const EMBEDDED_CREDENTIAL_RE = new RegExp(
     String.raw`(?:^|[/\s"'=(,;:&|])\.kube(?:/|["'\s,;)&|]|$)`,
     String.raw`(?:^|[/\s"'=(,;:&|])\.azure(?:/|["'\s,;)&|]|$)`,
     String.raw`\.config/gcloud`,
+    String.raw`\.config/gh(?:/|["'\s,;)&|]|$)`,
     String.raw`\.config/azure-cli`,
     String.raw`(?:^|[/\s"'=(,;:&|])id_(?:rsa|dsa|ecdsa|ed25519|ed448)(?:["'\s,;)&|./]|$)`,
     String.raw`(?:^|[/\s"'=(,;:&|])\.netrc(?:["'\s,;)&|]|$)`,
@@ -298,6 +303,7 @@ const EMBEDDED_CREDENTIAL_RE = new RegExp(
     String.raw`(?:^|[/\s"'=(,;:&|])[\w.-]+\.(?:crt|key)(?:["'\s,;)&|]|$)`,
     String.raw`(?:^|[/\s"'=(,;:&|])\.env(?:\.[\w.-]+)?(?:["'\s,;)&|]|$)`,
     String.raw`[\w.-]\.env(?:["'\s,;)&|]|$)`,
+    String.raw`(?:^|[/\s"'=(,;:&|])auth\.json(?:["'\s,;)&|]|$)`,
   ].join("|"),
   "i",
 )
@@ -330,8 +336,12 @@ function matchRegistry(absolute: string, home: string, flags: SensitivityFlags):
     if (norm === cleaned || norm.startsWith(cleaned + "/")) flags.systemWrite = true
   }
 
-  if (home) {
-    const h = home.replaceAll("\\", "/").toLowerCase().replace(/\/+$/, "")
+  const windowsProfile = norm.match(/^\/mnt\/[a-z]\/users\/[^/]+(?=\/|$)/)?.[0]
+  // A WSL credential store remains sensitive after HOME symlinks resolve into
+  // a Windows profile, including profiles other than the Linux user's name.
+  const homes = new Set([home, windowsProfile].filter((value): value is string => Boolean(value)))
+  for (const candidate of homes) {
+    const h = candidate.replaceAll("\\", "/").toLowerCase().replace(/\/+$/, "")
     if (h) {
       for (const dir of CREDENTIAL_HOME_DIRS) {
         if (norm === `${h}/${dir}` || norm.startsWith(`${h}/${dir}/`)) flags.credential = true
@@ -345,6 +355,20 @@ function matchRegistry(absolute: string, home: string, flags: SensitivityFlags):
   if (baseName) {
     for (const re of CREDENTIAL_NAME_RE) if (re.test(baseName)) flags.credential = true
   }
+  if (temporaryCredentialPath(norm, home) && CREDENTIAL_HOME_DIRS.some((dir) =>
+    norm.endsWith(`/${dir}`) || norm.includes(`/${dir}/`))) flags.credential = true
+}
+
+/** A temp name is not proof of either mock provenance or real credentials.
+ * Keep uncertain/staged secrets reviewable, including temporary HOME fixtures. */
+function temporaryCredentialPath(absolute: string, home: string): boolean {
+  if (isWithinLexical("/tmp", absolute) || isWithinLexical("/var/tmp", absolute)) return true
+  const temporary = tmpdir().replaceAll("\\", "/").replace(/\/+$/, "")
+  if (!path.isAbsolute(temporary) || temporary === "/") return false
+  const windowsHome = absolute.match(/^\/mnt\/[a-z]\/users\/[^/]+/i)?.[0]
+  if ([home, windowsHome].some((root) => root &&
+    (isWithinLexical(root, temporary) || isWithinLexical(temporary, root)))) return false
+  return isWithinLexical(temporary, absolute)
 }
 
 function matchSuffix(raw: string, flags: SensitivityFlags): void {
@@ -399,6 +423,9 @@ export function classifyPathTarget(raw: string, mode: "read" | "write" | "delete
 
   const sensitiveRead = flags.critical || flags.credential
   const sensitiveWrite = flags.critical || flags.credential || flags.systemWrite
+  const temporaryCredential = flags.credential && !flags.critical && resolved.absolute !== undefined &&
+    temporaryCredentialPath(resolved.absolute, home)
+  const temporaryReason = "Temporary credential-like target may be a disposable test fixture or a real staged secret; review its provenance and effects, not the filename alone"
 
   // /proc/sys is the kernel-parameter interface: a write-direction access is
   // a kernel.sysctl-write question (privilege category), not a secret one.
@@ -408,17 +435,17 @@ export function classifyPathTarget(raw: string, mode: "read" | "write" | "delete
   }
 
   if (mode === "read" && sensitiveRead) {
-    return { kind: "ask", rule: "credentials.sensitive-access", reason: REASON_SENSITIVE_READ_ASK }
+    return { kind: "ask", rule: "credentials.sensitive-access", reason: temporaryCredential ? temporaryReason : REASON_SENSITIVE_READ_ASK }
   }
   if (mode === "write" && sensitiveWrite) {
     return {
       kind: "ask",
       rule: flags.critical || flags.credential ? "credentials.sensitive-access" : "system.sensitive-write",
-      reason: REASON_SENSITIVE_WRITE_ASK,
+      reason: temporaryCredential ? temporaryReason : REASON_SENSITIVE_WRITE_ASK,
     }
   }
   if (mode === "delete" && sensitiveWrite) {
-    return { kind: "ask", rule: "data.critical-delete", reason: REASON_SENSITIVE_DELETE }
+    return { kind: "ask", rule: "data.critical-delete", reason: temporaryCredential ? temporaryReason : REASON_SENSITIVE_DELETE }
   }
   if (mode === "read" && resolved.foreignHome) {
     return { kind: "ask", rule: "credentials.foreign-home", reason: REASON_FOREIGN_HOME }
