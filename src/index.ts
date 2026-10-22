@@ -2023,7 +2023,8 @@ const plugin: Plugin = {
       cancelExecution?: () => void
       cacheUpdates?: Array<{ scope: ApprovalCacheScope; facts: ApprovalCacheFacts }>
       runtimeBlocked?: string
-      /** Infrastructure source only; never set for an actual policy refusal. */
+      /** Infrastructure or observer stop source; never an actual policy refusal.
+       *  Observer cancellation may be caused by the host's command deadline. */
       runtimeFailureCode?: string
       runtimeBlockDetails?: RuntimeBlockDetails
       failOpenPasses?: string[]
@@ -2377,12 +2378,12 @@ const plugin: Plugin = {
       const trustedOnly = trustedRuntimeCommand(command, resolved.trustedCommands)
       const recordBlock = (reason: string, event?: RuntimeBoundaryEvent, advice?: string, cancelled = false, reviewDenied = false, failureCode?: string) => {
         // A real refusal keeps priority over a later infrastructure failure.
-        // An infrastructure-only block may be replaced by a real denial,
+        // An infrastructure/observer-only block may be replaced by a real denial,
         // cancellation or revocation: the first *reason* wins, but an EOF is
         // not a reason to hide a subsequent explicit decision. `failureCode`
-        // marks a block as infrastructure-only for the timeout exception.
-        const infrastructureOnly = authorization.runtimeFailureCode !== undefined
-        if (!authorization.runtimeBlocked || infrastructureOnly && failureCode === undefined) {
+        // identifies stops that may come from the host's command deadline.
+        const replaceableStop = authorization.runtimeFailureCode !== undefined
+        if (!authorization.runtimeBlocked || replaceableStop && failureCode === undefined) {
           authorization.runtimeBlocked = reason
           authorization.runtimeFailureCode = failureCode
           authorization.runtimeBlockDetails = {
@@ -2424,7 +2425,9 @@ const plugin: Plugin = {
         onFailure: (code) => { failure(code) },
         // The observer has already stopped: fail-open cannot revive this run.
         onTerminalFailure: (code) => {
-          if (code === "observer_cancelled") recordBlock("Cancellation: the call was cancelled", undefined, CANCEL_ADVICE, true)
+          // TERM/INT/HUP do not distinguish a host deadline from cancellation.
+          // Keep the source until the original executor returns timeout metadata.
+          if (code === "observer_cancelled") recordBlock("Cancellation: the call was cancelled", undefined, CANCEL_ADVICE, true, false, code)
           else recordBlock(checkUnavailableReason(code), undefined, RETRY_LATER)
         },
         onCancelFailure: () => authorization.cancelExecution?.(),
@@ -3310,18 +3313,20 @@ const plugin: Plugin = {
                 if (!result || typeof result !== "object") return result
                 const value = result as { output?: unknown; content?: unknown; metadata?: Record<string, unknown> }
                 const output = value.output && typeof value.output === "object" ? value.output as Record<string, unknown> : undefined
-                // Killing the observer at the host's command deadline can close
-                // its socket before an exit frame. That EOF is not a security
-                // refusal. Only the trusted host timeout flag permits this
-                // exception; actual denials, revocations and cancels still win.
+                // A host deadline can kill the observer (EOF) or signal it
+                // (observer_cancelled). Neither is a plugin refusal when the
+                // original executor confirms a timeout. Plugin-side cancels,
+                // actual denials and revocations have no such source code.
                 const hostTimedOut = name === "shell" && (value.metadata?.timeout === true || output?.timeout === true)
-                const timeoutDisconnect = hostTimedOut && prepared.authorization.runtimeFailureCode === "broker_unavailable" &&
-                  !prepared.authorization.runtimeBlockDetails?.reviewDenied && !prepared.authorization.runtimeBlockDetails?.cancelled
+                const stopCode = prepared.authorization.runtimeFailureCode
+                const timeoutObserverStop = hostTimedOut && (stopCode === "broker_unavailable" || stopCode === "observer_cancelled") &&
+                  !prepared.authorization.runtimeBlockDetails?.reviewDenied &&
+                  (!prepared.authorization.runtimeBlockDetails?.cancelled || stopCode === "observer_cancelled")
                 // Exclude our own pre-spawn denial text: a nested tool
                 // call's "Command blocked … The whole command was not run."
                 // output must not be dressed up as a post-launch OS error.
                 let runtimeRefusal: string | undefined
-                if (prepared.authorization.runtimeBlocked && !timeoutDisconnect) {
+                if (prepared.authorization.runtimeBlocked && !timeoutObserverStop) {
                   runtimeRefusal = prepared.authorization.runtimeBlocked.startsWith("[opencode-v2-security]")
                     ? prepared.authorization.runtimeBlocked
                     : runtimeBlockedText(prepared.authorization.runtimeBlocked, prepared.authorization.runtimeBlockDetails)

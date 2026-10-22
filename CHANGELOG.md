@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.9.1 (2026-10-23)
+
+- 修复宿主命令超时通过 SIGTERM 等信号终止观察器时，`observer_cancelled` 被误转为插件 `Tool.Error` 的问题。宿主确认超时后保留原生输出、超时提示与结果状态；真实安全拒绝、权限撤销及插件侧取消仍优先。
+- 回归覆盖 SIGKILL、SIGTERM 与两种故障策略；8 项针对性测试通过。另实测命令自杀，SIGTERM／SIGKILL 分别保留原生退出码 143／137，不附加插件错误。未运行全量测试。
+
 ## 1.9.0 (2026-10-22)
 
 - 题组升级为 `v12-systemone-aligned-20261021-r6`：只读符合性题迁入冻结提示词的 `readonly_question`，不再由 TypeScript 常量提供；`filesystem_severity`、`network_severity` 的概率题补充 `true`/`false` criteria 说明真假边界；`scope_coverage` 与 `uncovered_owner` 明确“覆盖不等于意图”、只有当前 active bypass 才算授权、共享数据库改动归 remote、普通文件权限变更归 privilege。RW/RO 分别绑定该版本及其 `-readonly` 后缀，旧缓存不混用。

@@ -50,9 +50,10 @@ afterAll(async () => {
 const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`
 const python = (code: string) => `python3 -c ${quote(code)}`
 /** Host-deadline simulation: the observer's payload calls setpgid(0, 0), so a
- *  single `kill(-shellPid)` leaves it running. Walk /proc and SIGKILL every
- *  descendant (groups first, then the root) like a host process-tree kill. */
-async function killProcessTree(rootPid: number): Promise<void> {
+ *  single `kill(-shellPid)` leaves it running. Walk /proc and signal every
+ *  descendant (groups first, then the root) like a host process-tree kill.
+ *  TERM also exercises the observer's structured cancellation exit frame. */
+async function killProcessTree(rootPid: number, terminationSignal: "SIGKILL" | "SIGTERM"): Promise<void> {
   const processes = new Map<number, { ppid: number; pgrp: number }>()
   for (const entry of await readdir("/proc").catch(() => [] as string[])) {
     if (!/^\d+$/.test(entry)) continue
@@ -74,8 +75,8 @@ async function killProcessTree(rootPid: number): Promise<void> {
   collect(rootPid)
   const signal = (pid: number) => {
     const group = processes.get(pid)?.pgrp === pid
-    try { if (group) process.kill(-pid, "SIGKILL") } catch { /* already gone */ }
-    try { process.kill(pid, "SIGKILL") } catch { /* already gone */ }
+    try { if (group) process.kill(-pid, terminationSignal) } catch { /* already gone */ }
+    try { process.kill(pid, terminationSignal) } catch { /* already gone */ }
   }
   for (const pid of targets.reverse()) signal(pid)
   signal(rootPid)
@@ -110,6 +111,7 @@ async function harness(deny = false, options: {
    *  return the documented result shape (`output.timeout` + `metadata.timeout`)
    *  instead of failing the tool call. */
   hostTimeoutMs?: number
+  hostTimeoutSignal?: "SIGKILL" | "SIGTERM"
 } = {}) {
   // Security state is shared process-wide between plugin instances; each
   // simulated instance here must start from a clean registry.
@@ -151,9 +153,10 @@ async function harness(deny = false, options: {
             timedOut = true
             // The host kills the whole shell tree at its deadline. The
             // observer's payload runs in its own process group, so walk the
-            // live tree; its socket closes without a terminal exit frame.
-            if (child.pid !== undefined) void killProcessTree(child.pid)
-            else child.kill("SIGKILL")
+            // live tree. KILL causes EOF; TERM lets the observer report cancel.
+            const terminationSignal = options.hostTimeoutSignal ?? "SIGKILL"
+            if (child.pid !== undefined) void killProcessTree(child.pid, terminationSignal)
+            else child.kill(terminationSignal)
           }, hostTimeoutMs)
         })
         const output = yield* Effect.promise(() => new Promise<{ output: string; exit: number; timeout?: boolean }>((resolve) => {
@@ -164,7 +167,13 @@ async function harness(deny = false, options: {
             if (timer !== undefined) clearTimeout(timer)
             processOutputs.push({ stdout, stderr })
             options.onOutput?.(stdout, stderr)
-            const result = { output: stdout + stderr, exit: timedOut ? 124 : code ?? 1, ...(timedOut ? { timeout: true } : {}) }
+            const result = {
+              output: timedOut
+                ? `${stdout}${stderr}\n\nCommand exceeded timeout of ${hostTimeoutMs} ms. Retry with a larger timeout if the command is expected to take longer.`
+                : stdout + stderr,
+              exit: timedOut ? 124 : code ?? 1,
+              ...(timedOut ? { timeout: true } : {}),
+            }
             // Let the broker observe the killed observer's socket close before
             // the host reports its timeout result.
             setTimeout(() => resolve(result), timedOut ? 200 : 0)
@@ -766,8 +775,13 @@ describe("real observer → broker → frozen reviewer → original process", ()
     await expect(readFile(target)).rejects.toMatchObject({ code: "ENOENT" })
   })
 
-  test("a host command timeout keeps output and timeout metadata instead of a security refusal", async () => {
-    const host = await harness(false, { failPolicy: "fail_close", hostTimeoutMs: 2_500 })
+  test.each([
+    ["SIGKILL", "fail_open"],
+    ["SIGKILL", "fail_close"],
+    ["SIGTERM", "fail_open"],
+    ["SIGTERM", "fail_close"],
+  ] as const)("a host command timeout (%s, %s) keeps native output and metadata", async (hostTimeoutSignal, failPolicy) => {
+    const host = await harness(false, { failPolicy, hostTimeoutMs: 2_500, hostTimeoutSignal })
     const result = await host.run("shell", {
       command: python(`import sys,time; print('timeout-stdout', flush=True); print('timeout-stderr', file=sys.stderr, flush=True); time.sleep(30)`),
     })
@@ -777,6 +791,9 @@ describe("real observer → broker → frozen reviewer → original process", ()
     expect(result.output.timeout).toBe(true)
     expect(result.output.output).toContain("timeout-stdout")
     expect(result.output.output).toContain("timeout-stderr")
+    expect(result.output.output).toContain("Command exceeded timeout of 2500 ms. Retry with a larger timeout if the command is expected to take longer.")
+    expect(result.output.output).not.toContain("[opencode-v2-security]")
+    expect(result.content).toBe(result.output.output)
     expect(result.metadata.boundary.executionRoute).toBe("runtime_boundary_watch")
     expect(host.processOutputs).toHaveLength(1)
     expect(host.processOutputs[0]!.stdout).toContain("timeout-stdout")
