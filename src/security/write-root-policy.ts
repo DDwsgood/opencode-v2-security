@@ -1,4 +1,5 @@
 import { lstatSync } from "node:fs"
+import { homedir } from "node:os"
 import path from "node:path"
 import { canonicalCandidate } from "./automatic-write-roots"
 import { checkResolvedPathSensitivity } from "./paths"
@@ -24,6 +25,13 @@ function overlaps(root: string, target: string): boolean {
 const BROKER_DIRECTORIES_KEY = Symbol.for("opencode-v2-security.runtime-broker-directories.v1")
 const processState = globalThis as typeof globalThis & { [BROKER_DIRECTORIES_KEY]?: Set<string> }
 const activeBrokerDirectories = processState[BROKER_DIRECTORIES_KEY] ??= new Set<string>()
+
+/** Control-plane sockets must not live inside the recursively writable scratch
+ * tree. Otherwise protecting a broker also intercepts ordinary temp writes. */
+export function runtimeBrokerBase(home = homedir()): string {
+  const directory = path.join(home, ".opencode", "run")
+  return canonicalCandidate(directory) ?? directory
+}
 
 /** Share protection across plugin instances without reserving other processes'
  * broker names or preventing a traced child from creating its own broker. */

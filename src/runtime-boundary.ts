@@ -3,7 +3,9 @@ import { chmod, lstat, mkdtemp, unlink, rmdir } from "node:fs/promises"
 import { createServer, type Socket } from "node:net"
 import path from "node:path"
 import type { ApprovalCacheTarget, ApprovalCacheWriteEffect } from "./security/approval-cache"
-import { scan } from "./security/shell-scan"
+import { Nested, scan } from "./security/shell-scan"
+import { matchesTrustedCommand, parseTrustedCommands } from "./security/semantic-allow"
+import { extractRedirectTargets } from "./security/paths"
 import { inspectionErrorCode, isMissingPathError } from "./security/inspection"
 import { registerRuntimeBrokerDirectory } from "./security/write-root-policy"
 import { failureOrPass } from "./failure-policy"
@@ -93,6 +95,31 @@ export function knownSafeRuntimeBoundary(event: RuntimeBoundaryEvent, command: s
     remoteRead = true
   }
   return remoteRead
+}
+
+/** Trust the entire launch only when every invocation is explicitly listed.
+ * The caller must also require the static command proof: scan drops redirect
+ * targets, so this shape check alone cannot authorize shell writes. */
+export function trustedRuntimeCommand(command: string, entries: readonly string[]): boolean {
+  const rules = parseTrustedCommands(entries)
+  if (rules.length === 0) return false
+  const parsed = scan(command)
+  if (parsed.kind !== "scanned" || parsed.commands.length === 0) return false
+  let offset = 0
+  for (const item of parsed.commands) {
+    if (item[Nested] || !matchesTrustedCommand(item.words, rules)) return false
+    // A shell-owned file write is not the CLI's internal behavior, even if
+    // the generic static classifier considers that destination safe.
+    const redirects = extractRedirectTargets(item.resource)
+    if (redirects.unparseable || redirects.targets.length > 0) return false
+    // Assignment-only segments are omitted by scan. Do not let PATH=…;
+    // trusted-tool or shell setup inherit authority from the later CLI.
+    const start = command.indexOf(item.resource, offset)
+    if (start < 0 || !/^[\s;&|]*$/.test(command.slice(offset, start))) return false
+    if (/^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(item.resource)) return false
+    offset = start + item.resource.length
+  }
+  return /^[\s;&|]*$/.test(command.slice(offset))
 }
 
 /** Static stage of a runtime crossing: ALLOW or ASK, never a refusal. The

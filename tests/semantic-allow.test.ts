@@ -359,12 +359,15 @@ describe("known-safe forms that write or execute", () => {
 // --- user-trusted commands -----------------------------------------------------------------
 
 describe("trustedCommands", () => {
-  const trusted: Partial<Input> = { trustedCommands: ["agent-browser", "opencode2 --version"] }
+  const trusted: Partial<Input> = { trustedCommands: ["agent-browser", "opencode2 --version", "browser open *", "tool --mode=rea?"] }
   allows(
     [
       ["trusted tool with arguments", "agent-browser open https://example.com"],
       ["trusted tool with variable arguments", "R=/tmp/x; agent-browser screenshot $R/a.png"],
       ["exact multi-word prefix", "opencode2 --version"],
+      ["wildcard arguments", "browser open https://example.com extra"],
+      ["optional trailing wildcard", "browser open"],
+      ["single-character argument wildcard", "tool --mode=read"],
     ],
     trusted,
   )
@@ -378,6 +381,8 @@ describe("trustedCommands", () => {
       ["sensitive env prefix", "LD_PRELOAD=/tmp/x.so agent-browser open x"],
       ["write redirect outside the worktree", "agent-browser snapshot > /etc/x"],
       ["prefix mismatch", "opencode2 run x"],
+      ["wildcard subcommand mismatch", "browser close x"],
+      ["single-character wildcard mismatch", "tool --mode=readwrite"],
       ["destructive text still hits the rule scan", "agent-browser eval 'x' ; rm -rf /"],
     ],
     trusted,
@@ -386,6 +391,7 @@ describe("trustedCommands", () => {
     expect(() => resolvePluginConfig({ trustedCommands: ["tool; rm -rf /"] })).toThrow()
     expect(() => resolvePluginConfig({ trustedCommands: ["$(id)"] })).toThrow()
     expect(resolvePluginConfig({ trustedCommands: ["agent-browser"] }).trustedCommands).toEqual(["agent-browser"])
+    expect(resolvePluginConfig({ trustedCommands: ["agent-browser open *"] }).trustedCommands).toEqual(["agent-browser open *"])
     expect(resolvePluginConfig({}).trustedCommands).toEqual([])
   })
 })

@@ -5,6 +5,7 @@ import { inspectDirectory, inspectRegularTextFile, isMissingPathError } from "./
 import path from "node:path"
 import { STATIC_BYPASS_CATEGORIES, type BypassCategory } from "../categories"
 import { ruleBypassed } from "./bypass"
+import { alwaysWritableRoots, isAlwaysWritablePath } from "./automatic-write-roots"
 import {
   analyzeSegmentPaths,
   checkPathSensitivity,
@@ -3083,6 +3084,48 @@ function parseMoveInvocation(segment: string): ParsedTransferInvocation | undefi
   return undefined
 }
 
+/**
+ * Move operands with every removed source: `mv`/`move` also accept several
+ * sources (`mv a b dir/`) and `-t`/`--target-directory`, which
+ * `parseMoveInvocation` does not model. Each source is a delete of its old
+ * path, so confinement and outside-write checks must see all of them.
+ */
+function parseMoveOperands(segment: string): { sources: string[]; target: string } | undefined {
+  const parsed = parseMoveInvocation(segment)
+  if (parsed) return { sources: [parsed.source], target: parsed.target }
+  const tokens = simpleInvocationTokens(segment.trim())
+  const command = commandLeaf(tokens[0] ?? "")
+  if (command !== "mv" && command !== "move") return undefined
+
+  const operands: string[] = []
+  let targetDirectory: string | undefined
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = stripMatchingQuotes(tokens[index] ?? "")
+    if (token === "--") {
+      operands.push(...tokens.slice(index + 1).map(stripMatchingQuotes))
+      break
+    }
+    if (token === "-t" || token === "--target-directory") {
+      const value = tokens[index + 1]
+      if (value === undefined || targetDirectory !== undefined) return undefined
+      targetDirectory = stripMatchingQuotes(value)
+      index += 1
+      continue
+    }
+    if (/^--target-directory=/i.test(token)) {
+      if (targetDirectory !== undefined) return undefined
+      targetDirectory = stripMatchingQuotes(token.slice(token.indexOf("=") + 1))
+      continue
+    }
+    if (token.startsWith("-") && token !== "-") continue
+    operands.push(token)
+  }
+
+  const target = targetDirectory ?? operands.pop()
+  if (!target || operands.length === 0) return undefined
+  return { sources: operands, target }
+}
+
 function expandTrustedTempVariables(value: string) {
   const replacements: Array<[RegExp, string | undefined]> = [
     [/^%LOCALAPPDATA%(?=$|[\\/])/i, process.env.LOCALAPPDATA],
@@ -3155,6 +3198,7 @@ async function trustedUserLocalTempRoots(input: ClassifyShellCommandInput) {
   const candidates = input.trustedTempRoot
     ? [input.trustedTempRoot]
     : [
+        ...(process.platform === "win32" ? [process.env.TEMP] : []),
         process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Temp") : undefined,
         process.env.USERPROFILE ? path.join(process.env.USERPROFILE, "AppData", "Local", "Temp") : undefined,
       ]
@@ -3184,7 +3228,7 @@ async function isTrustedTempPath(
   for (const root of roots) {
     const lexicalMatch =
       isStrictlyWithin(root, resolved.absolute) ||
-      (resolved.contentsOnly && path.resolve(root).toLowerCase() === path.resolve(resolved.absolute).toLowerCase())
+      ((resolved.contentsOnly || isAlwaysWritablePath(root)) && path.resolve(root).toLowerCase() === path.resolve(resolved.absolute).toLowerCase())
     if (!lexicalMatch) continue
 
     const canonicalAnchor = await canonicalExistingAnchor(resolved.absolute)
@@ -3205,7 +3249,7 @@ async function isTrustedTempPath(
  */
 async function trustedTempRoots(input: ClassifyShellCommandInput) {
   const roots: string[] = []
-  for (const candidate of ["/tmp", "/var/tmp", ...(await trustedUserLocalTempRoots(input))]) {
+  for (const candidate of [...alwaysWritableRoots(), "/tmp", "/var/tmp", ...(await trustedUserLocalTempRoots(input))]) {
     try {
       roots.push(await realpath(candidate))
     } catch {
@@ -3226,7 +3270,7 @@ async function pathInsideTempRoot(candidate: string, base: string, roots: string
   if (!expanded || /[`$%{}<>|]/.test(expanded)) return false
   const absolute = path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(base, expanded)
   for (const root of roots) {
-    if (!isStrictlyWithin(root, absolute)) continue
+    if (!isStrictlyWithin(root, absolute) && !(isWithin(root, absolute) && isAlwaysWritablePath(root))) continue
     const canonical = await canonicalProjectedPath(absolute)
     if (canonical && isWithin(root, canonical)) return true
   }
@@ -3285,10 +3329,10 @@ async function writeTargetsConfinedToTemp(
     targets.push(...deletion.targets)
   }
 
-  const move = parseMoveInvocation(segment)
+  const move = parseMoveOperands(segment)
   if (move) {
     // `mv` removes the source — a worktree source is a worktree delete.
-    targets.push(move.source, move.target)
+    targets.push(...move.sources, move.target)
   }
   const copy = parseCopyInvocation(segment)
   if (copy) targets.push(copy.target)
@@ -3336,6 +3380,21 @@ async function classifyTempConfinedSegment(
   // Zero-target segments carry nothing to confine — they belong to the
   // normal safe/unsafe flow, not this exemption.
   const confinement = await writeTargetsConfinedToTemp(segment, base, roots, input.shell)
+  // The unconditional temp write pass covers only the destination side of a
+  // move. When the destination lands in temp but a source does not, the
+  // segment still removes an outside path, so the pass-looking path scan of
+  // the destination alone must not carry it into the known-safe allow.
+  const move = parseMoveOperands(segment)
+  if (move && (await pathInsideTempRoot(move.target, base, roots))) {
+    for (const source of move.sources) {
+      if (await pathInsideTempRoot(source, base, roots)) continue
+      return {
+        verdict: "ASK",
+        rules: ["filesystem.outside-write"],
+        reason: "The move removes a source path outside the trusted temp directories even though its destination is inside them",
+      }
+    }
+  }
   if (!confinement.confined || confinement.targets === 0) return undefined
 
   if (input.baseUnverified === true && !(await baseInsideTempRoot(base, input))) {
@@ -9697,6 +9756,9 @@ async function roPathWritable(
   // pointing at /etc cannot launder an out-of-scratch write.
   const canonical = await canonicalProjectedPath(resolved.absolute)
   if (!canonical || !roots.some((root) => isWithin(root, canonical))) return "outside"
+  // The host temp root is writable in every mode, including the root itself
+  // and credential-shaped fixtures. denyWrite cannot freeze this subtree.
+  if (isAlwaysWritablePath(canonical)) return "ok"
   // Config denyWrite freezes override the carve-out — judged on the canonical
   // projection so a symlinked scratch entry cannot launder a frozen path.
   if (denyWrite.length > 0) {
@@ -9784,9 +9846,12 @@ async function mutationTargetsOf(
     if (!deletion.parseable || deletion.targets.length === 0) return undefined
     targets.push(...deletion.targets.map((target) => ({ path: target, container: false })))
   }
-  const move = parseMoveInvocation(segment)
+  const move = parseMoveOperands(segment)
   if (move) {
-    targets.push({ path: move.source, container: false }, { path: move.target, container: true })
+    targets.push(
+      ...move.sources.map((source) => ({ path: source, container: false })),
+      { path: move.target, container: true },
+    )
   }
   const copy = parseCopyInvocation(segment)
   if (copy) targets.push({ path: copy.target, container: true })
@@ -9813,7 +9878,7 @@ async function roScratchCarveOut(
   input: InternalClassifyInput,
   kind: "write" | "unproven" | undefined,
 ): Promise<{ decision?: SegmentDecision; frozen?: boolean } | undefined> {
-  const roots = input.roWritableRoots ?? ["/tmp"]
+  const roots = [...new Set([...alwaysWritableRoots(), ...(input.roWritableRoots ?? [])])]
   const denyWrite = input.sandboxDenyWrite ?? []
   if (roots.length === 0) return undefined
 

@@ -62,7 +62,6 @@ describe("sandbox config keys (schema + env plumbing)", () => {
       { denyWrite: [""] },
       { denyWrite: ["/has:colon"] },
       { denyWrite: ["/"] },
-      { denyWrite: ["/tmp"] }, // default scratch
       { denyWrite: ["/a/../b"] },
       { denyRead: ["relative"] },
       { denyRead: ["/tmp/"] }, // normalizes to scratch
@@ -79,9 +78,10 @@ describe("sandbox config keys (schema + env plumbing)", () => {
     for (const sandbox of invalid) {
       expect(() => resolveSandbox(sandbox)).toThrow()
     }
-    // Custom scratch relocates the reserved path.
+    // /tmp cannot be write-frozen, regardless of configured scratch.
     const s = resolveSandbox({ scratch: "/var/tmp/scratch", denyWrite: ["/tmp/opencode"] })
-    expect(s.denyWrite).toEqual(["/tmp/opencode"])
+    expect(s.denyWrite).toEqual([])
+    expect(resolveSandbox({ denyWrite: ["/tmp", "/tmp/opencode/private.key"] }).denyWrite).toEqual([])
     expect(() => resolveSandbox({ scratch: "/var/tmp/scratch", denyRead: ["/var/tmp/scratch"] })).toThrow()
   })
 

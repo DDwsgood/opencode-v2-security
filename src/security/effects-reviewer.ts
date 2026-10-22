@@ -3,7 +3,7 @@ import { isIP } from "node:net"
 import { STATIC_BYPASS_CATEGORIES } from "../categories"
 
 /** Six independent material-effect heads and Variant B adjudication. */
-export const EFFECTS_POLICY_VERSION = "v11-final-gold-040-five-turns-r5-variant-b"
+export const EFFECTS_POLICY_VERSION = "v12-systemone-aligned-20261021-r6"
 export const EFFECTS_MODEL = frozenPrompt.model
 
 const USER_QUESTION_AUTHORIZATION =
@@ -33,18 +33,17 @@ const READONLY_SESSION_STATE =
   "exemption. Scratch cannot override denyWrite, protected/credential paths or floors. Missing decisive " +
   "bodies/values remain unclear."
 
-const READONLY_CONFORMANCE_QUESTION = {
-  type: "choice" as const,
-  instructions:
-    "Check every nested effect against READ-ONLY SESSION: read_only=reads/inspection or permitted " +
-    "listed-root scratch, despite sudo/interop/scripts; writes=forbidden mutation even if approved; " +
-    "unclear=specific missing decisive body/value, not a mediator name.",
-  criteria: {
-    read_only: "Only read/inspection or permitted temporary-root scratch effects, including all subprocesses.",
-    writes: "An outside-temp or other forbidden mutation is established; authorization cannot override.",
-    unclear: "A specific missing effect/body/value could change read-only conformance.",
-  },
+type ReadonlyConformanceQuestion = {
+  type: "choice"
+  instructions: string
+  criteria: Record<"read_only" | "writes" | "unclear", string>
 }
+
+const readonlyPrompt = frozenPrompt as typeof frozenPrompt & {
+  readonly_question: ReadonlyConformanceQuestion
+}
+
+const READONLY_CONFORMANCE_QUESTION = readonlyPrompt.readonly_question
 
 type Category = (typeof STATIC_BYPASS_CATEGORIES)[number]
 export type EffectCategory = Exclude<Category, "indirection">
@@ -285,9 +284,16 @@ export function resolveUncollectableEffects(
   return { ...result, decision: policy, source: policy === "allow" ? "accepted_unknown" : "evidence_limit" }
 }
 
-export interface EffectsReviewOptions {
+export interface SystemOneEndpoint {
   endpoint: string
   apiKey: string
+  model?: string
+}
+
+export interface EffectsReviewOptions extends SystemOneEndpoint {
+  /** Ordered availability fallbacks, never alternate verdicts. At most two. */
+  fallbacks?: readonly SystemOneEndpoint[]
+  /** Total chain budget; each attempt reserves time for remaining endpoints. */
   timeoutMs?: number
   signal?: AbortSignal
   /** Read-only session variant: extra conformance question + session contract. */
@@ -319,50 +325,103 @@ async function boundedResponse(response: Response): Promise<unknown> {
   }
 }
 
-/** One official-contract request: no alternate-engine fallback or .env reads. */
+/** All endpoints use the same policy; a valid verdict never tries a backup. */
 export async function reviewEffects(request: EffectReviewRequest, options: EffectsReviewOptions): Promise<EffectReviewResult> {
   const body = buildEffectReviewBody(request, options.readonly === true)
+  return requestSystemOne(body, options, (payload) => {
+    if (!record(payload)) protocol("Effects review response must be an object")
+    return adjudicateEffectAnswers(payload.answers, options.readonly === true)
+  })
+}
+
+/** Shared bounded transport for effects and L3; credentials never enter state. */
+export async function requestSystemOne<T>(
+  body: { model: string; state: string; questions: unknown },
+  options: EffectsReviewOptions,
+  decode: (payload: unknown) => T,
+): Promise<T> {
   if (options.signal?.aborted) throw new EffectsReviewError("Effects review was cancelled", "aborted")
-  let endpoint: URL
-  try { endpoint = new URL(options.endpoint) } catch { protocol("Effects review endpoint is invalid") }
-  const hostname = endpoint.hostname.toLowerCase().replace(/^\[|\]$/g, "")
-  const loopback = hostname === "localhost" || (isIP(hostname) === 4 && hostname.startsWith("127.")) || hostname === "::1"
-  if ((endpoint.protocol !== "https:" && !(endpoint.protocol === "http:" && loopback)) ||
-    endpoint.username || endpoint.password || endpoint.hash) {
-    protocol("Effects review endpoint is invalid")
+  if (options.fallbacks !== undefined && (!Array.isArray(options.fallbacks) || options.fallbacks.length > 2)) {
+    protocol("Effects review accepts at most two fallbacks")
   }
-  if (typeof options.apiKey !== "string" || !options.apiKey.trim()) {
+  // Validate the complete chain before sending credentials to any endpoint.
+  const candidates = [options, ...(options.fallbacks ?? [])].map((candidate) => {
+    if (!record(candidate)) protocol("Effects review endpoint is invalid")
+    let endpoint: URL
+    if (typeof candidate.endpoint !== "string" || /[\u0000-\u001f\u007f]/.test(candidate.endpoint)) {
+      protocol("Effects review endpoint is invalid")
+    }
+    try { endpoint = new URL(candidate.endpoint) } catch { protocol("Effects review endpoint is invalid") }
+    const hostname = endpoint.hostname.toLowerCase().replace(/^\[|\]$/g, "")
+    const loopback = hostname === "localhost" || (isIP(hostname) === 4 && hostname.startsWith("127.")) || hostname === "::1"
+    if ((endpoint.protocol !== "https:" && !(endpoint.protocol === "http:" && loopback)) ||
+      endpoint.username || endpoint.password || endpoint.hash) {
+      protocol("Effects review endpoint is invalid")
+    }
+    if (candidate.model !== undefined && typeof candidate.model !== "string") {
+      protocol("Effects review model is invalid")
+    }
+    const model = (candidate.model ?? body.model)
+    if (typeof model !== "string" || !model.trim() || model.length > 256 || /[\r\n\0]/.test(model)) {
+      protocol("Effects review model is invalid")
+    }
+    if (candidate.apiKey !== undefined && typeof candidate.apiKey !== "string") {
+      protocol("Effects review credentials are invalid")
+    }
+    const apiKey = typeof candidate.apiKey === "string" ? candidate.apiKey.trim() : undefined
+    if (apiKey !== undefined && /[\r\n\0]/.test(apiKey)) {
+      protocol("Effects review credentials are invalid")
+    }
+    return { endpoint, model: model.trim(), apiKey }
+  }).filter((candidate) => candidate.apiKey)
+  if (!candidates.length) {
     throw new EffectsReviewError("Effects review is not configured", "infrastructure")
   }
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) protocol("Effects review timeout is invalid")
-  const controller = new AbortController()
-  const abort = () => controller.abort()
-  options.signal?.addEventListener("abort", abort, { once: true })
-  if (options.signal?.aborted) controller.abort()
-  const timer = setTimeout(abort, timeoutMs)
-  try {
-    const response = await (options.fetch ?? fetch)(endpoint, {
-      method: "POST",
-      redirect: "error",
-      signal: controller.signal,
-      headers: { Authorization: `Bearer ${options.apiKey}`, "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify(body),
-    })
-    if (!response.ok) {
-      await response.body?.cancel().catch(() => {})
-      // Never include provider bodies: they may echo authorization or inputs.
-      throw new EffectsReviewError(`Effects review HTTP ${response.status}`, response.status === 400 ? "protocol" : "infrastructure")
-    }
-    const payload = await boundedResponse(response)
-    if (!record(payload)) protocol("Effects review response must be an object")
-    return adjudicateEffectAnswers(payload.answers, options.readonly === true)
-  } catch (error) {
-    if (error instanceof EffectsReviewError) throw error
+  const deadline = performance.now() + timeoutMs
+  let failure = new EffectsReviewError("Effects review timed out", "infrastructure")
+  for (const [index, candidate] of candidates.entries()) {
     if (options.signal?.aborted) throw new EffectsReviewError("Effects review was cancelled", "aborted")
-    throw new EffectsReviewError(controller.signal.aborted ? "Effects review timed out" : "Effects review transport failed", "infrastructure")
-  } finally {
-    clearTimeout(timer)
-    options.signal?.removeEventListener("abort", abort)
+    const remaining = deadline - performance.now()
+    if (remaining <= 0) break
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    options.signal?.addEventListener("abort", abort, { once: true })
+    if (options.signal?.aborted) controller.abort()
+    const timer = setTimeout(abort, remaining / (candidates.length - index))
+    try {
+      const response = await (options.fetch ?? fetch)(candidate.endpoint, {
+        method: "POST",
+        redirect: "error",
+        signal: controller.signal,
+        headers: { Authorization: `Bearer ${candidate.apiKey}`, "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ ...body, model: candidate.model }),
+      })
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => {})
+        // Never include provider bodies: they may echo authorization or inputs.
+        throw new EffectsReviewError(`Effects review HTTP ${response.status}`, response.status === 400 ? "protocol" : "infrastructure")
+      }
+      const payload = await boundedResponse(response)
+      if (options.signal?.aborted) throw new EffectsReviewError("Effects review was cancelled", "aborted")
+      // A fetch implementation may ignore abort; never accept a response that
+      // arrived after this attempt's share of the total chain deadline.
+      if (controller.signal.aborted) throw new EffectsReviewError("Effects review timed out", "infrastructure")
+      const result = decode(payload)
+      if (options.signal?.aborted) throw new EffectsReviewError("Effects review was cancelled", "aborted")
+      return result
+    } catch (error) {
+      if (options.signal?.aborted || (error instanceof EffectsReviewError && error.kind === "aborted")) {
+        throw new EffectsReviewError("Effects review was cancelled", "aborted")
+      }
+      failure = error instanceof EffectsReviewError ? error : new EffectsReviewError(
+        controller.signal.aborted ? "Effects review timed out" : "Effects review transport failed", "infrastructure")
+    } finally {
+      clearTimeout(timer)
+      options.signal?.removeEventListener("abort", abort)
+    }
   }
+  if (options.signal?.aborted) throw new EffectsReviewError("Effects review was cancelled", "aborted")
+  throw failure
 }

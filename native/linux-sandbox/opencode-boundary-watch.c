@@ -1635,7 +1635,10 @@ static int resolve_at_nofollow(pid_t tid, long dirfd, uintptr_t pathptr,
     snprintf(parent, sizeof(parent), "%.*s", PATH_MAX - 1, abs);
     char *sl = strrchr(parent, '/');
     if (!sl) return 0;
-    const char *leaf = sl + 1;
+    /* Copy before splitting: for /tmp, setting parent to "/" overwrites
+     * parent[1], which is also where a pointer-only leaf would start. */
+    char leaf[PATH_MAX];
+    snprintf(leaf, sizeof(leaf), "%s", sl + 1);
     if (strcmp(leaf, ".") == 0 || strcmp(leaf, "..") == 0)
         return canon_path(abs, out) ? 1
                                     : (snprintf(out, PATH_MAX, "%.*s",
@@ -1813,6 +1816,9 @@ static int dev_allowed(const char *path)
  * Returns GATE_PASS, or the boundary class: 0 write, 1 read, 2 opaque. */
 static int classify_path(const char *path, int is_write, int metadata_op)
 {
+    /* /tmp itself and all canonical descendants are unconditionally writable
+     * in every session mode. Control-plane sockets live outside this tree. */
+    if (is_write && is_within("/tmp", path)) return GATE_PASS;
     pid_t pp;
     int pc = proc_check(path, &pp);
     if (pc == 2) return 2;

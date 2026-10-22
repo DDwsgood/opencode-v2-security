@@ -510,7 +510,8 @@ class BoundaryWatchTests(unittest.TestCase):
     def setUpClass(cls):
         global TMP, WORK, OUT
         assert os.path.exists(BIN), f"missing helper binary: {BIN}"
-        TMP = tempfile.mkdtemp(prefix="bw-", dir="/tmp/opencode")
+        # Boundary fixtures must not live inside the unconditional /tmp grant.
+        TMP = tempfile.mkdtemp(prefix="opencode-bw-", dir="/var/tmp")
         WORK = os.path.realpath(os.path.join(TMP, "work"))
         OUT = os.path.realpath(os.path.join(TMP, "outside"))
         fresh_tree()
@@ -527,6 +528,25 @@ class BoundaryWatchTests(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual(out.strip(), "hi")
         self.assertEqual(br.events, [])
+
+    def test_01b_tmp_writes_ignore_readonly_deny_and_protect(self):
+        with tempfile.TemporaryDirectory(prefix="bw-writable-", dir="/tmp/opencode") as temporary:
+            for extra_args in [[], ["--readonly"], ["--readonly", "--deny-write", temporary, "--protect", temporary]]:
+                nested = os.path.join(temporary, "security-boundary-child", "nested")
+                target = os.path.join(nested, "private.key")
+                # mkdir -p really probes mkdir("/tmp"): its leaf must remain
+                # /tmp during NOFOLLOW-last resolution, not become "/".
+                script = (f"mkdir -p /tmp /tmp/opencode {nested}; "
+                          f"printf fixture > {target}; chmod 600 {target}; "
+                          f"mv {target} {nested}/.env.fixture")
+                proc, br = run_watch(script, lambda e, i: "deny", extra_args=extra_args)
+                rc, out, err = wait_proc(proc)
+                br.join(timeout=5)
+                br.close()
+                self.assertEqual(rc, 0, err)
+                self.assertEqual(br.events, [])
+                with open(os.path.join(nested, ".env.fixture")) as result:
+                    self.assertEqual(result.read(), "fixture")
 
     # 2. In-root write passes, out-of-root write => boundary event; broker
     #    deny => exit 126, the out file must NOT exist, the in file must.
@@ -920,14 +940,21 @@ print("sent")
         proc, br = run_watch(f"rm {WORK}/link/../victim.txt",
                              lambda e, i: "deny")
         rc, out, err = wait_proc(proc)
+        br.join(timeout=5)
         br.close()
         self.assertEqual(rc, 126, err)
         self.assertEqual(len(br.events), 1)
         self.assertEqual(br.events[0]["targets"][0]["path"], victim)
         self.assertTrue(os.path.exists(victim))
-        # The operation was held, but all runtime phases share one outcome.
-        self.assertIn("The command was stopped.", err)
-        self.assertNotIn("was not performed", err)
+        # The helper is silent on stdio (the host renders every agent-facing
+        # notice); the structured refusal is the broker deny plus the single
+        # terminal frame. An entry-side denial is a plain 137, never a
+        # fail-open code: all runtime phases share one outcome.
+        self.assertEqual(err, "")
+        self.assertEqual(br.replies[0]["action"], "deny")
+        self.assertEqual(len(br.exits), 1)
+        self.assertEqual(br.exits[0]["exit"], 137)
+        self.assertNotIn("failure", br.exits[0])
 
     # 25. linkat source is followed only under AT_SYMLINK_FOLLOW ('ln -L'):
     #     the default physical link of an in-root symlink raises no event.
@@ -1092,15 +1119,16 @@ print("sent")
         self.assertEqual(br.events[0]["operation"], "metadata")
         self.assertEqual(br.events[0]["targets"][0]["path"], "/dev/null")
 
-    # 34. A cancel while the (detached) payload is still running must say
-    #     "The command was stopped", just like entry and unknown-phase stops.
-    #     (The only exit-side event, recvfd/SCM_RIGHTS, cannot be exercised
-    #     live: its sendmsg sibling is full-approval, which only 'allow'
-    #     can pass — and 'allow' ends supervision. Wording coverage for the
-    #     post-entry paths comes from this cancel instead.)
-    def test_34_running_cancel_wording(self):
-        proc, br = run_watch(f"echo x > {OUT}/f.txt; sleep 30",
-                             lambda e, i: "allow")
+    # 34. A cancel while the (detached) payload is still running fails the
+    #     command closed exactly like an entry-phase stop, and reaches the
+    #     detached tree. The helper writes no notices to stdio: the refusal
+    #     is the 126 exit plus the killed payload (the terminal frame dies
+    #     with the closed channel, so there is nothing to record).
+    def test_34_running_cancel_fails_closed(self):
+        pidfile = f"{WORK}/running.pid"
+        proc, br = run_watch(
+            f"echo x > {OUT}/f.txt; sleep 30 & echo $! > {pidfile}; wait",
+            lambda e, i: "allow")
         for _ in range(100):
             if br.replies:
                 break
@@ -1109,10 +1137,14 @@ print("sent")
         time.sleep(0.3)
         br.close()  # broker disconnect mid-run = cancel
         rc, out, err = wait_proc(proc, timeout=15)
+        br.join(timeout=5)
         self.assertEqual(rc, 126, err)
-        self.assertIn("Command blocked", err)
-        self.assertIn("The command was stopped", err)
-        self.assertNotIn("was not performed", err)
+        self.assertEqual(err, "")
+        with open(pidfile) as f:
+            cancelled = int(f.read().strip())
+        time.sleep(0.3)
+        self.assertFalse(os.path.exists(f"/proc/{cancelled}"),
+                         f"detached payload {cancelled} survived the cancel")
 
     # 35. Host SIGTERM on the watcher tears down the WHOLE tree — including
     #     a detached, setsid'd survivor that killpg can no longer reach.
@@ -1129,16 +1161,16 @@ print("sent")
         time.sleep(0.3)
         proc.send_signal(15)  # SIGTERM — the host spawner's .kill()
         rc, out, err = wait_proc(proc, timeout=15)
+        br.join(timeout=5)
         br.close()
         self.assertEqual(rc, 143, err)
-        self.assertEqual(err, "Command cancelled: the run was terminated before it finished; "
-                         "this is not a security denial.\n")
-        self.assertNotIn("Command blocked", err)
-        self.assertNotIn("stopped", err)
-        self.assertNotIn("Do not automatically rerun or bypass this denial", err)
-        self.assertNotIn("Report this block to the user", err)
-        self.assertNotIn("Any revised request requires a fresh check", err)
-        self.assertNotIn("retry", err.lower())
+        # No stdio notices (the host renders them); the structured cancel is
+        # the terminal frame carrying the cancellation failure code, never a
+        # denial code.
+        self.assertEqual(err, "")
+        self.assertEqual(len(br.exits), 1)
+        self.assertEqual(br.exits[0]["exit"], 137)
+        self.assertEqual(br.exits[0]["failure"], "observer_cancelled")
         with open(pidfile) as f:
             sidpid = int(f.read().strip())
         time.sleep(0.3)
@@ -1226,15 +1258,22 @@ print("sent")
         proc, br = run_watch(f"echo x > {OUT}/f.txt",
                              lambda e, i: "deny", env=env)
         rc, out, err = wait_proc(proc)
+        br.join(timeout=5)
         br.close()
         self.assertEqual(rc, 126, err)
-        self.assertIn("could not be frozen", err)
+        self.assertEqual(err, "")
         self.assertFalse(os.path.exists(f"{OUT}/f.txt"))
+        # Failing closed is the fixed observer_freeze code on the terminal
+        # frame — the broker can record it without any stdio notice.
+        self.assertEqual(len(br.exits), 1)
+        self.assertEqual(br.exits[0]["exit"], 137)
+        self.assertEqual(br.exits[0]["failure"], "observer_freeze")
 
-    # 40. A failed PR_SET_CHILD_SUBREAPER (injected) is a launch refusal:
-    #     the cancel guarantee is load-bearing, so the payload must never
-    #     start and no permit path may run — no events, no exit frame, no
-    #     broker connection at all (the helper dies before connecting).
+    # 40. A failed PR_SET_CHILD_SUBREAPER (injected) is a launch refusal: the
+    #     cancel guarantee is load-bearing, so the payload must never start and
+    #     no permit path may run — no events, no payload effect. The refusal is
+    #     reported as the fixed observer_setup code on the terminal frame (125)
+    #     and nothing is written to stdio.
     def test_40_subreaper_failure_starts_nothing(self):
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1",
                    BW_TEST_SUBREAPER_FAIL="1")
@@ -1242,11 +1281,13 @@ print("sent")
                              lambda e, i: "allow", env=env)
         rc, out, err = wait_proc(proc)
         self.assertEqual(rc, 125, err)
-        self.assertIn("CHILD_SUBREAPER", err)
-        time.sleep(0.3)
+        self.assertEqual(err, "")
+        br.join(timeout=5)
         br.close()
         self.assertEqual(br.events, [])
-        self.assertEqual(br.exits, [])
+        self.assertEqual(len(br.exits), 1)
+        self.assertEqual(br.exits[0]["exit"], 125)
+        self.assertEqual(br.exits[0]["failure"], "observer_setup")
         self.assertFalse(os.path.exists(f"{OUT}/subreaper-ran"))
 
     # 41. fd-rebind coordination: a sibling dup2 on an fd whose pipe
@@ -1381,10 +1422,16 @@ print("sent")
             "'")
         proc, br = run_watch(script, lambda e, i: "continue", env=env)
         rc, out, err = wait_proc(proc)
+        br.join(timeout=5)
         br.close()
         self.assertEqual(rc, 126, err)
-        self.assertIn("clone3 argument block could not be read", err)
+        self.assertEqual(err, "")
         self.assertEqual(br.events, [])
+        # Fail-closed inspection refusal, reported structurally: 137 on the
+        # terminal frame with the observer_inspection code, no stdio notice.
+        self.assertEqual(len(br.exits), 1)
+        self.assertEqual(br.exits[0]["exit"], 137)
+        self.assertEqual(br.exits[0]["failure"], "observer_inspection")
 
     # 46. Closed-slot observation coordination: the gate sees fd 10 closed
     #     (write -> EBADF pass), and a same-table sibling's fd-allocating
@@ -1566,21 +1613,24 @@ print("sent")
                     f"printf fixture > {target}", policy,
                     extra_args=["--fail-open"])
                 code, out, err = wait_proc(proc)
+                broker.join(timeout=5)
                 broker.close()
                 self.assertFalse(os.path.exists(target))
+                self.assertEqual(err, "")
+                self.assertEqual(len(broker.exits), 1)
+                self.assertEqual(broker.exits[0]["exit"], 137)
                 if action == "deny":
-                    self.assertEqual(code, 126, err)
-                    self.assertIn("Command blocked:", err)
+                    # An explicit denial is policy, not a review failure:
+                    # fail-open must never turn it into a detached run.
+                    self.assertEqual(code, 126)
+                    self.assertEqual(broker.replies[0]["action"], "deny")
+                    self.assertNotIn("failure", broker.exits[0])
                 else:
-                    self.assertEqual(code, 130, err)
-                    self.assertEqual(err, "Command cancelled: the run was terminated before it finished; "
-                                     "this is not a security denial.\n")
-                    self.assertNotIn("Command blocked", err)
-                    self.assertNotIn("stopped", err)
-                    self.assertNotIn("Do not automatically rerun or bypass this denial", err)
-                    self.assertNotIn("Report this block to the user", err)
-                    self.assertNotIn("Any revised request requires a fresh check", err)
-                    self.assertNotIn("retry", err.lower())
+                    # An explicit cancel frame is also policy: it cancels
+                    # rather than degrading to the broker-EOF fail-open path.
+                    self.assertEqual(code, 130)
+                    self.assertEqual(broker.exits[0]["failure"],
+                                     "observer_cancelled")
 
     def test_56_fail_open_idle_eof_releases_whole_tree(self):
         fresh_tree()
@@ -1602,18 +1652,17 @@ print("sent")
             extra_args=["--fail-open"], eof_delay=0.2,
             idle_control=[b'{"version":1,"type":"can', b'cel"}\n'])
         code, out, err = wait_proc(proc)
+        broker.join(timeout=5)
         broker.close()
         self.assertEqual(code, 130, err)
         self.assertFalse(os.path.exists(target))
-        self.assertEqual(err, "Command cancelled: the run was terminated before it finished; "
-                         "this is not a security denial.\n")
-        self.assertNotIn("Command blocked", err)
-        self.assertNotIn("stopped", err)
-        self.assertNotIn("Do not automatically rerun or bypass this denial", err)
-        self.assertNotIn("Report this block to the user", err)
-        self.assertNotIn("Any revised request requires a fresh check", err)
-        self.assertNotIn("retry", err.lower())
+        # Bounded cancellation, not a fail-open release: no stdio notice,
+        # no boundary event, and the terminal frame carries the cancel code.
+        self.assertEqual(err, "")
         self.assertEqual(broker.events, [])
+        self.assertEqual(len(broker.exits), 1)
+        self.assertEqual(broker.exits[0]["exit"], 137)
+        self.assertEqual(broker.exits[0]["failure"], "observer_cancelled")
 
     def test_58_unfinished_idle_control_frame_uses_bounded_cancel(self):
         fresh_tree()
@@ -1623,18 +1672,15 @@ print("sent")
             extra_args=["--fail-open"], eof_delay=0.2,
             idle_control=[b'{"version":1,"type":"cancel"}'])
         code, out, err = wait_proc(proc)
+        broker.join(timeout=5)
         broker.close()
         self.assertEqual(code, 130, err)
         self.assertFalse(os.path.exists(target))
-        self.assertEqual(err, "Command cancelled: the run was terminated before it finished; "
-                         "this is not a security denial.\n")
-        self.assertNotIn("Command blocked", err)
-        self.assertNotIn("stopped", err)
-        self.assertNotIn("Do not automatically rerun or bypass this denial", err)
-        self.assertNotIn("Report this block to the user", err)
-        self.assertNotIn("Any revised request requires a fresh check", err)
-        self.assertNotIn("retry", err.lower())
+        self.assertEqual(err, "")
         self.assertEqual(broker.events, [])
+        self.assertEqual(len(broker.exits), 1)
+        self.assertEqual(broker.exits[0]["exit"], 137)
+        self.assertEqual(broker.exits[0]["failure"], "observer_cancelled")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

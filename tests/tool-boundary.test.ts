@@ -13,7 +13,7 @@ import {
   verifyShellBoundaryPlan,
 } from "../src/tool-boundary"
 
-const root = await mkdtemp("/tmp/opencode/tool-boundary-")
+const root = await mkdtemp("/var/tmp/opencode-tool-boundary-")
 const workspace = path.join(root, "workspace")
 const outside = path.join(root, "outside")
 await mkdir(workspace)

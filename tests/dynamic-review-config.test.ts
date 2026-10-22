@@ -23,6 +23,34 @@ afterEach(() => {
 })
 
 describe("dynamicReview JEV-only resolution", () => {
+  test("up to two independent backups remain usable when the primary key is missing", () => {
+    setEnv(JEV_ENV, undefined)
+    setEnv(FALLBACK_ENV, undefined)
+    setEnv("SYSTEMONE_BACKUP_KEY", "fixture-backup")
+    const backup = { endpoint: "https://backup.invalid/v1/systemone", model: "clef", apiKeyEnv: "SYSTEMONE_BACKUP_KEY" }
+    const resolved = resolvePluginConfig({ dynamicReview: { jev: { fallbacks: [backup] } } })
+    expect(resolved.dynamicReview.available).toBe(true)
+    expect(resolved.dynamicReview.reason).toBeUndefined()
+    expect(resolved.dynamicReview.jev?.apiKey).toBeUndefined()
+    expect(resolved.dynamicReview.jev?.reason).toBeUndefined()
+    expect(resolved.dynamicReview.jev?.fallbacks).toEqual([{ endpoint: backup.endpoint, model: "clef", apiKey: "fixture-backup" }])
+    for (const fallbacks of [[backup, backup, backup], [{ ...backup, endpoint: "http://remote.invalid" }], [{ model: "clef" }]]) {
+      expect(resolvePluginConfig({ dynamicReview: { jev: { fallbacks } } }).dynamicReview.available).toBe(false)
+    }
+    // An invalid primary is a local config error; it is never rescued by a valid backup.
+    expect(resolvePluginConfig({
+      dynamicReview: { jev: { endpoint: "http://remote.invalid", fallbacks: [backup] } },
+    }).dynamicReview.available).toBe(false)
+    // A primary-only OC_API_KEY remains the primary's documented fallback and
+    // must never be borrowed by a backup with its own env.
+    setEnv(FALLBACK_ENV, "primary-only")
+    setEnv("SYSTEMONE_BACKUP_KEY", undefined)
+    const missing = resolvePluginConfig({ dynamicReview: { jev: { fallbacks: [backup] } } })
+    expect(missing.dynamicReview.available).toBe(true)
+    expect(missing.dynamicReview.jev?.apiKey).toBe("primary-only")
+    expect(missing.dynamicReview.jev?.fallbacks?.[0].apiKey).toBeUndefined()
+  })
+
   test("no dynamicReview → unavailable, reviewer jev, onUncollectable allow", () => {
     const resolved = resolvePluginConfig({})
     expect(resolved.dynamicReview.available).toBe(false)

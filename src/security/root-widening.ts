@@ -1,8 +1,7 @@
 import { opendir } from "node:fs/promises"
-import { isIP } from "node:net"
 import path from "node:path"
 import { canonicalCandidate } from "./automatic-write-roots"
-import { EFFECTS_MODEL, type EffectsReviewOptions } from "./effects-reviewer"
+import { EFFECTS_MODEL, EffectsReviewError, requestSystemOne, type EffectsReviewOptions } from "./effects-reviewer"
 import { containsWritePath, writeRootRejection, writeTargetExempt, type WriteRootPolicy } from "./write-root-policy"
 import type { RuntimeBoundaryEvent } from "../runtime-boundary"
 
@@ -76,50 +75,14 @@ export function parseRootWideningChoice(payload: unknown, candidates: readonly R
 
 export async function reviewRootWidening(input: RootWideningInput, options: EffectsReviewOptions): Promise<unknown> {
   const body = buildRootWideningBody(input)
-  const endpoint = new URL(options.endpoint)
-  const hostname = endpoint.hostname.toLowerCase().replace(/^\[|\]$/g, "")
-  const loopback = hostname === "localhost" || (isIP(hostname) === 4 && hostname.startsWith("127.")) || hostname === "::1"
-  if ((endpoint.protocol !== "https:" && !(endpoint.protocol === "http:" && loopback)) ||
-    endpoint.username || endpoint.password || endpoint.hash || !options.apiKey.trim()) throw new Error("L3 configuration")
-  const timeoutMs = options.timeoutMs ?? 30_000
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("L3 timeout")
-  const controller = new AbortController()
-  const abort = () => controller.abort()
-  options.signal?.addEventListener("abort", abort, { once: true })
-  if (options.signal?.aborted) controller.abort()
-  const timer = setTimeout(abort, timeoutMs)
-  try {
-    const response = await (options.fetch ?? fetch)(endpoint, {
-      method: "POST", redirect: "error", signal: controller.signal,
-      headers: { Authorization: `Bearer ${options.apiKey}`, "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify(body),
-    })
-    if (!response.ok) {
-      await response.body?.cancel().catch(() => {})
-      throw new Error("L3 HTTP failure")
-    }
-    const reader = response.body?.getReader()
-    if (!reader) throw new Error("L3 empty response")
-    const chunks: Uint8Array[] = []
-    let bytes = 0
+  return requestSystemOne(body, options, (payload) => {
     try {
-      for (;;) {
-        const chunk = await reader.read()
-        if (chunk.done) break
-        bytes += chunk.value.byteLength
-        if (bytes > 1024 * 1024) throw new Error("L3 response size")
-        chunks.push(chunk.value)
-      }
-    } finally {
-      await reader.cancel().catch(() => {})
+      parseRootWideningChoice(payload, input.candidates)
+    } catch {
+      throw new EffectsReviewError("L3 choice protocol", "protocol")
     }
-    const payload: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"))
-    parseRootWideningChoice(payload, input.candidates)
     return payload
-  } finally {
-    clearTimeout(timer)
-    options.signal?.removeEventListener("abort", abort)
-  }
+  })
 }
 
 const HIGH_VALUE_NAMES = [

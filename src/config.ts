@@ -3,7 +3,8 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { homedir } from "node:os"
 import { credentialStoreReadPaths } from "./security/paths"
-import { resolveAllowWriteRoots } from "./security/write-root-policy"
+import { resolveAllowWriteRoots, runtimeBrokerBase } from "./security/write-root-policy"
+import { canonicalCandidate, isAlwaysWritablePath } from "./security/automatic-write-roots"
 import {
   reviewCommandWithAuditor,
   type CloudReviewRequest,
@@ -65,6 +66,10 @@ export type JevReviewOptions = {
   /** Environment variable holding the Jev key (default "JEV_API_KEY"; the
    * "OC_API_KEY" env var is accepted as a fallback). */
   apiKeyEnv?: string
+  /** Ordered SystemOne backups; at most two. Each entry must name its own
+   * endpoint, model and key environment variable. A missing key skips that
+   * backup; it is never filled from the primary key or OC_API_KEY. */
+  fallbacks?: Array<{ endpoint: string; model: string; apiKeyEnv: string }>
   [key: string]: unknown
 }
 
@@ -132,9 +137,10 @@ export type BashClassifierOptions = {
   /** Append one JSONL line to ~/.opencode/reviewer-trace.jsonl for every
    * dynamic review (verdict or error) and every dynamic cache hit. */
   logReviewerTrace?: boolean
-  /** Command prefixes the user trusts (`"agent-browser"`, `"opencode2 --version"`).
-   * A shell segment whose argv starts with one of them is statically allowed
-   * after every danger scan has passed. Bare names match PATH lookups only. */
+  /** Trusted argv prefixes; `*` and `?` are wildcards, a final `*` also
+   * matches remaining arguments. Bare names match PATH lookups only.
+   * In read/write sessions, trusted-only shell calls bypass runtime review
+   * after static checks; redirects and additional commands are not trusted. */
   trustedCommands?: string[]
   /** Permanently armed escape-hatch categories (all sessions, all clients). */
   BypassClassifier?: Array<BypassCategory | keyof typeof LEGACY_CATEGORY_ALIASES>
@@ -164,6 +170,9 @@ export type ResolvedJevReview = {
   endpoint: string
   model: string
   apiKey?: string
+  /** Ordered availability backups, each with its own resolved key when the
+   *  configured environment variable is present. */
+  fallbacks?: Array<{ endpoint: string; model: string; apiKey?: string }>
   /** Human-readable unavailability reason; never contains secrets. */
   reason?: string
 }
@@ -417,7 +426,7 @@ const ALLOWED_DYNAMIC_FIELDS = new Set([
   "onUncollectable",
 ])
 
-const ALLOWED_JEV_FIELDS = new Set(["enabled", "model", "endpoint", "apiKeyEnv"])
+const ALLOWED_JEV_FIELDS = new Set(["enabled", "model", "endpoint", "apiKeyEnv", "fallbacks"])
 
 const DEFAULT_JEV_ENDPOINT = "https://opencode.ai/zen/v1/systemone"
 const DEFAULT_JEV_MODEL = "jev-latest"
@@ -510,7 +519,7 @@ function resolveJevEndpoint(raw: unknown): { endpoint?: string; reason?: string 
   return { endpoint: `${parsed.protocol}//${parsed.host}${parsed.pathname}${parsed.search}` }
 }
 
-function resolveJev(raw: unknown): { jev?: ResolvedJevReview; reason?: string } {
+function resolveJev(raw: unknown, backup = false): { jev?: ResolvedJevReview; reason?: string } {
   if (raw === undefined) return {}
   if (!isPlainObject(raw)) return { reason: "dynamicReview.jev must be an object" }
   for (const key of Object.keys(raw)) {
@@ -524,6 +533,24 @@ function resolveJev(raw: unknown): { jev?: ResolvedJevReview; reason?: string } 
   }
   if (source.enabled === false) {
     return { jev: { available: false, endpoint: "", model: "", reason: "jev reviewer is disabled" } }
+  }
+  const fallbacks: NonNullable<ResolvedJevReview["fallbacks"]> = []
+  if (source.fallbacks !== undefined) {
+    if (backup || !Array.isArray(source.fallbacks) || source.fallbacks.length > 2) {
+      return { reason: "dynamicReview.jev.fallbacks must be an array of at most two endpoints" }
+    }
+    for (const [index, candidate] of source.fallbacks.entries()) {
+      const label = `dynamicReview.jev.fallbacks[${index}]`
+      if (!isPlainObject(candidate) || Object.keys(candidate).some((key) => !["endpoint", "model", "apiKeyEnv"].includes(key)) ||
+        ["endpoint", "model", "apiKeyEnv"].some((key) => typeof candidate[key] !== "string" || !candidate[key].trim())) {
+        return { reason: `${label} requires endpoint, model and apiKeyEnv strings only` }
+      }
+      const resolved = resolveJev(candidate, true)
+      if (resolved.reason || !resolved.jev) {
+        return { reason: (resolved.reason ?? "dynamicReview.jev is invalid").replace("dynamicReview.jev", label) }
+      }
+      fallbacks.push({ endpoint: resolved.jev.endpoint, model: resolved.jev.model, apiKey: resolved.jev.apiKey })
+    }
   }
   const endpointResult = resolveJevEndpoint(source.endpoint)
   if (endpointResult.reason) return { reason: endpointResult.reason }
@@ -543,16 +570,24 @@ function resolveJev(raw: unknown): { jev?: ResolvedJevReview; reason?: string } 
   }
   const apiKey = (
     process.env[envName] ??
-    process.env[FALLBACK_JEV_KEY_ENV] ??
+    (backup ? undefined : process.env[FALLBACK_JEV_KEY_ENV]) ??
     ""
   ).trim()
   if (!apiKey) {
+    const backupAvailable = fallbacks.some((candidate) => !!candidate.apiKey)
     return {
       jev: {
-        available: false,
+        // A usable backup keeps the chain available; the primary's missing key
+        // is not an unavailability reason for the whole chain. Backups never
+        // borrow the primary or OC_API_KEY credentials; the primary keeps its
+        // legacy OC_API_KEY fallback.
+        available: backupAvailable,
         endpoint: endpointResult.endpoint!,
         model: modelResult.model,
-        reason: `jev api key is not configured (${envName}${envName === FALLBACK_JEV_KEY_ENV ? "" : ` or ${FALLBACK_JEV_KEY_ENV}`})`,
+        ...(source.fallbacks !== undefined ? { fallbacks } : {}),
+        ...(backupAvailable
+          ? {}
+          : { reason: `jev api key is not configured (${envName}${envName === FALLBACK_JEV_KEY_ENV ? "" : ` or ${FALLBACK_JEV_KEY_ENV}`})` }),
       },
     }
   }
@@ -565,6 +600,7 @@ function resolveJev(raw: unknown): { jev?: ResolvedJevReview; reason?: string } 
       endpoint: endpointResult.endpoint!,
       model: modelResult.model,
       apiKey,
+      ...(source.fallbacks !== undefined ? { fallbacks } : {}),
     },
   }
 }
@@ -847,6 +883,10 @@ function resolveSandboxPathList(raw: unknown, field: string, scratch: string): s
       throw new Error(`sandbox.${field} entries must be absolute path strings`)
     }
     const trimmed = entry.trim()
+    if (field === "denyWrite") {
+      const canonical = canonicalCandidate(path.normalize(trimmed))
+      if (canonical !== undefined && isAlwaysWritablePath(canonical)) continue
+    }
     if (trimmed.includes(":")) {
       throw new Error(`sandbox.${field} entries may not contain ":" (colon breaks the env encoding): ${trimmed}`)
     }
@@ -975,8 +1015,8 @@ export function resolveSandbox(raw: unknown): ResolvedSandbox {
   const allowWrite = resolveAllowWriteRoots(source.allowWrite, {
     home: homedir(), cwd: PACKAGE_ROOT,
     credentialPaths: credentialStoreReadPaths(homedir()), denyWrite: resolved.denyWrite,
-    protect: [PACKAGE_ROOT, path.join(PACKAGE_ROOT, "bin", "opencode-boundary-watch")],
-    brokerBase: "/tmp/opencode",
+    protect: [PACKAGE_ROOT, path.join(PACKAGE_ROOT, "bin", "opencode-boundary-watch"), runtimeBrokerBase()],
+    brokerBase: runtimeBrokerBase(),
   })
   resolved.allowWrite = allowWrite.roots
   resolved.allowWriteWarnings = allowWrite.warnings
@@ -1172,8 +1212,8 @@ export function resolvePluginConfig(raw?: BashClassifierOptions): ResolvedPlugin
     }
     for (const entry of source.trustedCommands) {
       const words = entry.trim().split(/\s+/).filter(Boolean)
-      if (words.length === 0 || words.some((word) => /[$`'"\\;&|<>(){}*?[\]]/.test(word))) {
-        throw new Error(`trustedCommands entry must be plain words without shell syntax: ${JSON.stringify(entry)}`)
+      if (words.length === 0 || words.some((word) => /[$`'"\\;&|<>(){}[\]]/.test(word))) {
+        throw new Error(`trustedCommands entry must be plain words or wildcard patterns without shell syntax: ${JSON.stringify(entry)}`)
       }
     }
     trustedCommands = source.trustedCommands.map((entry) => entry.trim())

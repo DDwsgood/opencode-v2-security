@@ -5,7 +5,7 @@
 import { AsyncLocalStorage } from "node:async_hooks"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { isStandardCacheWrite } from "./automatic-write-roots"
+import { canonicalCandidate, isAlwaysWritablePath, isStandardCacheWrite } from "./automatic-write-roots"
 
 /** Set for the duration of one classification: read-write ("rw") or
  *  read-only ("ro"). Lexer and vocabulary relaxations that only exist to
@@ -207,7 +207,10 @@ export type ResolvedPath = {
 }
 
 export function resolveLexical(rawInput: string, cwd: string, home: string): ResolvedPath {
-  const raw = stripQuotes(rawInput).replaceAll("\\", "/")
+  let raw = stripQuotes(rawInput).replaceAll("\\", "/")
+  if (process.platform === "win32" && process.env.TEMP) {
+    raw = raw.replace(/^(?:\$env:TEMP|\$\{env:TEMP\}|%TEMP%)(?=$|\/)/i, () => process.env.TEMP!.replaceAll("\\", "/"))
+  }
   const result: ResolvedPath = { raw, absolute: undefined, isAbsolute: raw.startsWith("/"), foreignHome: false }
   if (!raw) return result
 
@@ -222,6 +225,12 @@ export function resolveLexical(rawInput: string, cwd: string, home: string): Res
     result.foreignHome = selfBase !== "" && other.toLowerCase() !== selfBase
     if (result.foreignHome) return result
     value = home + value.slice(1 + other.length)
+  }
+
+  if (process.platform === "win32") {
+    result.absolute = path.win32.resolve(cwd, value).replaceAll("\\", "/")
+    result.isAbsolute = path.win32.isAbsolute(value)
+    return result
   }
 
   const isAbsolute = value.startsWith("/")
@@ -412,6 +421,10 @@ export function classifyPathTarget(raw: string, mode: "read" | "write" | "delete
   }
   if (mode === "write" && /[*?[{]/.test(resolved.raw)) {
     return { kind: "ask", rule: "execution.unparseable-path", reason: REASON_UNPARSEABLE }
+  }
+  if (mode !== "read" && resolved.absolute !== undefined) {
+    const canonical = canonicalCandidate(resolved.absolute)
+    if (canonical !== undefined && isAlwaysWritablePath(canonical)) return { kind: "pass" }
   }
 
   const flags: SensitivityFlags = { critical: false, credential: false, systemWrite: false }

@@ -19,7 +19,7 @@ let logs: string
 let workspace: string
 let policy: WriteRootPolicy
 beforeAll(async () => {
-  root = await mkdtemp("/tmp/opencode/l3-roots-")
+  root = await mkdtemp("/var/tmp/opencode-l3-roots-")
   home = path.join(root, "home")
   logs = path.join(home, ".local/share/opencode/log")
   workspace = path.join(root, "workspace")
@@ -229,6 +229,55 @@ describe("L3 official choice request", () => {
     expect(JSON.parse(observed!.body as string)).toEqual(buildRootWideningBody(input()))
     expect(observed!.headers).toMatchObject({ Authorization: "Bearer fake-test-key" })
     expect(observed!.signal).toBeInstanceOf(AbortSignal)
+  })
+  test("availability failures use ordered L3 backups with their own model and credentials", async () => {
+    const calls: Array<{ url: string; model: string; authorization: string | null }> = []
+    const fetchFn = (async (url: URL, init: RequestInit) => {
+      calls.push({
+        url: String(url),
+        model: JSON.parse(init.body as string).model,
+        authorization: new Headers(init.headers).get("Authorization"),
+      })
+      if (calls.length === 1) return new Response("provider body must not leak", { status: 503 })
+      if (calls.length === 2) throw new Error("transport fixture")
+      return new Response(JSON.stringify(answer("root_1")))
+    }) as unknown as typeof fetch
+    const result = await reviewRootWidening(input(), {
+      endpoint: "https://primary.invalid/jev",
+      apiKey: "primary-key",
+      model: "clef",
+      fallbacks: [
+        { endpoint: "https://second.invalid/jev", apiKey: "second-key", model: "typesafe/jev" },
+        { endpoint: "https://third.invalid/jev", apiKey: "third-key", model: "jev-latest" },
+      ],
+      fetch: fetchFn,
+    })
+    expect(parseRootWideningChoice(result, input().candidates)).toBe("root_1")
+    expect(calls.map((call) => [call.model, call.authorization])).toEqual([
+      ["clef", "Bearer primary-key"],
+      ["typesafe/jev", "Bearer second-key"],
+      ["jev-latest", "Bearer third-key"],
+    ])
+  })
+  test("a valid L3 choice is final and local endpoint config is never retried elsewhere", async () => {
+    let calls = 0
+    const tracked = (async () => { calls++; return new Response(JSON.stringify(answer("none"))) }) as unknown as typeof fetch
+    const result = await reviewRootWidening(input(), {
+      endpoint: "https://primary.invalid/jev", apiKey: "primary-key",
+      fallbacks: [{ endpoint: "https://second.invalid/jev", apiKey: "second-key" }], fetch: tracked,
+    })
+    expect(parseRootWideningChoice(result, input().candidates)).toBe("none")
+    expect(calls).toBe(1)
+    for (const fallbacks of [
+      [{ endpoint: "http://remote.invalid/jev", apiKey: "second-key" }],
+      [{ endpoint: "https://user:pass@second.invalid/jev", apiKey: "second-key" }],
+    ]) {
+      calls = 0
+      await expect(reviewRootWidening(input(), {
+        endpoint: "https://primary.invalid/jev", apiKey: "primary-key", fallbacks, fetch: tracked,
+      })).rejects.toMatchObject({ kind: "protocol" })
+      expect(calls).toBe(0)
+    }
   })
 })
 

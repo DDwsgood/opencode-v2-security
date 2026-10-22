@@ -1,6 +1,6 @@
 {
   "name": "opencode-v2-security",
-  "version": "1.8.1",
+  "version": "1.9.0",
   "description": "Autonomous execution-boundary security for OpenCode V2: scoped assessments, one-call authorization, bypass leases, and session read/write permission ceilings.",
   "type": "module",
   "repository": {

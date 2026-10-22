@@ -126,12 +126,12 @@ import {
   type SharedStateEvent,
 } from "./security/shared-state"
 import { linkedWorktreePrivateDir } from "./security/worktree-roots"
-import { globalTempWriteRoots, incidentalWriteRoots, isIncidentalToolWrite, standardCacheWriteRoots } from "./security/automatic-write-roots"
+import { globalTempWriteRoots, incidentalWriteRoots, isAlwaysWritablePath, isIncidentalToolWrite, standardCacheWriteRoots } from "./security/automatic-write-roots"
 import { checkPathSensitivity, credentialStoreReadPaths } from "./security/paths"
-import { isRuntimeBrokerPath, writeRootRejection, writeTargetExempt, type WriteRootPolicy } from "./security/write-root-policy"
+import { isRuntimeBrokerPath, runtimeBrokerBase, writeRootRejection, writeTargetExempt, type WriteRootPolicy } from "./security/write-root-policy"
 import { createRootWidening, reviewRootWidening, L3_POLICY_VERSION, type L3Trace, type RootWideningContext, type RootWideningInput, type RootWideningScope } from "./security/root-widening"
 import { boundaryCoreDigest, observedNetworkEndpoint, type ApprovalCacheFacts, type ApprovalCacheScope, type ApprovalCacheTarget } from "./security/approval-cache"
-import { createRuntimeBoundaryBroker, currentCacheTargets, targetIdentitiesMatch, runtimeWriteEffect, staticCrossingReview, type RuntimeBoundaryBroker, type RuntimeBoundaryEvent } from "./runtime-boundary"
+import { createRuntimeBoundaryBroker, currentCacheTargets, targetIdentitiesMatch, runtimeWriteEffect, staticCrossingReview, trustedRuntimeCommand, type RuntimeBoundaryBroker, type RuntimeBoundaryEvent } from "./runtime-boundary"
 import { inspectRegularTextFileSync, inspectionErrorCode } from "./security/inspection"
 import { scan } from "./security/shell-scan"
 import { createSingleFlight } from "./security/single-flight"
@@ -273,8 +273,8 @@ function runtimeProtectedPaths(workspace: string): string[] {
   // A session opened in the plugin source may develop it; unrelated sessions
   // still cannot modify the installation. Never relax the live observer image.
   return containsPath(PACKAGE_ROOT, workspace)
-    ? [DEFAULT_BOUNDARY_WATCH_HELPER]
-    : [DEFAULT_BOUNDARY_WATCH_HELPER, PACKAGE_ROOT]
+    ? [DEFAULT_BOUNDARY_WATCH_HELPER, runtimeBrokerBase()]
+    : [DEFAULT_BOUNDARY_WATCH_HELPER, PACKAGE_ROOT, runtimeBrokerBase()]
 }
 
 const PROMPT_VERSION = "v7-execution-scope"
@@ -1520,8 +1520,9 @@ const plugin: Plugin = {
       for (const authorization of boundaryCalls.values()) {
         if (authorization.sessionID !== sessionID) continue
         if (authorization.securitySnapshot === currentSnapshot) continue
-        if (!authorization.runtimeBlocked) {
+        if (!authorization.runtimeBlocked || authorization.runtimeFailureCode) {
           authorization.runtimeBlocked = "Session permissions or authorization changed"
+          authorization.runtimeFailureCode = undefined
           authorization.runtimeBlockDetails = { advice: RECHECK }
         }
         if (authorization.runtimeBroker) void authorization.runtimeBroker.close()
@@ -2022,6 +2023,8 @@ const plugin: Plugin = {
       cancelExecution?: () => void
       cacheUpdates?: Array<{ scope: ApprovalCacheScope; facts: ApprovalCacheFacts }>
       runtimeBlocked?: string
+      /** Infrastructure source only; never set for an actual policy refusal. */
+      runtimeFailureCode?: string
       runtimeBlockDetails?: RuntimeBlockDetails
       failOpenPasses?: string[]
       runtimeStats?: { crossings: number; reviewRequests: number; cacheHits: number; staticAllows: number }
@@ -2066,7 +2069,13 @@ const plugin: Plugin = {
         if (injectedRootReview) return injectedRootReview(request)
         const jev = resolved.dynamicReview.jev
         if (!jev?.available) throw new Error("L3 reviewer unavailable")
-        return reviewRootWidening(request, { endpoint: jev.endpoint, apiKey: jev.apiKey ?? "", timeoutMs: resolved.dynamicReview.timeoutMs })
+        return reviewRootWidening(request, {
+          endpoint: jev.endpoint,
+          apiKey: jev.apiKey ?? "",
+          model: jev.model,
+          fallbacks: jev.fallbacks?.map((candidate) => ({ ...candidate, apiKey: candidate.apiKey ?? "" })),
+          timeoutMs: resolved.dynamicReview.timeoutMs,
+        })
       },
     })
     async function rootWideningContext(sessionID: string): Promise<RootWideningContext> {
@@ -2090,6 +2099,8 @@ const plugin: Plugin = {
       return reviewEffects(request, {
         endpoint: jev.endpoint,
         apiKey: jev.apiKey ?? "",
+        model: jev.model,
+        fallbacks: jev.fallbacks?.map((candidate) => ({ ...candidate, apiKey: candidate.apiKey ?? "" })),
         timeoutMs: resolved.dynamicReview.timeoutMs,
         signal,
         readonly,
@@ -2330,7 +2341,7 @@ const plugin: Plugin = {
         home: homedir(), cwd: runtimeCwd, credentialPaths: credentialStoreReadPaths(homedir()),
         denyWrite: deniedWritePaths,
         protect: [...runtimeProtectedPaths(cwd), path.dirname(broker.socketPath)],
-        brokerBase: "/tmp/opencode",
+        brokerBase: runtimeBrokerBase(),
       })
       const rememberAllowedWrite = (event: RuntimeBoundaryEvent) => {
         if (event.kind !== "write" || !effectivePerm(call.sessionID).w) return
@@ -2363,11 +2374,17 @@ const plugin: Plugin = {
         return { verdict: decision.verdict, rules: decision.rules }
       })
       const commandProofRules = () => proofRules
-      const recordBlock = (reason: string, event?: RuntimeBoundaryEvent, advice?: string, cancelled = false, reviewDenied = false) => {
-        // First refusal reason wins: a downstream broker EOF/cancel must not
-        // rewrite why the crossing was actually denied.
-        if (!authorization.runtimeBlocked) {
+      const trustedOnly = trustedRuntimeCommand(command, resolved.trustedCommands)
+      const recordBlock = (reason: string, event?: RuntimeBoundaryEvent, advice?: string, cancelled = false, reviewDenied = false, failureCode?: string) => {
+        // A real refusal keeps priority over a later infrastructure failure.
+        // An infrastructure-only block may be replaced by a real denial,
+        // cancellation or revocation: the first *reason* wins, but an EOF is
+        // not a reason to hide a subsequent explicit decision. `failureCode`
+        // marks a block as infrastructure-only for the timeout exception.
+        const infrastructureOnly = authorization.runtimeFailureCode !== undefined
+        if (!authorization.runtimeBlocked || infrastructureOnly && failureCode === undefined) {
           authorization.runtimeBlocked = reason
+          authorization.runtimeFailureCode = failureCode
           authorization.runtimeBlockDetails = {
             ...(event ? { trigger: runtimeBoundaryTrigger(event) } : {}),
             ...(advice ? { advice } : {}),
@@ -2381,10 +2398,11 @@ const plugin: Plugin = {
         }
       }
       const failure = (code: string, event?: RuntimeBoundaryEvent) => {
-        if (authorization.runtimeBlocked) return recordBlock(authorization.runtimeBlocked)
+        if (authorization.runtimeBlocked) return { action: "deny" as const, reason: authorization.runtimeBlocked }
         if (preparationSignal.aborted) return recordBlock("Cancellation: the call was cancelled", undefined, CANCEL_ADVICE, true)
         if (securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot) return recordBlock("Session permissions or authorization changed", undefined, RECHECK)
-        return passFailure(code, call, authorization) ? { action: "allow" as const } : recordBlock(checkUnavailableReason(code), event, RETRY_LATER)
+        if (passFailure(code, call, authorization)) return { action: "allow" as const }
+        return recordBlock(checkUnavailableReason(code), event, RETRY_LATER, false, false, code)
       }
       // Name-matched incidental writes (any `__pycache__`/`.pytest_cache`
       // component) bypass the boundary in EVERY mode — but never inside a
@@ -2397,8 +2415,10 @@ const plugin: Plugin = {
         if (!sharedTempWrite && !isIncidentalToolWrite(target) && !incidentalRoots.some((root) => containsPath(root, target))) return false
         return writeTargetExempt(target, writePolicy())
       }
+      const brokerDirectory = runtimeBrokerBase()
+      await mkdir(brokerDirectory, { recursive: true, mode: 0o700 })
       const broker = await createRuntimeBoundaryBroker({
-        directory: "/tmp/opencode",
+        directory: brokerDirectory,
         failPolicy: resolved.failPolicy,
         onError: () => { failure("broker_unavailable") },
         onFailure: (code) => { failure(code) },
@@ -2425,11 +2445,24 @@ const plugin: Plugin = {
           }
           const permission = effectivePerm(call.sessionID)
           const canWrite = permission.w
-          // mkdir on an existing directory cannot change it (EEXIST). Let
-          // mkdir -p ensure shared temp ancestors without treating it as removal.
-          if (runtimeWriteEffect(event) === "mkdir" && event.targets.length === 1 &&
-            (await lstat(event.targets[0]!.path).catch(() => undefined))?.isDirectory()) {
-            return { action: "continue" }
+          // /tmp has no plugin write protection in any mode. The observer's
+          // paths are canonical, so external symlink referents do not qualify.
+          if (event.kind === "write" && event.targets.length > 0 &&
+            event.targets.every((target) => isAlwaysWritablePath(target.path))) return { action: "continue" }
+          if (runtimeWriteEffect(event) === "mkdir" && event.targets.length === 1) {
+            const target = event.targets[0]!.path
+            // mkdir cannot replace an existing entry, even a file/symlink:
+            // the kernel returns EEXIST. Do not stop a mkdir -p preamble.
+            if (await lstat(target).catch(() => undefined)) return { action: "continue" }
+            // A missing granted root may need missing parents as well. Only
+            // directory creation gets this ancestor allowance; rename, chmod
+            // and ordinary writes cannot borrow a descendant's grant.
+            if (roots.some((root) => containsPath(root, target) || containsPath(target, root)) &&
+              !deniedWritePaths.some((root) => containsPath(root, target)) &&
+              !isRuntimeBrokerPath(target) &&
+              !runtimeProtectedPaths(cwd).some((root) => containsPath(root, target))) {
+              return { action: "continue" }
+            }
           }
           if (event.kind === "write" && event.targets.length > 0 &&
             event.targets.every((target) => incidentalWriteExempt(target.path))) {
@@ -2466,6 +2499,23 @@ const plugin: Plugin = {
             authorization.source = !resolved.securityEnabled ? "security_disabled" : "bypass_dynamic"
             if (canWrite) authorization.executionRoute = "host_direct_reviewed"
             return { action: canWrite ? "allow" : "continue" }
+          }
+          // Unlike an ordinary static proof, an explicit trust entry covers
+          // this CLI's own effects and children. Never detach a mixed script:
+          // shell redirects, substitutions and unlisted siblings keep review.
+          // Trusted writes must not seed L3 grants for unrelated commands.
+          if (canWrite && permission.r && trustedOnly && event.details.argvIncomplete !== true &&
+            (await commandProof()).verdict === "ALLOW") {
+            authorization.runtimeStats!.staticAllows++
+            authorization.source = "runtime_trusted_command"
+            writeReviewerTrace({ kind: "effects_trusted_allow", sessionID: call.sessionID, callID: call.id,
+              command, eventID: event.eventID,
+              boundary: { kind: event.kind, syscall: event.syscall, operation: event.operation,
+                targets: event.targets, details: event.details } })
+            // Trust grants the CLI's complete native run, not a sequence of
+            // syscall approvals. This also preserves native child-process and
+            // browser startup semantics rather than keeping them ptraced.
+            return { action: "allow" }
           }
           const executable = typeof event.details.executable === "string" ? event.details.executable : undefined
           const executableInfo = executable ? await lstat(executable, { bigint: true }).catch(() => undefined) : undefined
@@ -2699,7 +2749,7 @@ const plugin: Plugin = {
         // write inside them or a rename/unlink/chmod on any ancestor swaps
         // the control plane mid-command. This holds even when the session
         // workspace never exempts the live broker or watcher image.
-        protect: ["/tmp/opencode", ...runtimeProtectedPaths(cwd),
+        protect: [...runtimeProtectedPaths(cwd),
           ...temporaryWriteRoots, ...observedWriteRoots],
         // Explicit/worktree roots stay observed for per-target exclusions;
         // L3 roots also re-check expiry/revocation on every write. Safe local
@@ -2797,8 +2847,8 @@ const plugin: Plugin = {
       // (~/.cache, *.sqlite_history-style files): a read-oriented command's
       // own history/cache effect is not a boundary crossing. On top of those,
       // Both modes share global temp directories (scratch, /tmp, /var/tmp,
-      // TMPDIR, WSL's Windows %TEMP%). In ReadOnly the workspace stays
-      // read-only even when it lives inside one of them.
+      // TMPDIR, WSL's Windows %TEMP%). /tmp remains writable even when it
+      // contains the workspace; other roots retain the independent RO ceiling.
       const readOnly = !effectivePerm(call.sessionID).w
       const credentialPaths = await Promise.all(credentialStoreReadPaths(homedir()).map((target) => canonicalBoundaryPath(target)))
       const incidental = incidentalWriteRoots().filter((root) =>
@@ -2806,7 +2856,7 @@ const plugin: Plugin = {
         !checkPathSensitivity(root, { cwd, worktree: cwd }).sensitive)
       const configuredRoots = resolved.sandbox.allowWrite.filter((root) => !writeRootRejection(root, {
         home: homedir(), cwd, credentialPaths, denyWrite: resolved.sandbox.denyWrite,
-        protect: runtimeProtectedPaths(cwd), brokerBase: "/tmp/opencode",
+        protect: runtimeProtectedPaths(cwd), brokerBase: runtimeBrokerBase(),
       }))
       // A linked git worktree's private metadata directory (resolved from the
       // cwd/.git pointer and fully verified — see linkedWorktreePrivateDir)
@@ -2822,7 +2872,7 @@ const plugin: Plugin = {
         const candidate = await linkedWorktreePrivateDir(cwd)
         if (candidate && !writeRootRejection(candidate, {
           home: homedir(), cwd, credentialPaths, denyWrite: resolved.sandbox.denyWrite,
-          protect: runtimeProtectedPaths(cwd), brokerBase: "/tmp/opencode",
+          protect: runtimeProtectedPaths(cwd), brokerBase: runtimeBrokerBase(),
         })) worktreePrivateRoots = [candidate]
       }
       let temporaryRoots: string[] = []
@@ -2835,7 +2885,8 @@ const plugin: Plugin = {
       const baseRoots = [...new Set([cwd, scratchRoot, ...tempRoots,
         ...(!readOnly ? [...standardCacheWriteRoots(), ...temporaryRoots, ...worktreePrivateRoots] : [])])]
       const beyondReadOnlyTemp = (writes: readonly string[]) => readOnly
-        ? writes.filter((target) => containsPath(cwd, target) || !tempRoots.some((root) => containsPath(root, target)))
+        ? writes.filter((target) => !isAlwaysWritablePath(target) &&
+          (containsPath(cwd, target) || !tempRoots.some((root) => containsPath(root, target))))
         : writes
       if (tool === "shell") {
         const command = commandFromArgs(raw)
@@ -2906,7 +2957,7 @@ const plugin: Plugin = {
       const needsReview = filePlan.verdict !== "ALLOW"
       const tempOnly = readOnly && filePlan.resolvedWrites.length > 0 && beyondReadOnlyTemp(filePlan.resolvedWrites).length === 0
       assertNativeCeiling(tool, call.sessionID, filePlan.resolvedWrites, tempOnly)
-      if (filePlan.targets.some((target) => target.mode !== "read" &&
+      if (filePlan.targets.some((target) => target.mode !== "read" && !isAlwaysWritablePath(target.resolved) &&
         (isRuntimeBrokerPath(target.resolved) ||
           [...resolved.sandbox.denyWrite, ...credentialPaths, ...runtimeProtectedPaths(cwd)]
             .some((root) => containsPath(root, target.resolved))))) {
@@ -3100,8 +3151,9 @@ const plugin: Plugin = {
         try {
           applySandboxCreateBefore(ev, marked, resolved.sandbox, sandboxProbe, undefined, resolved.failPolicy,
             (code) => { passFailure(code) }, (message) => {
-              if (authorization && !authorization.runtimeBlocked) {
+              if (authorization && (!authorization.runtimeBlocked || authorization.runtimeFailureCode)) {
                 authorization.runtimeBlocked = message
+                authorization.runtimeFailureCode = undefined
                 authorization.runtimeBlockDetails = { advice: RETRY_LATER }
               }
             })
@@ -3205,6 +3257,9 @@ const plugin: Plugin = {
                   return original(prepared.input, call)
                 })).pipe(Effect.exit, Effect.flatMap((exit) => {
                   if (Exit.isSuccess(exit)) return Effect.succeed(exit.value)
+                  // No trusted host-timeout flag exists on the interrupt path:
+                  // an observer EOF alone must never be read as a normal
+                  // deadline, so a recorded refusal still wins here.
                   if (prepared.authorization.runtimeBlocked && Exit.hasInterrupts(exit)) {
                     return Effect.fail(rejectionError(runtimeBlockedText(prepared.authorization.runtimeBlocked,
                       prepared.authorization.runtimeBlockDetails)))
@@ -3255,11 +3310,18 @@ const plugin: Plugin = {
                 if (!result || typeof result !== "object") return result
                 const value = result as { output?: unknown; content?: unknown; metadata?: Record<string, unknown> }
                 const output = value.output && typeof value.output === "object" ? value.output as Record<string, unknown> : undefined
+                // Killing the observer at the host's command deadline can close
+                // its socket before an exit frame. That EOF is not a security
+                // refusal. Only the trusted host timeout flag permits this
+                // exception; actual denials, revocations and cancels still win.
+                const hostTimedOut = name === "shell" && (value.metadata?.timeout === true || output?.timeout === true)
+                const timeoutDisconnect = hostTimedOut && prepared.authorization.runtimeFailureCode === "broker_unavailable" &&
+                  !prepared.authorization.runtimeBlockDetails?.reviewDenied && !prepared.authorization.runtimeBlockDetails?.cancelled
                 // Exclude our own pre-spawn denial text: a nested tool
                 // call's "Command blocked … The whole command was not run."
                 // output must not be dressed up as a post-launch OS error.
                 let runtimeRefusal: string | undefined
-                if (prepared.authorization.runtimeBlocked) {
+                if (prepared.authorization.runtimeBlocked && !timeoutDisconnect) {
                   runtimeRefusal = prepared.authorization.runtimeBlocked.startsWith("[opencode-v2-security]")
                     ? prepared.authorization.runtimeBlocked
                     : runtimeBlockedText(prepared.authorization.runtimeBlocked, prepared.authorization.runtimeBlockDetails)
@@ -3267,9 +3329,9 @@ const plugin: Plugin = {
                 // Setup failures normally arrive over the broker's terminal
                 // frame. Exit 125 also covers failure before it can connect;
                 // a payload's own exit 125 has an ordinary terminal frame.
-                const observerSetupError = !runtimeRefusal && prepared.authorization.executionRoute === "runtime_boundary_watch" &&
+                const observerSetupError = !hostTimedOut && !runtimeRefusal && prepared.authorization.executionRoute === "runtime_boundary_watch" &&
                   output?.exit === 125 && prepared.authorization.runtimeBroker?.terminalExit === undefined
-                const accessError = !runtimeRefusal && name === "shell" && output && output.exit !== 0 &&
+                const accessError = !hostTimedOut && !runtimeRefusal && name === "shell" && output && output.exit !== 0 &&
                   typeof output.output === "string" && !output.output.includes("The whole command was not run.") &&
                   /permission denied|read-only file system|device or resource busy|cross-device link|\bEACCES\b|\bEPERM\b|sudo:|bwrap:|opencode-sandbox:/i.test(output.output)
                 // Post-launch OS errors keep their raw output; the appended

@@ -9,6 +9,30 @@ function contains(root: string, target: string): boolean {
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
 }
 
+/** Host-owned unconditional write roots, shared by all session modes. */
+export function alwaysWritableRoots(platform: NodeJS.Platform = process.platform, env: NodeJS.ProcessEnv = process.env): string[] {
+  if (platform === "linux") return ["/tmp"]
+  if (platform !== "win32") return []
+  const temporary = env.TEMP?.trim()
+  if (!temporary || !path.win32.isAbsolute(temporary)) return []
+  const normalized = path.win32.normalize(temporary)
+  // Cross-platform callers can compare Windows paths without asking the local
+  // filesystem to interpret a different OS's drive letters.
+  if (platform !== process.platform) return [normalized]
+  const canonical = canonicalCandidate(normalized)
+  return canonical === undefined ? [] : [canonical]
+}
+
+/** Callers pass a canonical target: external symlink/junction referents do not
+ * borrow the temp directory's unconditional write allowance. */
+export function isAlwaysWritablePath(target: string, platform: NodeJS.Platform = process.platform, env: NodeJS.ProcessEnv = process.env): boolean {
+  const paths = platform === "win32" ? path.win32 : path.posix
+  return alwaysWritableRoots(platform, env).some((root) => {
+    const relative = paths.relative(root, target)
+    return relative === "" || (relative !== ".." && !relative.startsWith(`..${paths.sep}`) && !paths.isAbsolute(relative))
+  })
+}
+
 /** Resolve an existing ancestor without creating anything. Dangling symlinks
  *  and non-missing-path failures are not grants. */
 export function canonicalCandidate(target: string): string | undefined {
@@ -150,16 +174,26 @@ function wslWindowsTempDirs(): Promise<string[]> {
 
 /** Global temporary directories that stay writable in Read only mode:
  *  `extra` (the configured scratch), /tmp, /var/tmp, the process temp dir and,
- *  on WSL, the Windows user's temp dir. Only existing canonical directories
- *  qualify; a redirected TMPDIR never turns "/" or HOME into a temp root. */
+ *  on WSL, the Windows user's temp dir. Explicit extra roots may be missing
+ *  so mkdir can create them; discovered temp dirs must already exist.
+ *  A redirected TMPDIR never turns "/" or HOME into a temp root. */
 export async function globalTempWriteRoots(extra: readonly string[] = [], home = homedir()): Promise<string[]> {
+  if (process.platform === "win32") return alwaysWritableRoots()
   if (process.platform !== "linux") return []
   const roots: string[] = []
-  for (const candidate of [...extra, "/tmp", "/var/tmp", tmpdir(), ...await wslWindowsTempDirs()]) {
+  for (const candidate of extra) {
+    if (!path.isAbsolute(candidate)) continue
+    const canonical = canonicalCandidate(candidate)
+    if (canonical !== candidate || (!isAlwaysWritablePath(canonical) && contains(canonical, home)) || canonical === path.parse(canonical).root) continue
+    const directory = await stat(canonical).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? undefined : null)
+    if (directory === null) continue
+    if ((!directory || directory.isDirectory()) && !roots.includes(canonical)) roots.push(canonical)
+  }
+  for (const candidate of ["/tmp", "/var/tmp", tmpdir(), ...await wslWindowsTempDirs()]) {
     if (!path.isAbsolute(candidate)) continue
     const canonical = await realpath(candidate).catch(() => undefined)
     if (!canonical || !(await stat(canonical).catch(() => undefined))?.isDirectory()) continue
-    if (contains(canonical, home) || canonical === path.parse(canonical).root) continue
+    if ((!isAlwaysWritablePath(canonical) && contains(canonical, home)) || canonical === path.parse(canonical).root) continue
     if (!roots.includes(canonical)) roots.push(canonical)
   }
   return roots

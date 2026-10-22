@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.9.0 (2026-10-22)
+
+- 题组升级为 `v12-systemone-aligned-20261021-r6`：只读符合性题迁入冻结提示词的 `readonly_question`，不再由 TypeScript 常量提供；`filesystem_severity`、`network_severity` 的概率题补充 `true`/`false` criteria 说明真假边界；`scope_coverage` 与 `uncovered_owner` 明确“覆盖不等于意图”、只有当前 active bypass 才算授权、共享数据库改动归 remote、普通文件权限变更归 privilege。RW/RO 分别绑定该版本及其 `-readonly` 后缀，旧缓存不混用。
+- SystemOne 链路支持备用端点：`dynamicReview.jev.fallbacks` 最多两项，每项必须自带 `endpoint`、`model`、`apiKeyEnv`；缺少密钥的备用直接跳过，绝不借用主端点或 `OC_API_KEY` 的密钥。主密钥缺失但存在可用备用时整条链仍可用；有效否决、取消与用户撤销不触发备用。
+- `dynamicReview.timeoutMs` 改为整链总预算，按剩余可用端点分配；effects 与 L3 共用同一有界传输实现，发送凭据前先校验完整端点链，取消、超时、协议错误与传输失败仍分源上报。`dynamicReview.jev.model` 真正生效，主端点模型可覆盖冻结题组的默认模型。
+- 运行时控制面迁出共享临时目录：broker 目录改为 `~/.opencode/run`（创建为 `0700`），`/tmp/opencode` 不再进入 broker 的 `protect` 列表。此前保护控制面时会连带拦掉该目录下的普通写入，导致测试或正常临时写入被误判为受保护路径。
+- Linux `/tmp` 与原生 Windows `$env:TEMP` 的目录本身及真实后代，在所有模式下无条件可写：原生观察器在 `classify_path` 直接放行且不产生边界事件；宿主跨边界处理、只读临时豁免、原生文件工具规划与 `denyWrite` 配置过滤统一采用同一判定。外部链接目标不继承该授权，敏感读取仍独立审查。
+- 修复原生观察器 `resolve_at_nofollow` 在 `/tmp` 这类单层路径上原地截断 `parent`、同时用指针引用叶名的缺陷；新增回归用例覆盖 `--readonly`、`--deny-write`、`--protect` 同时指向 `/tmp` 子目录时的建目录、写入、`chmod` 与 `mv`。
+- `trustedCommands` 支持 `*`/`?` 通配与零参数尾随 `*`：读写会话中整条 shell 调用只含匹配命令且静态检查为 ALLOW 时，该命令自身及其子进程的边界效果免动态审查。出现重定向、命令替换、混合未列命令、纯赋值段或 argv 不完整时仍保留审查，且该信任不会为后续无关命令种入 L3 扩根授权。
+- 运行时把基础设施故障与真实安全拒绝分开记录：broker EOF 等故障不再抢占拒绝原因，其后的真实否决、取消或权限变化可以覆盖；宿主工具超时（`metadata.timeout`）杀死观察器导致的断开按超时处理，不当作安全拒绝，真实拒绝、撤销与取消仍然优先。
+- 运行时 `mkdir` 在授予根尚缺祖先、目标不存在时放行目录创建（`rename`、`chmod` 与普通写入不能借用该豁免）；目标已存在时按 `EEXIST` 语义继续，不打断 `mkdir -p` 前导。
+- `mv` 解析支持多源与 `-t`/`--target-directory`：每个被移除的源都进入临时目录约束与删除检查，目标在临时根内而源在外时仍判 `filesystem.outside-write`。Windows 下按 `win32` 语义解析绝对路径并展开 `$env:TEMP`/`%TEMP%`。
+- 验证：Bun 43 个文件共 1,839 项测试通过；Python 148 项测试通过；`bin/opencode-boundary-watch` 由当前 C 源码静态重编译并逐字节核对一致。运行中的服务实例未重载，`/tmp` 无条件写授权需要重载后才会在实际会话中生效。
+
 ## 1.8.1 (2026-10-19)
 
 - 修复 npm 发包产物遗漏 Windows supervisor 预编译二进制的问题，确保完整包含 79 个发布文件。

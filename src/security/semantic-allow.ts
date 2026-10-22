@@ -727,15 +727,15 @@ export async function proveLiteralInvocation(argv: string[], ctx: PathContext): 
 
 // --- user-trusted commands --------------------------------------------------------------
 
-/** Parses `trustedCommands` entries (`"agent-browser"`, `"opencode2 --version"`)
- *  into argv prefixes. Entries with shell syntax are dropped. */
+/** Parses trusted argv prefixes, including `*` / `?` argument patterns.
+ *  Entries with shell syntax are dropped. */
 export function parseTrustedCommands(entries: readonly string[]): string[][] {
   const out: string[][] = []
   for (const entry of entries) {
     if (typeof entry !== "string") continue
     const words = entry.trim().split(/\s+/).filter(Boolean)
     if (words.length === 0) continue
-    if (words.some((w) => /[$`'"\\;&|<>(){}*?[\]]/.test(w))) continue
+    if (words.some((w) => /[$`'"\\;&|<>(){}[\]]/.test(w))) continue
     out.push(words)
   }
   return out
@@ -746,8 +746,17 @@ export function parseTrustedCommands(entries: readonly string[]): string[][] {
  *  — it would run whatever file the worktree holds under that name. */
 export function matchesTrustedCommand(words: string[], rules: readonly string[][]): boolean {
   return rules.some((rule) => {
-    if (words.length < rule.length) return false
-    return rule.every((part, k) => words[k] === part)
+    for (let index = 0; index < rule.length; index++) {
+      const pattern = rule[index]!
+      // Like OpenCode's trailing " *", this also accepts zero arguments.
+      if (pattern === "*" && index === rule.length - 1) return true
+      const word = words[index]
+      if (word === undefined) return false
+      const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&")
+        .replace(/\*/g, ".*").replace(/\?/g, ".")
+      if (!new RegExp(`^${escaped}$`, "s").test(word)) return false
+    }
+    return true
   })
 }
 

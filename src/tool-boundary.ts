@@ -6,6 +6,7 @@ import { ruleRequiredCategories } from "./security/bypass"
 import { splitSimpleSegments } from "./security/classifier"
 import { scan } from "./security/shell-scan"
 import { inspectionErrorCode, isMissingPathError } from "./security/inspection"
+import { alwaysWritableRoots, isAlwaysWritablePath } from "./security/automatic-write-roots"
 
 export const NATIVE_BOUNDARY_TOOLS = new Set(["shell", "write", "edit", "patch", "read", "glob", "grep"])
 export type NativeBoundaryTool = "shell" | "write" | "edit" | "patch" | "read" | "glob" | "grep"
@@ -173,7 +174,8 @@ export async function planFileBoundary(
   }
   const targets: BoundaryFileTarget[] = []
   const facts: string[] = [`native_tool=${tool}; supplied input is a file operation, not executable shell code`]
-  const roots = await Promise.all(options.writableRoots.map((root) => canonicalBoundaryPath(path.resolve(root))))
+  const roots = await Promise.all([...options.writableRoots, ...alwaysWritableRoots()]
+    .map((root) => canonicalBoundaryPath(path.resolve(root))))
   const findings: string[] = []
   // A harmless search root does not make an explicitly sensitive selector safe.
   const selector = tool === "glob" ? args.pattern : tool === "grep" ? args.include : undefined
@@ -196,7 +198,12 @@ export async function planFileBoundary(
       ? `${request.mode}: ${JSON.stringify(absolute)} has unavailable evidence: ${target.inspectionError}; the lexical path is not a canonical grant`
       : `${request.mode}: ${JSON.stringify(absolute)} resolves to ${JSON.stringify(resolved)}`)
     if (target.inspectionError) findings.push(target.inspectionError)
-    const classificationPaths = absolute === resolved ? [absolute] : [absolute, resolved]
+    const temporaryWrite = request.mode !== "read" && !target.inspectionError && isAlwaysWritablePath(resolved)
+    const classificationPaths: string[] = []
+    if (!temporaryWrite) {
+      classificationPaths.push(absolute)
+      if (resolved !== absolute) classificationPaths.push(resolved)
+    }
     const publicSshPattern = /\/\.ssh\/(?:config|known_hosts(?:\.old)?|authorized_keys(?:2)?|[^/]+\.pub)$/
     const publicSshResource = publicSshPattern.test(absolute) && publicSshPattern.test(resolved)
     const directoryListing = request.mode === "read" && (await stat(resolved).catch(() => undefined))?.isDirectory() === true
@@ -258,6 +265,8 @@ export async function planFileBoundary(
 export async function verifyFileBoundaryPlan(plan: FileBoundaryPlan): Promise<void> {
   for (const target of plan.targets) {
     const inspected = await inspectBoundaryTarget(target.absolute, target.mode)
+    if (target.mode !== "read" && !inspected.inspectionError &&
+      isAlwaysWritablePath(target.resolved) && isAlwaysWritablePath(inspected.resolved)) continue
     if (inspected.inspectionError || target.inspectionError) {
       if (inspected.inspectionError === target.inspectionError && inspected.resolved === target.resolved) continue
       throw new BoundaryPreparationError("Native-tool inspection changed after review", "the target's inspection availability changed after this call was checked", true)

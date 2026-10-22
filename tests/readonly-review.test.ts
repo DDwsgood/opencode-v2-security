@@ -157,7 +157,7 @@ const systemHome = os.homedir()
 let homeSpy: { mockRestore(): void }
 const scopes: Scope.Closeable[] = []
 beforeAll(async () => {
-  root = await mkdtemp("/tmp/opencode/readonly-review-")
+  root = await mkdtemp("/var/tmp/opencode-readonly-review-")
   workspace = path.join(root, "workspace")
   scratch = path.join(root, "scratch")
   home = path.join(root, "home")
@@ -392,14 +392,13 @@ describe("RO launch gate", () => {
     expect(developer.calls).toHaveLength(0)
   })
 
-  test("existing temp ancestors permit mkdir but still refuse destructive writes", async () => {
+  test("writes under /tmp continue in Auto mode, including destructive writes", async () => {
     const host = await harness({ mode: "auto" })
     const paths = ["/tmp/opencode"]
     const mkdir = await host.run("true", { kind: "write", syscall: "mkdirat", paths })
     expect(mkdir.output.response.action).toBe("continue")
-    await expect(host.run("true", { kind: "write", syscall: "rmdir", paths })).rejects.toMatchObject({
-      _tag: "Tool.Error", message: expect.stringContaining("Write protection:"),
-    })
+    const rmdir = await host.run("true", { kind: "write", syscall: "rmdir", paths })
+    expect(rmdir.output.response.action).toBe("continue")
     expect(host.calls).toHaveLength(0)
   })
 

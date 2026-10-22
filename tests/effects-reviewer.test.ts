@@ -208,6 +208,88 @@ describe("Variant B adjudication order", () => {
 })
 
 describe("effects transport without live API requests", () => {
+  test("availability failures try ordered backups with their own model and credentials, not alternate verdicts", async () => {
+    const calls: Array<{ url: string; model: string; authorization: string | null }> = []
+    const fetchFn = (async (url: URL, init: RequestInit) => {
+      calls.push({ url: String(url), model: JSON.parse(init.body as string).model, authorization: new Headers(init.headers).get("Authorization") })
+      if (calls.length === 1) return new Response("provider secret must not leak", { status: 503 })
+      if (calls.length === 2) return Response.json({ answers: {} })
+      return Response.json({ answers: answers({ floor: { choice: "yes" } }) })
+    }) as unknown as typeof fetch
+    const result = await reviewEffects(request, {
+      endpoint: "https://primary.invalid/systemone", apiKey: "primary-key", model: "clef", fetch: fetchFn,
+      fallbacks: [
+        { endpoint: "https://second.invalid/systemone", apiKey: "second-key", model: "typesafe/jev" },
+        { endpoint: "https://third.invalid/systemone", apiKey: "third-key", model: "jev-latest" },
+      ],
+    })
+    expect(result.decision).toBe("deny")
+    expect(calls.map((call) => [call.model, call.authorization])).toEqual([
+      ["clef", "Bearer primary-key"], ["typesafe/jev", "Bearer second-key"], ["jev-latest", "Bearer third-key"],
+    ])
+    calls.length = 2
+    await reviewEffects(request, { endpoint: "https://primary.invalid/systemone", apiKey: "primary-key", fetch: fetchFn,
+      fallbacks: [{ endpoint: "https://second.invalid/systemone", apiKey: "second-key" }] })
+    expect(calls).toHaveLength(3)
+  })
+
+  test("the total deadline reserves time for backups; cancellation never retries and exhaustion throws", async () => {
+    let calls = 0
+    const fallback = { endpoint: "https://backup.invalid/systemone", apiKey: "backup-key", model: "clef" }
+    const fetchFn = ((_url: URL, init: RequestInit) => {
+      calls++
+      if (calls > 1) return Promise.resolve(Response.json({ answers: answers() }))
+      return new Promise<Response>((_resolve, reject) => init.signal!.addEventListener("abort", () => reject(new Error("timeout")), { once: true }))
+    }) as unknown as typeof fetch
+    expect((await reviewEffects(request, { endpoint: "https://primary.invalid/systemone", apiKey: "primary-key", timeoutMs: 100, fallbacks: [fallback], fetch: fetchFn })).decision).toBe("allow")
+    expect(calls).toBe(2)
+    const controller = new AbortController()
+    calls = 0
+    const cancelled = (async () => { calls++; controller.abort(); throw new Error("cancelled") }) as unknown as typeof fetch
+    await expect(reviewEffects(request, { endpoint: "https://primary.invalid/systemone", apiKey: "primary-key", signal: controller.signal, fallbacks: [fallback], fetch: cancelled })).rejects.toMatchObject({ kind: "aborted" })
+    expect(calls).toBe(1)
+    calls = 0
+    const failed = (async () => { calls++; return new Response("secret body", { status: 503 }) }) as unknown as typeof fetch
+    await expect(reviewEffects(request, { endpoint: "https://primary.invalid/systemone", apiKey: "primary-key", fallbacks: [fallback], fetch: failed })).rejects.toMatchObject({ kind: "infrastructure", message: "Effects review HTTP 503" })
+    expect(calls).toBe(2)
+  })
+
+  test("missing backup keys are skipped without borrowing primary credentials; invalid local config sends nothing", async () => {
+    const calls: Array<{ url: string; authorization: string | null }> = []
+    const fetchFn = (async (url: URL, init: RequestInit) => {
+      calls.push({ url: String(url), authorization: new Headers(init.headers).get("Authorization") })
+      return Response.json({ answers: answers() })
+    }) as unknown as typeof fetch
+    const result = await reviewEffects(request, {
+      endpoint: "https://primary.invalid/systemone", apiKey: "primary-key",
+      fallbacks: [
+        { endpoint: "https://missing.invalid/systemone", apiKey: "", model: "clef" },
+        { endpoint: "https://backup.invalid/systemone", apiKey: "backup-key" },
+      ],
+      fetch: fetchFn,
+    })
+    expect(result.decision).toBe("allow")
+    expect(calls).toEqual([{ url: "https://primary.invalid/systemone", authorization: "Bearer primary-key" }])
+    calls.length = 0
+    const backupOnly = await reviewEffects(request, {
+      endpoint: "https://primary.invalid/systemone", apiKey: "",
+      fallbacks: [{ endpoint: "https://backup.invalid/systemone", apiKey: "backup-key" }],
+      fetch: fetchFn,
+    })
+    expect(backupOnly.decision).toBe("allow")
+    expect(calls).toEqual([{ url: "https://backup.invalid/systemone", authorization: "Bearer backup-key" }])
+    calls.length = 0
+    for (const fallbacks of [
+      [{ endpoint: "http://remote.invalid/systemone", apiKey: "backup-key" }],
+      [{ endpoint: "https://user:pass@backup.invalid/systemone", apiKey: "backup-key" }],
+    ]) {
+      await expect(reviewEffects(request, {
+        endpoint: "https://primary.invalid/systemone", apiKey: "primary-key", fallbacks, fetch: fetchFn,
+      })).rejects.toMatchObject({ kind: "protocol" })
+      expect(calls).toHaveLength(0)
+    }
+  })
+
   function fake(response: Response): typeof fetch {
     return (async () => response) as unknown as typeof fetch
   }

@@ -40,7 +40,7 @@ const { adjudicateEffectAnswers } = await import("../src/security/effects-review
 import type { EffectReviewRequest } from "../src/security/effects-reviewer"
 const frozen = (await import("../src/security/v11-gold-prompt.json")).default
 
-const root = await mkdtemp("/tmp/opencode/shared-state-")
+const root = await mkdtemp("/var/tmp/opencode-shared-state-")
 const workspace = path.join(root, "workspace")
 const outside = path.join(root, "outside")
 const scratch = path.join(root, "scratch")

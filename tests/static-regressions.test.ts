@@ -268,6 +268,7 @@ describe("tracked cd base", () => {
     ["subshell in between", () => `cd ${tempArea}; (echo hi); rm -rf some_dir`],
     ["|| in between", () => `cd ${tempArea} || cd /tmp; rm -rf some_dir`],
     ["rm -f (not recursive)", () => `cd ${tempArea}; rm -f some_dir`],
+    ["the temp root itself has no write protection", () => "cd /tmp; rm -rf ."],
   ]
   for (const [label, script] of allowed) {
     both(`temp-confined delete is allowed: ${label}`, { LOOSE: "ALLOW" }, script)
@@ -286,7 +287,6 @@ describe("tracked cd base", () => {
 
   const floors: Array<[string, Script]> = [
     ["escape out of temp stays denied", () => "cd /tmp; rm -rf ../etc/x"],
-    ["deleting the temp root itself stays denied", () => "cd /tmp; rm -rf ."],
     ["deleting the temp parent stays denied", () => "cd /tmp; rm -rf .."],
     ["no cd, relative rm -rf in worktree stays denied", () => "rm -rf some_dir"],
     ["absolute floor does not relax after cd", () => "cd /tmp; rm -rf /"],
@@ -327,6 +327,11 @@ describe("temp-confined writes", () => {
     ["redirect escaping temp", () => `cd ${tempArea}; echo x > /etc/evil`, "ASK"],
     ["tar -C escaping temp", () => `cd ${tempArea}; tar xzf a.tgz -C /etc`, "ASK"],
     ["mv pulls worktree file out", () => `cd ${tempArea}; mv ${path.join(root, "src/a.ts")} moved.ts`, "ASK"],
+    [
+      "mv pulls several worktree files out",
+      () => `cd ${tempArea}; mv ${path.join(root, "src/a.ts")} ${path.join(root, "src/b.ts")} moved`,
+      "ASK",
+    ],
     ["find -delete outside temp", () => `cd ${tempArea}; find /etc -delete`, "DENY"],
   ]
   for (const [label, script, loose] of escapes) {
@@ -1200,16 +1205,15 @@ describe("read-only session: kernel-enforced pass-through + scratch carve-out", 
     }
   })
 
-  // sandbox.denyWrite entries freeze paths inside the scratch root too, in
-  // every mode — including kernel-enforced.
-  test("denyWrite inside /tmp overrides carve-out in every mode", async () => {
+  // /tmp's write allowance is unconditional, including explicit denyWrite.
+  test("denyWrite cannot freeze /tmp in any mode", async () => {
     for (const [extra, mode] of [[kern, "LOOSE"], [noKern, "LOOSE"]] as const) {
       const d = await classify("echo hi > /tmp/secret-zone/x", mode, {
         ...extra,
         sandboxDenyWrite: ["/tmp/secret-zone"],
       })
-      expect(d.verdict).toBe("DENY")
-      expect(d.rules).toContain("filesystem.deny-write")
+      expect(d.verdict).toBe("ALLOW")
+      expect(d.rules).toContain("operation.scratch-write")
     }
   })
 
@@ -1218,7 +1222,7 @@ describe("read-only session: kernel-enforced pass-through + scratch carve-out", 
     expect(
       await verdict("echo hi > /var/tmp/x", "LOOSE", { ...noKern, roWritableRoots: ["/var/tmp"] }),
     ).toBe("ALLOW")
-    expect(await verdict("echo hi > /tmp/x", "LOOSE", { ...noKern, roWritableRoots: ["/var/tmp"] })).toBe("DENY")
+    expect(await verdict("echo hi > /tmp/x", "LOOSE", { ...noKern, roWritableRoots: ["/var/tmp"] })).toBe("ALLOW")
   })
 
   // Flag plumbing: roKernelEnforced=false (or absent) is byte-identical to

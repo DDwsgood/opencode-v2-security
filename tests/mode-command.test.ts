@@ -25,7 +25,7 @@ mock.module("node:fs/promises", () => ({
 const { default: plugin } = await import("../src/index")
 const { resetSharedSecurityStateForTests } = await import("../src/security/shared-state")
 
-const root = await mkdtemp("/tmp/opencode/mode-command-")
+const root = await mkdtemp("/var/tmp/opencode-mode-command-")
 const workspace = path.join(root, "workspace")
 await mkdir(workspace)
 const scopes: Scope.Closeable[] = []

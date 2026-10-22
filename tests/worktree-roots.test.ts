@@ -7,7 +7,7 @@
 // runtime boundary review. linkedWorktreePrivateDir verifies the pointer
 // round-trip before the runBoundaryBefore shell path adds it — and only in
 // sessions that can write (Auto), never in ReadOnly, never for native file
-// tools. These tests use REAL temporary repositories under /tmp/opencode.
+// tools. These tests use REAL temporary repositories under /var/tmp/opencode-*.
 
 import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from "bun:test"
 import { execFile } from "node:child_process"
@@ -50,10 +50,11 @@ const oldHome = process.env.HOME
 const systemHome = os.homedir()
 let homeSpy: { mockRestore(): void }
 beforeAll(async () => {
-  root = await mkdtemp("/tmp/opencode/worktree-roots-")
+  root = await mkdtemp("/var/tmp/opencode-worktree-roots-")
   const home = path.join(root, "home")
   await mkdir(home)
-  // Exclude /tmp from automatic grants so writes outside the private dir reach review.
+  // HOME inside this fixture root keeps /var/tmp from being auto-granted, so
+  // writes outside the private dir reach review.
   process.env.HOME = home
   homeSpy = spyOn(os, "homedir").mockImplementation(() => process.env.HOME ?? systemHome)
   main = path.join(root, "main")

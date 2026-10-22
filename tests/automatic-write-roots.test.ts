@@ -3,7 +3,7 @@ import * as childProcess from "node:child_process"
 import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { cleanupTestArtifacts } from "./artifacts"
-import { globalTempWriteRoots, isStandardCacheWrite, standardCacheWriteRoots } from "../src/security/automatic-write-roots"
+import { alwaysWritableRoots, globalTempWriteRoots, isAlwaysWritablePath, isStandardCacheWrite, standardCacheWriteRoots } from "../src/security/automatic-write-roots"
 import { classifyPathTarget, looseRelaxationScope } from "../src/security/paths"
 import { planFileBoundary } from "../src/tool-boundary"
 
@@ -12,7 +12,7 @@ let home: string
 let workspace: string
 let outside: string
 beforeAll(async () => {
-  root = await mkdtemp("/tmp/opencode/automatic-cache-")
+  root = await mkdtemp("/var/tmp/opencode-automatic-cache-")
   home = path.join(root, "home")
   workspace = path.join(root, "workspace")
   outside = path.join(root, "outside")
@@ -21,6 +21,21 @@ beforeAll(async () => {
 afterAll(async () => { await cleanupTestArtifacts(root, { recursive: true, force: true }) })
 
 describe("small automatic cache write scope", () => {
+  test("Windows TEMP has the same recursive unconditional grant as Linux /tmp", () => {
+    const env = { TEMP: "C:\\Users\\Fixture\\AppData\\Local\\Temp" }
+    expect(alwaysWritableRoots("win32", env)).toEqual([env.TEMP])
+    for (const target of [env.TEMP, `${env.TEMP}\\nested\\private.key`, "c:/users/fixture/appdata/local/temp/.env.fixture"]) {
+      expect(isAlwaysWritablePath(target, "win32", env)).toBe(true)
+    }
+    for (const target of [`${env.TEMP}-other\\file`, `${env.TEMP}\\..\\outside.txt`, "D:\\Users\\Fixture\\AppData\\Local\\Temp\\file"]) {
+      expect(isAlwaysWritablePath(target, "win32", env)).toBe(false)
+    }
+    expect(alwaysWritableRoots("win32", {})).toEqual([])
+    expect(alwaysWritableRoots("win32", { TEMP: "relative" })).toEqual([])
+    expect(isAlwaysWritablePath("/tmp", "linux", env)).toBe(true)
+    expect(isAlwaysWritablePath("/tmp/nested/private.key", "linux", env)).toBe(true)
+    expect(isAlwaysWritablePath("/tmp-other/file", "linux", env)).toBe(false)
+  })
   test("ordinary and missing cache targets qualify, adjacent HOME data does not", () => {
     expect(standardCacheWriteRoots(home)).toEqual([path.join(home, ".cache"), path.join(home, ".npm/_cacache")])
     expect(isStandardCacheWrite(path.join(home, ".cache/pip/new/item"), home)).toBe(true)
@@ -57,7 +72,7 @@ describe("small automatic cache write scope", () => {
     expect((await planFileBoundary("write", { path: path.join(home, ".cache/private.key"), content: "fixture" }, options)).verdict).toBe("ASK")
   })
 
-  test("Read only temp roots are canonical existing directories and never cover HOME", async () => {
+  test("Read only temp roots accept missing explicit directories but never cover HOME", async () => {
     const oldDistro = process.env.WSL_DISTRO_NAME
     const oldTemp = process.env.TEMP
     process.env.WSL_DISTRO_NAME = "fixture"
@@ -68,8 +83,9 @@ describe("small automatic cache write scope", () => {
       expect(roots).toContain(workspace)
       expect(roots).toContain("/tmp")
       expect(roots).toContain(outside)
-      expect(roots).not.toContain(path.join(root, "missing"))
+      expect(roots).toContain(path.join(root, "missing"))
       expect(await globalTempWriteRoots([root], path.join(root, "home"))).not.toContain(root)
+      expect(await globalTempWriteRoots([], "/tmp/fixture-home")).toContain("/tmp")
       expect(spawn.mock.calls.some(([file]) => /(?:^|[\\/])cmd\.exe$/i.test(String(file)))).toBe(false)
     } finally {
       spawn.mockRestore()

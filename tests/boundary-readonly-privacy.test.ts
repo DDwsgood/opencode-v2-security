@@ -132,11 +132,13 @@ describe("boundary: proven read-only substitutions and bound variables", () => {
     expect(d.verdict).toBe("ASK")
   })
 
-  test("tee/redirect writes inside a substitution are not allowed", async () => {
-    const tee = await boundary('F=/tmp/x; echo "$(stat $F | tee /tmp/out)"', { permScope: RW })
+  test("outside writes inside a substitution stay unproven while /tmp redirects are writable", async () => {
+    const tee = await boundary('F=/tmp/x; echo "$(stat $F | tee /etc/substitution-fixture.log)"', { permScope: RW })
     expect(tee.verdict).toBe("ASK")
-    const red = await boundary('F=/tmp/x; echo "$(stat $F > /tmp/out)"', { permScope: RW })
+    const red = await boundary('F=/tmp/x; echo "$(stat $F > /etc/substitution-fixture.log)"', { permScope: RW })
     expect(red.verdict).toBe("ASK")
+    const temporary = await boundary('F=/tmp/x; echo "$(stat $F > /tmp/out)"', { permScope: RW })
+    expect(temporary.verdict).toBe("ALLOW")
   })
 
   test("a bound variable reading a key still ASKs (binding is not a bypass)", async () => {

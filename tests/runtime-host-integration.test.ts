@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test"
-import { execFile } from "node:child_process"
-import { chmod, mkdtemp, mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises"
+import { execFile, spawn as spawnProcess } from "node:child_process"
+import { chmod, mkdtemp, mkdir, readFile, readdir, rename, symlink, writeFile } from "node:fs/promises"
 import path from "node:path"
 import * as os from "node:os"
 import * as filesystem from "node:fs/promises"
@@ -12,6 +12,7 @@ import plugin from "../src/index"
 import frozen from "../src/security/v11-gold-prompt.json"
 import { adjudicateEffectAnswers, EffectsReviewError, type EffectReviewRequest } from "../src/security/effects-reviewer"
 import { resetSharedSecurityStateForTests } from "../src/security/shared-state"
+import * as writeRootPolicy from "../src/security/write-root-policy"
 import { createRuntimeBoundaryBroker } from "../src/runtime-boundary"
 import { NO_REROUTE } from "../src/agent-messages"
 import { cleanupTestArtifacts } from "./artifacts"
@@ -20,9 +21,11 @@ let root: string, workspace: string, outside: string, scratch: string, probe: st
 const oldHome = process.env.HOME
 const systemHome = os.homedir()
 let homeSpy: { mockRestore(): void }
+let brokerBaseSpy: { mockRestore(): void }
 const scopes: Scope.Closeable[] = []
 beforeAll(async () => {
-  root = await mkdtemp("/tmp/opencode/runtime-host-")
+  // Keep non-temp permission fixtures outside the unconditional /tmp grant.
+  root = await mkdtemp("/var/tmp/opencode-runtime-host-")
   workspace = path.join(root, "workspace")
   outside = path.join(root, "outside")
   scratch = path.join(root, "scratch")
@@ -32,18 +35,51 @@ beforeAll(async () => {
   // covers this isolated HOME is intentionally never an automatic grant.
   process.env.HOME = home
   homeSpy = spyOn(os, "homedir").mockImplementation(() => process.env.HOME ?? systemHome)
+  brokerBaseSpy = spyOn(writeRootPolicy, "runtimeBrokerBase").mockReturnValue(path.join(home, ".opencode", "run"))
   probe = path.join(root, "probe-fixture")
   await writeFile(probe, "#!/bin/sh\nprintf 'bwrap: /usr/bin/bwrap\\nuserns: yes\\nlandlock_abi: 7\\nsandbox_path: full\\n'\n", { mode: 0o700 })
 })
 afterAll(async () => {
   for (const scope of scopes) await Effect.runPromise(Scope.close(scope, undefined as never))
   homeSpy.mockRestore()
+  brokerBaseSpy.mockRestore()
   if (oldHome === undefined) delete process.env.HOME
   else process.env.HOME = oldHome
   await cleanupTestArtifacts(root, { recursive: true, force: true })
 })
 const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`
 const python = (code: string) => `python3 -c ${quote(code)}`
+/** Host-deadline simulation: the observer's payload calls setpgid(0, 0), so a
+ *  single `kill(-shellPid)` leaves it running. Walk /proc and SIGKILL every
+ *  descendant (groups first, then the root) like a host process-tree kill. */
+async function killProcessTree(rootPid: number): Promise<void> {
+  const processes = new Map<number, { ppid: number; pgrp: number }>()
+  for (const entry of await readdir("/proc").catch(() => [] as string[])) {
+    if (!/^\d+$/.test(entry)) continue
+    const stat = await readFile(`/proc/${entry}/stat`, "utf8").catch(() => "")
+    const close = stat.lastIndexOf(")")
+    if (close < 0) continue
+    const fields = stat.slice(close + 2).trim().split(/\s+/)
+    const ppid = Number(fields[1]), pgrp = Number(fields[2])
+    if (Number.isSafeInteger(ppid) && Number.isSafeInteger(pgrp)) processes.set(Number(entry), { ppid, pgrp })
+  }
+  const targets: number[] = []
+  const collect = (pid: number) => {
+    for (const [child, info] of processes) {
+      if (info.ppid !== pid || targets.includes(child)) continue
+      targets.push(child)
+      collect(child)
+    }
+  }
+  collect(rootPid)
+  const signal = (pid: number) => {
+    const group = processes.get(pid)?.pgrp === pid
+    try { if (group) process.kill(-pid, "SIGKILL") } catch { /* already gone */ }
+    try { process.kill(pid, "SIGKILL") } catch { /* already gone */ }
+  }
+  for (const pid of targets.reverse()) signal(pid)
+  signal(rootPid)
+}
 const report = (deny = false, readonly = false) => {
   const answers: Record<string, unknown> = {}
   for (const [id, q] of Object.entries(frozen.questions)) {
@@ -68,7 +104,12 @@ async function harness(deny = false, options: {
   failContextRead?: number
   slowCommands?: boolean
   logReviewerTrace?: boolean
+  trustedCommands?: string[]
   onOutput?: (stdout: string, stderr: string) => void
+  /** Simulate the host command deadline: kill the detached process tree and
+   *  return the documented result shape (`output.timeout` + `metadata.timeout`)
+   *  instead of failing the tool call. */
+  hostTimeoutMs?: number
 } = {}) {
   // Security state is shared process-wide between plugin instances; each
   // simulated instance here must start from a clean registry.
@@ -95,6 +136,44 @@ async function harness(deny = false, options: {
       }
       const spawn = { command: input.command, cwd: input.workdir ?? workspace, shell: "/bin/bash", env: { ...process.env, ...input.env } }
       yield* hooks.get("shell.create.before")!(spawn)
+      const hostTimeoutMs = options.hostTimeoutMs
+      if (!input.background && hostTimeoutMs !== undefined) {
+        const child = spawnProcess(spawn.shell, ["-c", spawn.command], {
+          cwd: spawn.cwd, env: spawn.env, detached: true, stdio: ["ignore", "pipe", "pipe"],
+        })
+        let stdout = "", stderr = "", timedOut = false
+        child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString() })
+        child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString() })
+        let timer: ReturnType<typeof setTimeout> | undefined
+        child.once("spawn", () => {
+          options.onSpawn?.()
+          timer = setTimeout(() => {
+            timedOut = true
+            // The host kills the whole shell tree at its deadline. The
+            // observer's payload runs in its own process group, so walk the
+            // live tree; its socket closes without a terminal exit frame.
+            if (child.pid !== undefined) void killProcessTree(child.pid)
+            else child.kill("SIGKILL")
+          }, hostTimeoutMs)
+        })
+        const output = yield* Effect.promise(() => new Promise<{ output: string; exit: number; timeout?: boolean }>((resolve) => {
+          let settled = false
+          const finish = (code: number | null) => {
+            if (settled) return
+            settled = true
+            if (timer !== undefined) clearTimeout(timer)
+            processOutputs.push({ stdout, stderr })
+            options.onOutput?.(stdout, stderr)
+            const result = { output: stdout + stderr, exit: timedOut ? 124 : code ?? 1, ...(timedOut ? { timeout: true } : {}) }
+            // Let the broker observe the killed observer's socket close before
+            // the host reports its timeout result.
+            setTimeout(() => resolve(result), timedOut ? 200 : 0)
+          }
+          child.once("close", finish)
+          child.once("error", () => finish(1))
+        }))
+        return { output, content: output.output, metadata: timedOut ? { timeout: true, exit: output.exit } : {} }
+      }
       const output = yield* Effect.promise((signal) => new Promise<{ output: string; exit: number; status?: string }>((resolve) => {
         if (input.background) {
           // Host shape: background=true returns status:"running" at once and
@@ -125,6 +204,7 @@ async function harness(deny = false, options: {
   const ctx: any = {
     options: { sandbox: { enabled: true, mode: "auto", scratch, helperPath: probe }, slowCommands: options.slowCommands ?? false, logReviewerTrace: options.logReviewerTrace ?? false,
       failPolicy: options.failPolicy ?? "fail_open",
+      trustedCommands: options.trustedCommands ?? [],
       dynamicReview: { jev: { enabled: false } }, permission: { registerTool: false },
       reviewCommand: async (request: EffectReviewRequest) => {
         calls.push(structuredClone(request))
@@ -186,13 +266,102 @@ async function harness(deny = false, options: {
 }
 
 describe("real observer → broker → frozen reviewer → original process", () => {
+  test("trustedCommands runtime bypass covers only trusted-only launches and keeps permission floors", async () => {
+    const toolsDirectory = path.join(workspace, "trusted-bin")
+    await mkdir(toolsDirectory)
+    const fixture = [
+      "#!/usr/bin/python3",
+      "import ctypes, os, socket, subprocess, sys",
+      "print('trusted-start', flush=True)",
+      "open(os.environ['TRUSTED_TEST_TARGET'], 'w').write('trusted')",
+      "subprocess.check_call([sys.executable, '-c', \"import os; open(os.environ['TRUSTED_TEST_CHILD'], 'w').write('child')\"])",
+      "try:",
+      "    socket.create_connection(('127.0.0.1', 9), 1).close()",
+      "except OSError:",
+      "    pass",
+      "if os.environ.get('TRUSTED_TEST_FULL') == '1':",
+      "    ctypes.CDLL(None).syscall(426, -1, 0, 0, 0, 0) # io_uring_enter: invalid fd, no effect",
+      "print('trusted-done')",
+      "",
+    ].join("\n")
+    for (const name of ["opencode", "ask-gemini", "agent-browser", "google-chrome"]) {
+      await writeFile(path.join(toolsDirectory, name), fixture, { mode: 0o700 })
+    }
+    const trustedCommands = ["opencode", "ask-gemini", "agent-browser open *", "google-chrome --headless *"]
+    const environment = (name: string) => ({
+      PATH: `${toolsDirectory}:${process.env.PATH}`,
+      // The host's BASH_ENV can reset PATH and launch the real installed CLI
+      // instead of these fixtures. Keep this acceptance test self-contained.
+      BASH_ENV: "",
+      ENV: "",
+      TRUSTED_TEST_TARGET: path.join(outside, `trusted-${name}.log`),
+      TRUSTED_TEST_CHILD: path.join(outside, `trusted-${name}-child.log`),
+    })
+    // Context lookup would fail if this path accidentally entered review.
+    const trusted = await harness(true, { trustedCommands, contextFailure: true })
+    for (const [name, command] of [
+      ["opencode", 'opencode run --session ses_fixture "prompt" 2>&1'],
+      ["gemini", 'ask-gemini "prompt; this is data"'],
+      ["browser", "agent-browser open https://example.invalid"],
+      ["chrome", "google-chrome --headless"],
+    ]) {
+      const env = environment(name!)
+      const result = await trusted.run("shell", { command, env }).catch((error) => {
+        throw new Error(`Trusted CLI ${name} failed; captured output: ${JSON.stringify(trusted.processOutputs.at(-1))}`, { cause: error })
+      })
+      expect(result.output.exit).toBe(0)
+      expect(result.content).toContain("trusted-done")
+      expect(result.metadata.boundary.source).toBe("runtime_trusted_command")
+      expect(await readFile(env.TRUSTED_TEST_TARGET, "utf8")).toBe("trusted")
+      expect(await readFile(env.TRUSTED_TEST_CHILD, "utf8")).toBe("child")
+    }
+    const full = await trusted.run("shell", {
+      command: "google-chrome --headless about:blank",
+      env: { ...environment("full"), TRUSTED_TEST_FULL: "1" },
+    })
+    expect(full.output.exit).toBe(0)
+    expect(full.content).toContain("trusted-done")
+    expect(trusted.calls).toHaveLength(0)
+
+    const redirect = path.join(outside, "trusted-shell-redirect.log")
+    const additionalWrite = python(`open(${JSON.stringify(path.join(outside, "trusted-sibling.log"))}, 'w').write('other')`)
+    const untrustedCommands = [
+      `opencode api get /api/info > ${quote(redirect)}`,
+      `ask-gemini prompt; ${additionalWrite}`,
+      "agent-browser close session",
+      "./trusted-bin/opencode run prompt",
+      `opencode "$(printf prompt)"`,
+      `opencode "$(opencode prompt)"`,
+      `PATH=${quote(toolsDirectory)}; opencode run prompt`,
+    ]
+    for (const [index, command] of untrustedCommands.entries()) {
+      const host = await harness(true, { trustedCommands })
+      await host.failure("shell", { command, env: environment(`untrusted-${index}`) })
+      expect(host.calls).toHaveLength(1)
+    }
+    await expect(readFile(redirect)).rejects.toMatchObject({ code: "ENOENT" })
+
+    const readonly = await harness(true, { trustedCommands })
+    await readonly.command("ro")
+    const readonlyEnv = environment("readonly")
+    expect((await readonly.failure("shell", { command: "opencode run prompt", env: readonlyEnv })).message).toContain("Read-only limit")
+    expect(readonly.calls).toHaveLength(0)
+    await expect(readFile(readonlyEnv.TRUSTED_TEST_TARGET)).rejects.toMatchObject({ code: "ENOENT" })
+
+    const deniedEnv = environment("denied")
+    const denied = await harness(true, { trustedCommands, denyWrite: [deniedEnv.TRUSTED_TEST_TARGET] })
+    expect((await denied.failure("shell", { command: "opencode run prompt", env: deniedEnv })).message).toContain("Write protection")
+    expect(denied.calls).toHaveLength(0)
+    await expect(readFile(deniedEnv.TRUSTED_TEST_TARGET)).rejects.toMatchObject({ code: "ENOENT" })
+  }, 30_000)
+
   test("first review inlines executable bodies, protects sensitive aliases and redacts expanded argv", async () => {
     const literalToken = "fixture-literal-token-123456"
     for (const kind of ["ordinary", "sensitive-alias", "build-wrapper"] as const) {
       const host = await harness()
       const scriptName = kind === "build-wrapper" ? "gradlew" : `${kind}.py`
-      const script = path.join(scratch, scriptName)
-      const source = kind === "sensitive-alias" ? path.join(scratch, ".env.payload") : script
+      const script = path.join(workspace, scriptName)
+      const source = kind === "sensitive-alias" ? path.join(workspace, ".env.payload") : script
       const target = path.join(outside, `preinline-${kind}.txt`)
       const marker = `payload-body-${kind}`
       await writeFile(source, `# ${marker}\nopen(${JSON.stringify(target)}, 'w').write('fixture')\n`)
@@ -256,7 +425,7 @@ describe("real observer → broker → frozen reviewer → original process", ()
 
   test("quoted whitespace secrets are redacted in reviewer command and JSON facts", async () => {
     const host = await harness()
-    const script = path.join(scratch, "quoted-secret-command.py")
+    const script = path.join(workspace, "quoted-secret-command.py")
     const target = path.join(outside, "quoted-secret-command.txt")
     await writeFile(script, `# program --password 'two words'\n# TOKEN="two words" program\nopen(${JSON.stringify(target)}, 'w').write('fixture')\n`)
     const command = `TOKEN="two words" API_KEY="my secret key" python3 ${quote(script)} --password 'two words' --token="two words"`
@@ -338,15 +507,22 @@ describe("real observer → broker → frozen reviewer → original process", ()
 
   test("real allowWrite roots observe sensitive writes in Auto and ReadOnly, ordinary files skip review", async () => {
     const allowed = path.join(outside, "observed-allow-root")
-    await mkdir(allowed)
     for (const mode of ["auto", "ro"]) {
-      const host = await harness(true, { allowWrite: [allowed] })
+      const writable = path.join(allowed, mode)
+      const host = await harness(true, { allowWrite: [writable] })
       if (mode === "ro") await host.command("ro")
-      const plain = path.join(allowed, mode === "auto" ? "[...404].css" : "ro.log")
+      // The configured root itself may be missing; mkdir -p must also be
+      // allowed to ensure its missing ancestors and already-existing roots.
+      const created = await host.run("shell", { command: `mkdir -p ${quote(writable)} ${quote(path.join(writable, "nested", "deeper"))}` })
+      expect(created.output.exit).toBe(0)
+      const repeated = await host.run("shell", { command: `mkdir -p ${quote(writable)}; printf ready` })
+      expect(repeated.output.exit).toBe(0)
+      expect(repeated.content).toBe("ready")
+      const plain = path.join(writable, "nested", "deeper", mode === "auto" ? "[...404].css" : "ro.log")
       const ordinary = await host.run("shell", { command: python(`open(${JSON.stringify(plain)}, 'w').write('fixture')`) })
       expect(ordinary.output.exit).toBe(0)
       expect(host.calls).toHaveLength(0)
-      const sensitive = path.join(allowed, `${mode}.key`)
+      const sensitive = path.join(writable, `${mode}.key`)
       const refused = await host.failure("shell", { command: python(`open(${JSON.stringify(sensitive)}, 'w').write('FAKE TEST DATA')`) })
       expect(refused._tag).toBe("Tool.Error")
       expect(refused.message).toContain(mode === "auto" ? "Command blocked:" : "Command failed")
@@ -590,6 +766,33 @@ describe("real observer → broker → frozen reviewer → original process", ()
     await expect(readFile(target)).rejects.toMatchObject({ code: "ENOENT" })
   })
 
+  test("a host command timeout keeps output and timeout metadata instead of a security refusal", async () => {
+    const host = await harness(false, { failPolicy: "fail_close", hostTimeoutMs: 2_500 })
+    const result = await host.run("shell", {
+      command: python(`import sys,time; print('timeout-stdout', flush=True); print('timeout-stderr', file=sys.stderr, flush=True); time.sleep(30)`),
+    })
+    // The host's own deadline result survives: it is not converted into a
+    // Tool.Error, and both its output and timeout metadata stay intact.
+    expect(result.metadata.timeout).toBe(true)
+    expect(result.output.timeout).toBe(true)
+    expect(result.output.output).toContain("timeout-stdout")
+    expect(result.output.output).toContain("timeout-stderr")
+    expect(result.metadata.boundary.executionRoute).toBe("runtime_boundary_watch")
+    expect(host.processOutputs).toHaveLength(1)
+    expect(host.processOutputs[0]!.stdout).toContain("timeout-stdout")
+    expect(host.processOutputs[0]!.stderr).toContain("timeout-stderr")
+    expect(host.processOutputs[0]!.stdout).not.toContain("[opencode-v2-security]")
+    expect(host.processOutputs[0]!.stderr).not.toContain("[opencode-v2-security]")
+  })
+  test("a real runtime denial still fails while the host deadline is configured", async () => {
+    const host = await harness(true, { hostTimeoutMs: 10_000 })
+    const target = path.join(outside, "timeout-denial.txt")
+    const failure = await host.failure("shell", { command: `printf fixture > ${quote(target)}` })
+    expect(failure.message).toStartWith("[opencode-v2-security] Command blocked:")
+    expect(failure.message).toContain(NO_REROUTE)
+    expect(host.processOutputs.every(({ stdout, stderr }) => !stdout.includes("fixture") && !stderr.includes("fixture"))).toBe(true)
+    await expect(readFile(target)).rejects.toMatchObject({ code: "ENOENT" })
+  })
   test("a late background reviewer denial is audited and delivered to the agent without child stderr", async () => {
     let reviewing!: () => void
     const entered = new Promise<void>((resolve) => { reviewing = resolve })
@@ -762,7 +965,8 @@ describe("real observer → broker → frozen reviewer → original process", ()
     const isolatedHome = process.env.HOME!
     process.env.HOME = systemHome
     const temp = await mkdtemp("/var/tmp/opencode-regression-")
-    const protectedBroker = await createRuntimeBoundaryBroker({ directory: "/tmp/opencode", onBoundary: async () => ({ action: "deny" }) })
+    await mkdir(writeRootPolicy.runtimeBrokerBase(), { recursive: true })
+    const protectedBroker = await createRuntimeBoundaryBroker({ directory: writeRootPolicy.runtimeBrokerBase(), onBoundary: async () => ({ action: "deny" }) })
     const reserved = path.dirname(protectedBroker.socketPath)
     const unreserved = await mkdtemp("/tmp/opencode/security-boundary-regression-")
     try {
@@ -775,6 +979,12 @@ describe("real observer → broker → frozen reviewer → original process", ()
         const file = path.join(temp, `${mode}-shell.txt`)
         const result = await host.run("shell", { command: `printf fixture > ${quote(file)}; rm -- ${quote(file)}` })
         expect(result.output.exit).toBe(0)
+        const nested = path.join(unreserved, mode, "nested", "deeper")
+        const madeDirectories = await host.run("shell", {
+          command: `mkdir -p /tmp/opencode ${quote(nested)}; printf fixture > ${quote(path.join(nested, "result.log"))}`,
+        })
+        expect(madeDirectories.output.exit).toBe(0)
+        expect(await readFile(path.join(nested, "result.log"), "utf8")).toBe("fixture")
         const ownBroker = path.join(unreserved, `${mode}-child-broker.txt`)
         expect((await host.run("shell", { command: `printf fixture > ${quote(ownBroker)}` })).output.exit).toBe(0)
         const blocked = await host.failure("shell", { command: `printf fixture > ${quote(path.join(reserved, "denied.txt"))}` })
@@ -787,6 +997,32 @@ describe("real observer → broker → frozen reviewer → original process", ()
       await cleanupTestArtifacts(temp, { recursive: true, force: true })
       await protectedBroker.close()
       await cleanupTestArtifacts(unreserved, { recursive: true, force: true })
+    }
+  })
+  test("/tmp is recursively writable in every mode, even with denyWrite or a workspace inside it", async () => {
+    const temporaryWorkspace = await mkdtemp("/tmp/opencode/unconditional-write-")
+    const childBroker = await createRuntimeBoundaryBroker({ directory: temporaryWorkspace, onBoundary: async () => ({ action: "deny" }) })
+    try {
+      for (const mode of ["auto", "ro"]) {
+        const host = await harness(true, { directory: temporaryWorkspace, denyWrite: [temporaryWorkspace, "/tmp"] })
+        if (mode === "ro") await host.command("ro")
+        const nested = path.join(temporaryWorkspace, mode, "security-boundary-child", "nested")
+        const key = path.join(nested, "private.key")
+        const result = await host.run("shell", {
+          workdir: temporaryWorkspace,
+          command: `mkdir -p /tmp /tmp/opencode ${quote(nested)}; printf fixture > ${quote(key)}; mv ${quote(key)} ${quote(`${key}.moved`)}`,
+        })
+        expect(result.output.exit).toBe(0)
+        expect(await readFile(`${key}.moved`, "utf8")).toBe("fixture")
+        const native = path.join(nested, ".env.fixture")
+        expect((await host.run("write", { path: native, content: "FAKE TEST DATA" })).content).toBe("written")
+        const brokerChild = path.join(path.dirname(childBroker.socketPath), `${mode}.log`)
+        expect((await host.run("shell", { command: `printf child > ${quote(brokerChild)}` })).output.exit).toBe(0)
+        expect(host.calls).toHaveLength(0)
+      }
+    } finally {
+      await childBroker.close()
+      await cleanupTestArtifacts(temporaryWorkspace, { recursive: true, force: true })
     }
   })
   test("ReadOnly Python reads do not enter JEV", async () => {
