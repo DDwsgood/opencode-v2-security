@@ -1,12 +1,14 @@
 import { lstat, readlink, realpath, stat } from "node:fs/promises"
 import { homedir } from "node:os"
 import path from "node:path"
-import { classifyPathTarget, embeddedCredentialFinding, extractReadPaths, extractWriteTargets } from "./security/paths"
+import { classifyPathTarget, credentialStoreReadPaths, embeddedCredentialFinding, extractReadPaths, extractWriteTargets } from "./security/paths"
 import { ruleRequiredCategories } from "./security/bypass"
 import { splitSimpleSegments } from "./security/classifier"
 import { scan } from "./security/shell-scan"
-import { inspectionErrorCode, isMissingPathError } from "./security/inspection"
-import { alwaysWritableRoots, isAlwaysWritablePath } from "./security/automatic-write-roots"
+import { inspectionErrorCode, inspectRegularTextFile, isMissingPathError } from "./security/inspection"
+import { alwaysWritableRoots, isAlwaysWritablePath, windowsPathHazard } from "./security/automatic-write-roots"
+import { createHash } from "node:crypto"
+import type { TrustedReviewInstruction } from "./security/effects-reviewer"
 
 export const NATIVE_BOUNDARY_TOOLS = new Set(["shell", "write", "edit", "patch", "read", "glob", "grep"])
 export type NativeBoundaryTool = "shell" | "write" | "edit" | "patch" | "read" | "glob" | "grep"
@@ -20,12 +22,20 @@ export class BoundaryPreparationError extends Error {
   }
 }
 
+/** Unsupported file paths are hard rejections, not unavailable inspection evidence. */
+export class UnsupportedNativePathError extends BoundaryPreparationError {
+  constructor(reason: string) {
+    super("Unsupported Windows native-tool path", reason)
+    this.name = "UnsupportedNativePathError"
+  }
+}
+
 /** Routing policy, not a claim that the host supplies immutable producer identity. */
 export function isBoundaryTool(
   tool: { id?: string; name?: string; options?: Record<string, unknown> },
   platform: string = process.platform,
 ): boolean {
-  return platform === "linux" &&
+  return (platform === "linux" || platform === "win32") &&
     typeof tool.name === "string" && NATIVE_BOUNDARY_TOOLS.has(tool.name) &&
     tool.id === tool.name && tool.options?.codemode === false && tool.options.namespace === undefined
 }
@@ -68,6 +78,31 @@ export function nativeAbsolutePath(cwd: string, value: string): string {
   if (!value || value.includes("\0")) throw new BoundaryPreparationError("Invalid native-tool path", "the target path is empty or contains an invalid NUL character")
   const expanded = value === "~" ? homedir() : value.startsWith("~/") ? path.join(homedir(), value.slice(2)) : value
   return path.resolve(cwd, expanded)
+}
+
+function assertWindowsNativeFilePath(value: string): void {
+  // Ordinary navigation is valid, but normalization must not erase an unsafe
+  // segment such as "frozen.txt.\\.." before it has been checked.
+  const spelling = value.replaceAll("/", "\\").split("\\")
+    .filter((segment) => segment !== "." && segment !== "..").join("\\")
+  // A volume root is a valid read/search target, unlike a writable-root grant.
+  const hazard = /^[A-Za-z]:\\+$/.test(spelling) ? undefined : windowsPathHazard(spelling)
+  if (hazard) throw new UnsupportedNativePathError(hazard)
+}
+
+/** File-only validation: shell enumeration keeps its existing path contract. */
+export function nativeFileAbsolutePath(cwd: string, value: string, platform: string = process.platform): string {
+  if (platform !== "win32") return nativeAbsolutePath(cwd, value)
+  if (!value || value.includes("\0")) throw new UnsupportedNativePathError("the target path is empty or contains an invalid NUL character")
+  const expanded = value === "~" ? homedir() : value.startsWith("~/") ? path.win32.join(homedir(), value.slice(2)) : value
+  // Root-relative and drive-relative paths depend on ambient drive state.
+  if (/^[\\/]/.test(expanded) || /^[A-Za-z]:(?![\\/])/.test(expanded)) {
+    throw new UnsupportedNativePathError("UNC, device-namespace, root-relative and drive-relative paths are not supported")
+  }
+  assertWindowsNativeFilePath(path.win32.isAbsolute(expanded) ? expanded : `${cwd}\\${expanded}`)
+  const absolute = path.win32.resolve(cwd, expanded)
+  assertWindowsNativeFilePath(absolute)
+  return absolute
 }
 
 /** Resolve missing leaves through their existing parents, including dangling symlinks. */
@@ -129,6 +164,19 @@ function patchTargets(text: string): Array<{ value: string; mode: FileMode }> {
   return targets
 }
 
+/** Pure spelling gate, called before any session/filesystem preparation can fail open. */
+export function validateWindowsNativeFileInput(tool: Exclude<NativeBoundaryTool, "shell">, input: unknown): void {
+  if (process.platform !== "win32" || !contextRecord(input)) return
+  const cwd = process.cwd()
+  if (tool === "patch") {
+    if (typeof input.patchText !== "string") return
+    for (const target of patchTargets(input.patchText)) nativeFileAbsolutePath(cwd, target.value)
+    return
+  }
+  const value = input.path ?? ((tool === "glob" || tool === "grep") ? "." : undefined)
+  if (typeof value === "string") nativeFileAbsolutePath(cwd, value)
+}
+
 async function targetIdentity(resolved: string, noFollow = false): Promise<Identity | undefined> {
   try {
     const info = await (noFollow ? lstat(resolved) : stat(resolved))
@@ -139,18 +187,29 @@ async function targetIdentity(resolved: string, noFollow = false): Promise<Ident
   }
 }
 
-async function inspectBoundaryTarget(absolute: string, mode: FileMode): Promise<BoundaryFileTarget> {
+async function inspectBoundaryTarget(absolute: string, mode: FileMode, validateResolved?: (resolved: string) => void): Promise<BoundaryFileTarget> {
   let resolved = absolute
   try {
     resolved = mode === "delete"
       ? path.join(await canonicalBoundaryPath(path.dirname(absolute)), path.basename(absolute))
       : await canonicalBoundaryPath(absolute)
+    validateResolved?.(resolved)
     const identity = await targetIdentity(resolved, mode === "delete")
     return { mode, absolute, resolved, ...(identity ? { identity } : {}) }
   } catch (error) {
+    if (error instanceof UnsupportedNativePathError) throw error
     if (!(error instanceof BoundaryPreparationError)) throw error
     return { mode, absolute, resolved, inspectionError: error.agentReason }
   }
+}
+
+async function inspectFileBoundaryTarget(absolute: string, mode: FileMode): Promise<BoundaryFileTarget> {
+  if (process.platform === "win32") assertWindowsNativeFilePath(absolute)
+  const target = await inspectBoundaryTarget(absolute, mode, process.platform === "win32" ? assertWindowsNativeFilePath : undefined)
+  // The host's native executor follows these referents without the shell helper.
+  // Unsupported referents must fail preflight, not become reviewable uncertainty.
+  if (process.platform === "win32") assertWindowsNativeFilePath(target.resolved)
+  return target
 }
 
 export async function planFileBoundary(
@@ -172,6 +231,7 @@ export async function planFileBoundary(
     if (typeof value !== "string") throw new BoundaryPreparationError(`Native ${tool} requires a path`, `the native ${tool} input requires a target path`)
     requested = [{ value, mode: tool === "write" || tool === "edit" ? "write" : "read" }]
   }
+  const absoluteRequests = requested.map((request) => ({ ...request, absolute: nativeFileAbsolutePath(options.cwd, request.value) }))
   const targets: BoundaryFileTarget[] = []
   const facts: string[] = [`native_tool=${tool}; supplied input is a file operation, not executable shell code`]
   const roots = await Promise.all([...options.writableRoots, ...alwaysWritableRoots()]
@@ -189,9 +249,9 @@ export async function planFileBoundary(
       findings.push(`${selectorFinding.rule}: native search explicitly selects sensitive names: ${JSON.stringify(selector)}`)
     }
   }
-  for (const request of requested) {
-    const absolute = nativeAbsolutePath(options.cwd, request.value)
-    const target = await inspectBoundaryTarget(absolute, request.mode)
+  for (const request of absoluteRequests) {
+    const { absolute } = request
+    const target = await inspectFileBoundaryTarget(absolute, request.mode)
     const { resolved } = target
     targets.push(target)
     facts.push(target.inspectionError
@@ -229,7 +289,7 @@ export async function planFileBoundary(
     if (request.mode === "delete") {
       // Native patch reads the old contents for its preview before unlinking.
       // The unlink target and a symlink's read referent are different effects.
-      const readTarget = await inspectBoundaryTarget(absolute, "read")
+      const readTarget = await inspectFileBoundaryTarget(absolute, "read")
       const referent = readTarget.resolved
       if (readTarget.inspectionError) findings.push(readTarget.inspectionError)
       if (referent !== resolved) {
@@ -264,7 +324,7 @@ export async function planFileBoundary(
 /** Revalidate just before the original executor. This is a path gate, not atomic OS isolation. */
 export async function verifyFileBoundaryPlan(plan: FileBoundaryPlan): Promise<void> {
   for (const target of plan.targets) {
-    const inspected = await inspectBoundaryTarget(target.absolute, target.mode)
+    const inspected = await inspectFileBoundaryTarget(target.absolute, target.mode)
     if (target.mode !== "read" && !inspected.inspectionError &&
       isAlwaysWritablePath(target.resolved) && isAlwaysWritablePath(inspected.resolved)) continue
     if (inspected.inspectionError || target.inspectionError) {
@@ -455,29 +515,250 @@ export function needsHostDirectPrivilege(command: string): boolean {
     ["sudo", "sudoedit", "doas", "pkexec", "su", "runuser"].includes(path.basename(item.words[0] ?? "")))
 }
 
-/** Canonical user messages and completed user-question answers authorize;
- * ordinary tool output, synthetic messages and assistant text do not. */
-export function boundarySessionContext(raw: unknown): { userRequest: string; context: string[] } {
+function contextRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+/** Input must be the host's session.hook("context") system array. Never pass
+ * parsed tool output here. OpenCode documents these source-labelled copies;
+ * arbitrary system prose and MCP/reference instructions are not promoted. */
+export function boundaryHostInstructions(system: unknown): TrustedReviewInstruction[] {
+  if (!Array.isArray(system)) return []
+  const instructions: TrustedReviewInstruction[] = []
+  for (const part of system) {
+    if (!contextRecord(part) || part.type !== "text" || !contextRecord(part.metadata) ||
+      !contextRecord(part.metadata.experimental)) continue
+    const sources = part.metadata.experimental.instructions
+    if (!Array.isArray(sources)) continue
+    for (const source of sources) {
+      if (!contextRecord(source) || source.key !== "core/instructions" ||
+        typeof source.text !== "string") continue
+      instructions.push({ kind: "instruction", source: source.key, text: source.text })
+    }
+  }
+  return instructions
+}
+
+export interface BoundaryWorkspaceInstructionOptions {
+  /** Actual host Location.project.directory, never a model-supplied path.
+   * Outside HOME this is the ancestor-walk stop; defaults to the session directory. */
+  projectDirectory?: string
+  /** Embedded hosts may disable discovery independently of the CLI environment. */
+  project?: boolean
+  global?: boolean
+}
+
+/** The user explicitly trusts applicable AGENTS.md policy files, including on
+ * hosts without instruction-source metadata. Match the V2 loader's global-first,
+ * nearest-to-farthest walk: inside HOME stop at HOME, otherwise at the host
+ * project directory. Never discover paths from tool output or scan descendants.
+ * Like the host loader, safe symlinks resolve to their actual file; sensitive,
+ * nonregular, binary and oversized referents are not read as policy. */
+export async function boundaryWorkspaceInstructions(
+  directory: string,
+  options: BoundaryWorkspaceInstructionOptions = {},
+): Promise<TrustedReviewInstruction[]> {
+  if (!path.isAbsolute(directory) || options.projectDirectory !== undefined && !path.isAbsolute(options.projectDirectory)) {
+    throw new BoundaryPreparationError("Invalid instruction workspace", "instruction discovery requires the actual absolute session and project directories")
+  }
+  const start = await canonicalBoundaryPath(directory)
+  const home = await canonicalBoundaryPath(path.resolve(process.env.OPENCODE_TEST_HOME ?? homedir()))
+  const projectDirectory = await canonicalBoundaryPath(options.projectDirectory ?? start)
+  const disabled = process.env.OPENCODE_CONFIG_PROJECT_DISABLE ?? process.env.OPENCODE_DISABLE_PROJECT_CONFIG
+  const projectEnabled = options.project ?? !(disabled === "1" || disabled?.toLowerCase() === "true")
+  const globalEnabled = options.global !== false
+  const configDirectory = process.env.OPENCODE_CONFIG_DIR || path.join(process.env.XDG_CONFIG_HOME || path.join(homedir(), ".config"), "opencode")
+  const globalFile = path.resolve(configDirectory, "AGENTS.md")
+  const candidates = globalEnabled ? [globalFile] : []
+  if (projectEnabled && containsPath(projectDirectory, start)) {
+    const stop = containsPath(home, start) ? home : projectDirectory
+    let current = start
+    for (;;) {
+      const candidate = path.join(current, "AGENTS.md")
+      if (globalEnabled || candidate !== globalFile) candidates.push(candidate)
+      if (current === stop) break
+      const parent = path.dirname(current)
+      if (parent === current) break
+      current = parent
+    }
+  }
+
+  return readBoundaryInstructionFiles(candidates, { directory: start, home, projectDirectory })
+}
+
+/** Only canonical host synthetic records identify independently loaded nested
+ * AGENTS sources. Their old text is never reused. Sources must remain inside
+ * the actual session directory, not merely somewhere else in the project. */
+export async function boundaryLoadedInstructions(
+  raw: unknown,
+  directory: string,
+  options: BoundaryWorkspaceInstructionOptions = {},
+): Promise<TrustedReviewInstruction[]> {
+  if (!path.isAbsolute(directory) || options.projectDirectory !== undefined && !path.isAbsolute(options.projectDirectory)) {
+    throw new BoundaryPreparationError("Invalid instruction workspace", "instruction discovery requires the actual absolute session and project directories")
+  }
+  const disabled = process.env.OPENCODE_CONFIG_PROJECT_DISABLE ?? process.env.OPENCODE_DISABLE_PROJECT_CONFIG
+  const projectEnabled = options.project ?? !(disabled === "1" || disabled?.toLowerCase() === "true")
+  if (!projectEnabled) return []
+  const messages = Array.isArray(raw) ? raw : contextRecord(raw) && Array.isArray(raw.data) ? raw.data : []
+  const candidates: string[] = []
+  for (const message of messages) {
+    if (!contextRecord(message) || message.type !== "synthetic" || !contextRecord(message.metadata) ||
+      !contextRecord(message.metadata.instruction) || !Array.isArray(message.metadata.instruction.paths)) continue
+    for (const value of message.metadata.instruction.paths) {
+      if (typeof value !== "string" || !path.isAbsolute(value) || path.basename(value) !== "AGENTS.md") continue
+      candidates.push(nativeFileAbsolutePath(directory, value))
+    }
+  }
+  if (!candidates.length) return []
+  const start = await canonicalBoundaryPath(directory)
+  const home = await canonicalBoundaryPath(path.resolve(process.env.OPENCODE_TEST_HOME ?? homedir()))
+  const projectDirectory = await canonicalBoundaryPath(options.projectDirectory ?? start)
+  for (const candidate of candidates) {
+    if ((!containsPath(path.resolve(directory), candidate) && !containsPath(start, candidate)) ||
+      !containsPath(projectDirectory, start)) {
+      throw new BoundaryPreparationError("Loaded instruction source is outside the session workspace", "a loaded AGENTS.md source is not applicable to the current session and project directories")
+    }
+  }
+  return readBoundaryInstructionFiles(candidates, { directory: start, home, projectDirectory, loadedRoot: start })
+}
+
+async function readBoundaryInstructionFiles(
+  candidates: readonly string[],
+  options: { directory: string; home: string; projectDirectory: string; loadedRoot?: string },
+): Promise<TrustedReviewInstruction[]> {
+  const { directory: start, home, projectDirectory, loadedRoot } = options
+  const instructions: TrustedReviewInstruction[] = []
+  const seen = new Set<string>()
+  const sensitiveRoots = credentialStoreReadPaths(home)
+  let totalBytes = 0
+  for (const candidate of candidates) {
+    let resolved: string
+    try {
+      resolved = await realpath(candidate)
+    } catch (error) {
+      if (isMissingPathError(error)) continue
+      throw new BoundaryPreparationError("Instruction file inspection is unavailable", `an applicable AGENTS.md file could not be resolved (${inspectionErrorCode(error)})`)
+    }
+    if (seen.has(resolved)) continue
+    seen.add(resolved)
+    for (const target of [candidate, resolved]) {
+      const finding = classifyPathTarget(target, "read", { cwd: start, worktree: projectDirectory, strictness: "LOOSE" })
+      if ((finding.kind !== "pass" && finding.rule === "credentials.sensitive-access") ||
+        sensitiveRoots.some((root) => containsPath(root, target))) {
+        throw new BoundaryPreparationError("Sensitive instruction target is not allowed", "an applicable AGENTS.md resolves to a sensitive credential or system path")
+      }
+    }
+    if (loadedRoot !== undefined && !containsPath(loadedRoot, resolved)) {
+      throw new BoundaryPreparationError("Loaded instruction source is outside the session workspace", "a loaded AGENTS.md resolves outside the current session directory")
+    }
+    const inspected = await inspectRegularTextFile(resolved, 64 * 1024)
+    if (!inspected.ok) {
+      throw new BoundaryPreparationError("Instruction file is not bounded regular text", `an applicable AGENTS.md could not be safely read (${inspected.reason})`)
+    }
+    if (!inspected.text.trim()) continue
+    totalBytes += inspected.content.length
+    if (totalBytes > 128 * 1024) {
+      throw new BoundaryPreparationError("Instruction files exceed the size limit", "applicable AGENTS.md files exceed the total trusted-policy text limit")
+    }
+    instructions.push({ kind: "instruction", source: `explicit-user-policy:agents:${resolved}`, text: inspected.text })
+  }
+  return instructions
+}
+
+export interface BoundaryContextSources {
+  /** Only snapshots returned by boundaryHostInstructions for this session. */
+  instructions?: readonly TrustedReviewInstruction[]
+  /** Explicitly trusted AGENTS policy files returned by boundaryWorkspaceInstructions. */
+  workspaceInstructions?: readonly TrustedReviewInstruction[]
+  /** Current nested AGENTS contents returned by boundaryLoadedInstructions. */
+  loadedInstructions?: readonly TrustedReviewInstruction[]
+  /** The host ctx.skill.list() result, not a model-supplied catalogue. */
+  skills?: unknown
+}
+
+export interface BoundarySessionContext {
+  userRequest: string
+  context: string[]
+  trustedInstructions: TrustedReviewInstruction[]
+  /** Full authorization sources, before display truncation. Bind all reuse to this. */
+  authorizationDigest: string
+}
+
+/** Canonical host messages are the provenance boundary, not text labels. The
+ * skill tool has no immutable producer ID: its output must match a host skill
+ * definition, and only that registry's content (never output/file lists) enters
+ * the trusted channel. Missing host metadata never falls back to tag matching. */
+export function boundarySessionContext(raw: unknown, host: BoundaryContextSources = {}): BoundarySessionContext {
   const messages = Array.isArray(raw) ? raw : raw && typeof raw === "object" && "data" in raw && Array.isArray(raw.data) ? raw.data : []
+  const skillValues = Array.isArray(host.skills) ? host.skills
+    : contextRecord(host.skills) && Array.isArray(host.skills.data) ? host.skills.data : []
+  const skills = skillValues.filter((skill): skill is Record<string, unknown> => contextRecord(skill) &&
+    typeof skill.id === "string" && typeof skill.name === "string" &&
+    typeof skill.location === "string" && typeof skill.content === "string")
+  const trustedInstructions: TrustedReviewInstruction[] = [...(host.instructions ?? [])]
+  // A source-labelled host snapshot replaces root/global file discovery, even
+  // when empty. Independently loaded nested AGENTS are not part of that snapshot.
+  if (!trustedInstructions.some((instruction) => instruction.kind === "instruction" && instruction.source === "core/instructions")) {
+    for (const instruction of host.workspaceInstructions ?? []) {
+      if (!trustedInstructions.some((existing) => existing.kind === instruction.kind &&
+        existing.source === instruction.source && existing.text === instruction.text)) trustedInstructions.push(instruction)
+    }
+  }
+  trustedInstructions.push(...(host.loadedInstructions ?? []))
+  const addSkill = (id: unknown, name: unknown, text: unknown, directory?: unknown): boolean => {
+    const skill = skills.find((candidate) => candidate.id === id && candidate.name === name)
+    if (!skill || typeof text !== "string") return false
+    const baseDirectory = path.dirname(skill.location as string)
+    if (directory !== undefined && directory !== baseDirectory) return false
+    const prefix = [
+      `<skill_content name="${skill.name}">`, `# Skill: ${skill.name}`, "", (skill.content as string).trim(), "",
+      `Base directory for this skill: ${baseDirectory}`,
+      "Relative paths in this skill (e.g., scripts/, reference/) are relative to this base directory.",
+      "Note: file list is sampled.", "", "<skill_files>",
+    ].join("\n")
+    if (!text.startsWith(`${prefix}\n`) || !text.endsWith("\n</skill_files>\n</skill_content>")) return false
+    trustedInstructions.push({ kind: "skill", source: String(skill.id), text: skill.content as string })
+    return true
+  }
   const recent: string[] = []
   const userTurns: string[][] = []
   for (const value of messages) {
     if (!value || typeof value !== "object") continue
     const message = value as Record<string, unknown>
     if (message.type === "user" && typeof message.text === "string") {
+      if (message.synthetic === true) continue
+      if (Array.isArray(message.skills)) {
+        for (const skill of message.skills) {
+          if (contextRecord(skill)) addSkill(skill.id, skill.name, skill.text)
+        }
+      }
       const text = message.text.split(/\n{2,}/).filter((block) => !block.trimStart().startsWith("[opencode-v2-security]")).join("\n\n").trim()
-      if (message.synthetic === true || !text) continue
+      if (!text) continue
       userTurns.push([text])
-      recent.push(`user: ${text.slice(-4_000)}`)
+      recent.push(`user: ${text.slice(-8_000)}`)
+    } else if (message.type === "synthetic" && typeof message.text === "string" &&
+      contextRecord(message.metadata) && contextRecord(message.metadata.instruction)) {
+      // Only boundaryLoadedInstructions' safely refreshed sources authorize;
+      // neither the historical body nor arbitrary paths authorize here.
+      recent.push(`historical loaded instructions (evidence only): ${message.text.slice(-8_000)}`)
+    } else if (message.type === "skill") {
+      addSkill(message.skill, message.name, message.text)
+    } else if (message.type === "system" && typeof message.text === "string") {
+      // InstructionsUpdated is also history, not the current source snapshot.
+      recent.push(`host system context (evidence only): ${message.text.slice(-8_000)}`)
     } else if (message.type === "assistant" && Array.isArray(message.content)) {
       for (const item of message.content) {
         if (!item || typeof item !== "object") continue
-        if (item.type === "text" && typeof item.text === "string") recent.push(`assistant: ${item.text.slice(-4_000)}`)
+        if (item.type === "text" && typeof item.text === "string") recent.push(`assistant: ${item.text.slice(-8_000)}`)
         if (item.type !== "tool" || !item.state || typeof item.state !== "object") continue
         const state = item.state as Record<string, unknown>
         const parts = Array.isArray(state.content) ? state.content : []
         const text = parts.filter((part) => part && part.type === "text" && typeof part.text === "string")
-          .map((part) => part.text).join("\n").slice(-4_000)
+          .map((part) => part.text).join("\n")
+        if (item.name === "skill" && state.status === "completed" && contextRecord(state.input) && contextRecord(state.metadata)) {
+          addSkill(state.input.id, state.metadata.name, text, state.metadata.directory)
+        }
         if (["question", "askUserQuestion"].includes(item.name) && state.status === "completed" && text.trim()) {
           const metadata = state.metadata && typeof state.metadata === "object" ? state.metadata as Record<string, unknown> : undefined
           const answers = metadata?.answers
@@ -492,18 +773,18 @@ export function boundarySessionContext(raw: unknown): { userRequest: string; con
               ...(hasStructuredAnswers ? { user_answers: answers } : { formatted_user_response: text }),
             })}`
             if (!userTurns.length) userTurns.push([])
-            userTurns.at(-1)!.push(response.slice(0, 4_000))
-            recent.push(`user: ${response.slice(0, 4_000)}`)
+            userTurns.at(-1)!.push(response)
+            recent.push(`user: ${response.slice(0, 8_000)}`)
             continue
           }
         }
-        recent.push(`tool ${JSON.stringify(item.name)} (${String(state.status)}): ${text}`)
+        recent.push(`tool ${JSON.stringify(item.name)} (${String(state.status)}): ${text.slice(-8_000)}`)
       }
     }
   }
   const context: string[] = []
-  let remaining = 16_000
-  for (const text of recent.slice(-12).reverse()) {
+  let remaining = 32_000
+  for (const text of recent.slice(-24).reverse()) {
     // Do not slice off a role label to squeeze in an older message.
     if (text.length > remaining) break
     context.unshift(text)
@@ -511,7 +792,7 @@ export function boundarySessionContext(raw: unknown): { userRequest: string; con
   }
   const recentUserTurns = userTurns.slice(-5)
   const separatorCharacters = Math.max(0, recentUserTurns.length - 1) * 2
-  const turnBudget = Math.min(3_998, Math.floor((12_000 - separatorCharacters) / Math.max(1, recentUserTurns.length)))
+  const turnBudget = Math.min(7_998, Math.floor((24_000 - separatorCharacters) / Math.max(1, recentUserTurns.length)))
   const retainedTurns = recentUserTurns.map((turn) => {
     const text = turn.join("\n\n")
     if (text.length <= turnBudget) return text
@@ -527,5 +808,15 @@ export function boundarySessionContext(raw: unknown): { userRequest: string; con
   const latestTurn = retainedTurns.at(-1)
   const duplicate = latestTurn === undefined ? -1 : context.lastIndexOf(`user: ${latestTurn}`)
   if (duplicate >= 0) context.splice(duplicate, 1)
-  return { userRequest, context }
+  // Preserve an empty snapshot's precedence internally, but never send blank
+  // protocol entries. The latest current copy of each canonical source wins.
+  const uniqueInstructions = trustedInstructions.filter((instruction, index) => instruction.text.trim().length > 0 &&
+    !trustedInstructions.slice(index + 1).some((candidate) => candidate.kind === instruction.kind && candidate.source === instruction.source))
+  if (uniqueInstructions.reduce((bytes, instruction) => bytes + Buffer.byteLength(instruction.text, "utf8"), 0) > 128_000) {
+    throw new BoundaryPreparationError("Trusted review context exceeds the size limit", "the host-loaded instructions are too large to review without losing authorization scope")
+  }
+  const authorizationDigest = createHash("sha256").update(JSON.stringify({
+    userTurns, trustedInstructions: uniqueInstructions,
+  })).digest("hex")
+  return { userRequest, context, trustedInstructions: uniqueInstructions, authorizationDigest }
 }

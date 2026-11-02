@@ -28,9 +28,10 @@
 
 import type { BypassCategory } from "../config"
 import { permIntersect, type Perm } from "../permissions"
-import { createApprovalCache, type ApprovalCache } from "./approval-cache"
+import { APPROVAL_CACHE_VERSION, createApprovalCache, type ApprovalCache } from "./approval-cache"
 import { createNoticeStore, type NoticeStore } from "../session-notifications"
 import type { RootWideningStore } from "./root-widening"
+import type { TrustedReviewInstruction } from "./effects-reviewer"
 
 /** A temporary bypass lease. In-memory by design: a service restart clears
  *  every lease. `expiresAt` is an absolute deadline; `all` is the Bypass
@@ -101,9 +102,12 @@ interface SharedSecurityStateFields {
   readonly securityEpochs: Map<string, number>
   readonly locationPolicies: Map<string, LocationPolicyEntry>
   readonly sessionLocations: Map<string, string>
+  readonly trustedInstructions: Map<string, TrustedReviewInstruction[]>
+  readonly projectDirectories: Map<string, string>
   // Per-session approval cache: one shared object, so a session's cached
   // approvals are not split by which instance serves the call.
   readonly approvalCache: ApprovalCache
+  readonly approvalCacheVersion: string
   // L3 temporary write-root grants/repetitions, shared for the same reason.
   readonly l3: RootWideningStore
   // Security-notice snapshot store: shared so a notice recorded by one
@@ -143,7 +147,10 @@ function createSharedState(): SharedSecurityState {
     securityEpochs: new Map(),
     locationPolicies: new Map(),
     sessionLocations: new Map(),
+    trustedInstructions: new Map(),
+    projectDirectories: new Map(),
     approvalCache: createApprovalCache(),
+    approvalCacheVersion: APPROVAL_CACHE_VERSION,
     l3: { repetitions: new Map(), grants: new Map() },
     notices: createNoticeStore(),
   }
@@ -245,7 +252,19 @@ function isCompatibleState(value: unknown): value is SharedSecurityState {
 export function getSharedSecurityState(): SharedSecurityState {
   const holder = globalThis as Record<symbol, unknown>
   const existing = holder[STATE_KEY]
-  if (isCompatibleState(existing)) return existing
+  if (isCompatibleState(existing)) {
+    // Additive migration preserves user grants across a plugin hot reload.
+    if (!existing.trustedInstructions) Object.assign(existing, { trustedInstructions: new Map() })
+    if (!existing.projectDirectories) Object.assign(existing, { projectDirectories: new Map() })
+    if (existing.approvalCacheVersion !== APPROVAL_CACHE_VERSION) {
+      existing.approvalCache.clearAll()
+      // Keep the object identity: already loaded location instances captured
+      // this cache too. Upgrade their methods without dropping user authority.
+      Object.assign(existing.approvalCache, createApprovalCache())
+      Object.assign(existing, { approvalCacheVersion: APPROVAL_CACHE_VERSION })
+    }
+    return existing
+  }
   const fresh = createSharedState()
   holder[STATE_KEY] = fresh
   return fresh

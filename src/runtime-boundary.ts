@@ -233,16 +233,19 @@ export async function createRuntimeBoundaryBroker(options: {
   onTerminalFailure?(code: string): void
   onCancelFailure?(): void
 }): Promise<RuntimeBoundaryBroker> {
-  const directory = await mkdtemp(path.join(options.directory, "security-boundary-"))
-  const unregisterDirectory = registerRuntimeBrokerDirectory(directory)
+  const windows = process.platform === "win32"
+  const minimumExit = windows ? -0x80000000 : 0
+  const maximumExit = windows ? 0xffffffff : 255
+  const directory = windows ? options.directory : await mkdtemp(path.join(options.directory, "security-boundary-"))
+  const unregisterDirectory = windows ? () => {} : registerRuntimeBrokerDirectory(directory)
   try {
-    await chmod(directory, 0o700)
+    if (!windows) await chmod(directory, 0o700)
   } catch (error) {
     await rmdir(directory).catch(() => {})
     unregisterDirectory()
     throw error
   }
-  const socketPath = path.join(directory, "observer.sock")
+  const socketPath = windows ? `\\\\.\\pipe\\opencode-security-${randomBytes(24).toString("hex")}` : path.join(directory, "observer.sock")
   const token = randomBytes(32).toString("hex")
   const controller = new AbortController()
   const sockets = new Set<Socket>()
@@ -250,6 +253,7 @@ export async function createRuntimeBoundaryBroker(options: {
   let active: Socket | undefined
   let terminalExit: number | undefined
   let brokerError: string | undefined
+  let connectionTimer: ReturnType<typeof setTimeout> | undefined
   let complete!: (result: { exit?: number; error?: string }) => void
   const finished = new Promise<{ exit?: number; error?: string }>((resolve) => { complete = resolve })
   const fail = (reason: string) => {
@@ -259,6 +263,10 @@ export async function createRuntimeBoundaryBroker(options: {
     complete({ error: brokerError })
   }
   const server = createServer((socket) => {
+    if (windows && (closed || controller.signal.aborted)) {
+      socket.destroy()
+      return
+    }
     sockets.add(socket)
     socket.on("error", () => { fail("the runtime observer connection failed"); socket.destroy() })
     socket.on("close", () => {
@@ -271,7 +279,7 @@ export async function createRuntimeBoundaryBroker(options: {
     let lastEvent = 0
     let pending = false
     socket.setEncoding("utf8")
-    socket.on("data", (chunk: string) => {
+    const receive = (chunk: string) => {
       if (closed || active && active !== socket) { socket.destroy(); return }
       const invalid = (reason: string) => { fail(reason); socket.destroy() }
       buffer += chunk
@@ -284,11 +292,18 @@ export async function createRuntimeBoundaryBroker(options: {
       // multiple approvals from one held syscall. Trailing bytes after a
       // line are only acceptable while a reply is in flight — the terminal
       // exit frame may share the chunk.
-      if (buffer.length > 0 && !pending) { invalid("the runtime observer sent overlapping messages"); return }
+      if (!windows && buffer.length > 0 && !pending) { invalid("the runtime observer sent overlapping messages"); return }
       let raw: unknown
       try { raw = JSON.parse(line) } catch { invalid("the runtime observer returned invalid JSON"); return }
+      if (windows && record(raw) && raw.version === 1 && raw.type === "ready" && raw.token === token) {
+        if (active || pending) { invalid("the Windows sandbox sent a duplicate control handshake"); return }
+        clearTimeout(connectionTimer)
+        active = socket
+        if (buffer.length > 0) receive("")
+        return
+      }
       if (record(raw) && raw.version === 1 && raw.type === "exit" && raw.token === token &&
-        Number.isInteger(raw.exit) && Number(raw.exit) >= 0 && Number(raw.exit) <= 255) {
+        Number.isInteger(raw.exit) && Number(raw.exit) >= minimumExit && Number(raw.exit) <= maximumExit) {
         if (raw.failure !== undefined && (typeof raw.failure !== "string" || !/^[a-z][a-z0-9_]{0,63}$/.test(raw.failure))) {
           invalid("the runtime observer returned an invalid terminal failure")
           return
@@ -310,7 +325,7 @@ export async function createRuntimeBoundaryBroker(options: {
       const event = parseRuntimeBoundary(raw, token)
       // A second boundary event while one is unanswered is a protocol
       // violation; the terminal exit frame above stays legal mid-flight.
-      if (!event || pending || event.eventID <= lastEvent) { invalid("the runtime observer returned an invalid or unauthenticated boundary event"); return }
+      if (windows || !event || pending || event.eventID <= lastEvent) { invalid("the runtime observer returned an invalid or unauthenticated boundary event"); return }
       active = socket
       lastEvent = event.eventID
       pending = true
@@ -331,11 +346,15 @@ export async function createRuntimeBoundaryBroker(options: {
           ...(pass ? {} : { reason: "the boundary check could not be completed" }),
         }) + "\n")
       }).finally(() => { pending = false }).catch(() => { fail("the runtime boundary response could not be sent"); socket.destroy() })
-    })
+    }
+    socket.on("data", receive)
   })
   const cleanup = async () => {
-    await unlink(socketPath).catch(() => {})
-    await rmdir(directory).catch(() => {})
+    clearTimeout(connectionTimer)
+    if (!windows) {
+      await unlink(socketPath).catch(() => {})
+      await rmdir(directory).catch(() => {})
+    }
     unregisterDirectory()
   }
   try {
@@ -343,7 +362,16 @@ export async function createRuntimeBoundaryBroker(options: {
       server.once("error", reject)
       server.listen(socketPath, () => { server.removeListener("error", reject); resolve() })
     })
-    await chmod(socketPath, 0o600)
+    if (!windows) await chmod(socketPath, 0o600)
+    else {
+      connectionTimer = setTimeout(() => {
+        if (!active && !closed) {
+          fail("the Windows sandbox did not authenticate its control channel")
+          for (const socket of sockets) socket.destroy()
+        }
+      }, 30_000)
+      connectionTimer.unref()
+    }
   } catch (error) {
     server.close()
     await cleanup()
@@ -356,6 +384,7 @@ export async function createRuntimeBoundaryBroker(options: {
     async close() {
       if (closed) return
       closed = true
+      clearTimeout(connectionTimer)
       controller.abort()
       complete({ ...(terminalExit !== undefined ? { exit: terminalExit } : {}) })
       // EOF is an infrastructure failure under fail-open. User cancellation

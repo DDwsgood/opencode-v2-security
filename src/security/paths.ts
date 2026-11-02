@@ -73,6 +73,58 @@ const CREDENTIAL_HOME_FILES = [
   ".docker/config.json",
 ]
 
+/** Native Windows credential layout, relative to a native `C:\Users\<user>`
+ *  profile root. Real secret material on Windows lives under AppData — DPAPI
+ *  credential blobs, master keys, vaults, private-key stores — not only in the
+ *  POSIX `~/.ssh` layout. These entries are applied only on the Windows host;
+ *  a WSL-mounted profile stays a Linux home. */
+const WINDOWS_CREDENTIAL_PROFILE_DIRS = [
+  "AppData/Roaming/Microsoft/Credentials",
+  "AppData/Local/Microsoft/Credentials",
+  "AppData/Roaming/Microsoft/Protect",
+  "AppData/Local/Microsoft/Protect",
+  "AppData/Roaming/Microsoft/Vault",
+  "AppData/Local/Microsoft/Vault",
+  "AppData/Roaming/Microsoft/Crypto",
+  "AppData/Roaming/Microsoft/SystemCertificates",
+  "AppData/Roaming/Microsoft/UserSecrets",
+  "AppData/Roaming/gcloud",
+  "AppData/Roaming/GitHub CLI",
+  "AppData/Local/GitHub CLI",
+  "AppData/Roaming/Subversion/auth",
+]
+
+const WINDOWS_CREDENTIAL_PROFILE_FILES = [
+  // curl.exe stores its netrc as _netrc in the profile root.
+  "_netrc",
+  // NuGet keeps cleartext feed credentials here.
+  "AppData/Roaming/NuGet/NuGet.Config",
+]
+
+/** Native Windows system locations whose writes are system modification.
+ *  Drive letters vary, so every pattern is anchored on a drive letter instead
+ *  of a literal `C:`. */
+const WINDOWS_SYSTEM_WRITE_PROFILE_DIRS = ["AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup"]
+
+const WINDOWS_CRITICAL_RE = [
+  /^[a-z]:\/windows\/system32\/config\/(?:sam|security|system|default|software|components|bcd-template)(?:\.(?:log\d*|sav|alt)|$|\/)/,
+  /^[a-z]:\/windows\/system32\/config\/regback(?:\/|$)/,
+  /^[a-z]:\/windows\/ntds\/ntds\.dit$/,
+  /^[a-z]:\/windows\/repair\/(?:sam|security|system|default|software|ntuser\.dat)(?:$|\.|\/)/,
+  /^[a-z]:\/users\/[^/]+\/ntuser\.dat(?:\.log\d*)?$/,
+  /^[a-z]:\/windows\/system32\/config\/systemprofile\/ntuser\.dat$/,
+]
+
+const WINDOWS_SYSTEM_WRITE_RE = [
+  /^[a-z]:\/windows\/system32\/(?:config|drivers\/etc|tasks|grouppolicy)(?:\/|$)/,
+  /^[a-z]:\/windows\/tasks(?:\/|$)/,
+  /^[a-z]:\/windows\/(?:win\.ini|system\.ini)$/,
+  /^[a-z]:\/windows\/(?:system32|syswow64)(?:\/|$)/,
+  /^[a-z]:\/programdata\/microsoft\/(?:crypto|protect|systemcertificates|credentials)(?:\/|$)/,
+  /^[a-z]:\/programdata\/microsoft\/windows\/start menu\/programs\/startup(?:\/|$)/,
+  /^[a-z]:\/program files(?: \(x86\))?(?:\/|$)/,
+]
+
 const CREDENTIAL_ABS_RE = [
   /^\/proc\/(?:\d+|self|thread-self)\/environ/,
   /^\/etc\/sudoers(?:$|[./])/,
@@ -84,12 +136,25 @@ const CREDENTIAL_ABS_RE = [
  *  scan. A read-only session passes them to the observer as extra deny-read
  *  roots so a read produces a reviewable boundary event instead of running
  *  silently. Relative-to-home only — foreign homes cannot be enumerated
- *  without scanning /home. */
-export function credentialStoreReadPaths(home: string): string[] {
-  if (!path.isAbsolute(home)) return []
+ *  without scanning /home (or C:\Users).
+ *
+ *  A native Windows home (`C:\Users\<user>`) also yields the profile-local
+ *  AppData credential stores, spelled with Windows separators so the observer
+ *  receives the same paths the OS uses. This is a Windows-host branch, not a
+ *  spelling guess: a POSIX home (including a WSL-mounted profile) keeps the
+ *  original Linux layout. */
+export function credentialStoreReadPaths(home: string, platform: NodeJS.Platform = process.platform): string[] {
+  const windows = platform === "win32"
+  const paths = windows ? path.win32 : path.posix
+  if (!paths.isAbsolute(home)) return []
+  const join = (relative: string) =>
+    windows ? path.win32.join(home, ...relative.split("/")) : path.join(home, relative)
   return [
-    ...CREDENTIAL_HOME_DIRS.map((dir) => path.join(home, dir)),
-    ...CREDENTIAL_HOME_FILES.map((file) => path.join(home, file)),
+    ...CREDENTIAL_HOME_DIRS.map(join),
+    ...CREDENTIAL_HOME_FILES.map(join),
+    ...(windows
+      ? [...WINDOWS_CREDENTIAL_PROFILE_DIRS.map(join), ...WINDOWS_CREDENTIAL_PROFILE_FILES.map(join)]
+      : []),
   ]
 }
 
@@ -171,10 +236,26 @@ const SENSITIVE_SUFFIXES: [string, SensitivityFlags][] = [
   [".kube/", { critical: false, credential: true, systemWrite: false }],
 ]
 
+// Native Windows spellings for relative arguments that escape the worktree.
+// Kept separate so the POSIX classifier is unchanged on a non-Windows host.
+const WINDOWS_SENSITIVE_SUFFIXES: [string, SensitivityFlags][] = [
+  ["/windows/system32/config/sam", { critical: true, credential: false, systemWrite: true }],
+  ["/windows/system32/config/security", { critical: true, credential: false, systemWrite: true }],
+  ["/windows/system32/config/system", { critical: true, credential: false, systemWrite: true }],
+  ["/ntds/ntds.dit", { critical: true, credential: false, systemWrite: true }],
+  ["/ntuser.dat", { critical: true, credential: false, systemWrite: false }],
+  ["/appdata/roaming/microsoft/credentials", { critical: false, credential: true, systemWrite: false }],
+  ["/appdata/local/microsoft/credentials", { critical: false, credential: true, systemWrite: false }],
+  ["/appdata/roaming/microsoft/protect", { critical: false, credential: true, systemWrite: false }],
+  ["/appdata/roaming/microsoft/vault", { critical: false, credential: true, systemWrite: false }],
+  ["/appdata/roaming/gcloud", { critical: false, credential: true, systemWrite: false }],
+  ["/appdata/roaming/github cli", { critical: false, credential: true, systemWrite: false }],
+]
+
 // --- environment ------------------------------------------------------------
 
-function getHome(): string {
-  return process.platform === "win32"
+function getHome(platform: NodeJS.Platform = process.platform): string {
+  return platform === "win32"
     ? process.env.USERPROFILE ?? process.env.HOME ?? ""
     : process.env.HOME ?? process.env.USERPROFILE ?? ""
 }
@@ -329,7 +410,8 @@ export function embeddedCredentialFinding(text: string): PathFinding | undefined
   }
 }
 
-function matchRegistry(absolute: string, home: string, flags: SensitivityFlags): void {
+function matchRegistry(absolute: string, home: string, flags: SensitivityFlags, platform: NodeJS.Platform = process.platform): void {
+  const windows = platform === "win32"
   const norm = absolute
     .replaceAll("\\", "/")
     .toLowerCase()
@@ -346,9 +428,16 @@ function matchRegistry(absolute: string, home: string, flags: SensitivityFlags):
   }
 
   const windowsProfile = norm.match(/^\/mnt\/[a-z]\/users\/[^/]+(?=\/|$)/)?.[0]
+  // A native Windows profile (drive-letter home) carries the same AppData
+  // credential layout; it is not only reachable through a WSL mount. Only a
+  // Windows host gets these entries, so a POSIX path that merely spells
+  // `appdata/roaming/...` under a Linux home keeps its HEAD classification.
+  const nativeWindowsProfile = windows ? norm.match(/^[a-z]:\/users\/[^/]+(?=\/|$)/)?.[0] : undefined
   // A WSL credential store remains sensitive after HOME symlinks resolve into
   // a Windows profile, including profiles other than the Linux user's name.
-  const homes = new Set([home, windowsProfile].filter((value): value is string => Boolean(value)))
+  const homes = new Set(
+    [home, windowsProfile, nativeWindowsProfile].filter((value): value is string => Boolean(value)),
+  )
   for (const candidate of homes) {
     const h = candidate.replaceAll("\\", "/").toLowerCase().replace(/\/+$/, "")
     if (h) {
@@ -356,33 +445,62 @@ function matchRegistry(absolute: string, home: string, flags: SensitivityFlags):
         if (norm === `${h}/${dir}` || norm.startsWith(`${h}/${dir}/`)) flags.credential = true
       }
       for (const file of CREDENTIAL_HOME_FILES) if (norm === `${h}/${file}`) flags.credential = true
+      if (windows) {
+        for (const dir of WINDOWS_CREDENTIAL_PROFILE_DIRS) {
+          const lower = dir.toLowerCase()
+          if (norm === `${h}/${lower}` || norm.startsWith(`${h}/${lower}/`)) flags.credential = true
+        }
+        for (const file of WINDOWS_CREDENTIAL_PROFILE_FILES) {
+          if (norm === `${h}/${file.toLowerCase()}`) flags.credential = true
+        }
+        for (const dir of WINDOWS_SYSTEM_WRITE_PROFILE_DIRS) {
+          const lower = dir.toLowerCase()
+          if (norm === `${h}/${lower}` || norm.startsWith(`${h}/${lower}/`)) flags.systemWrite = true
+        }
+      }
       for (const file of SYSTEM_WRITE_HOME_FILES) if (norm === `${h}/${file}`) flags.systemWrite = true
     }
+  }
+  if (windows) {
+    for (const re of WINDOWS_CRITICAL_RE) if (re.test(norm)) flags.critical = true
+    for (const re of WINDOWS_SYSTEM_WRITE_RE) if (re.test(norm)) flags.systemWrite = true
   }
 
   const baseName = norm.split("/").pop() ?? ""
   if (baseName) {
     for (const re of CREDENTIAL_NAME_RE) if (re.test(baseName)) flags.credential = true
   }
-  if (temporaryCredentialPath(norm, home) && CREDENTIAL_HOME_DIRS.some((dir) =>
+  if (temporaryCredentialPath(norm, home, platform) && CREDENTIAL_HOME_DIRS.some((dir) =>
     norm.endsWith(`/${dir}`) || norm.includes(`/${dir}/`))) flags.credential = true
+}
+
+/** Case-insensitive containment for drive-letter paths (Windows compares path
+ *  names without case); POSIX containment everywhere else. */
+function withinLexicalPortable(base: string, target: string, platform: NodeJS.Platform): boolean {
+  const windows = platform === "win32" && (/^[A-Za-z]:[\\/]/.test(base) || /^[A-Za-z]:[\\/]/.test(target))
+  return windows
+    ? isWithinLexical(base.toLowerCase(), target.toLowerCase())
+    : isWithinLexical(base, target)
 }
 
 /** A temp name is not proof of either mock provenance or real credentials.
  * Keep uncertain/staged secrets reviewable, including temporary HOME fixtures. */
-function temporaryCredentialPath(absolute: string, home: string): boolean {
-  if (isWithinLexical("/tmp", absolute) || isWithinLexical("/var/tmp", absolute)) return true
+function temporaryCredentialPath(absolute: string, home: string, platform: NodeJS.Platform = process.platform): boolean {
+  if (withinLexicalPortable("/tmp", absolute, platform) || withinLexicalPortable("/var/tmp", absolute, platform)) return true
   const temporary = tmpdir().replaceAll("\\", "/").replace(/\/+$/, "")
   if (!path.isAbsolute(temporary) || temporary === "/") return false
-  const windowsHome = absolute.match(/^\/mnt\/[a-z]\/users\/[^/]+/i)?.[0]
+  const windowsHome = platform === "win32"
+    ? absolute.match(/^(?:\/mnt\/[a-z]|[a-z]:)\/users\/[^/]+/i)?.[0]
+    : absolute.match(/^\/mnt\/[a-z]\/users\/[^/]+/i)?.[0]
   if ([home, windowsHome].some((root) => root &&
-    (isWithinLexical(root, temporary) || isWithinLexical(temporary, root)))) return false
-  return isWithinLexical(temporary, absolute)
+    (withinLexicalPortable(root, temporary, platform) || withinLexicalPortable(temporary, root, platform)))) return false
+  return withinLexicalPortable(temporary, absolute, platform)
 }
 
-function matchSuffix(raw: string, flags: SensitivityFlags): void {
+function matchSuffix(raw: string, flags: SensitivityFlags, platform: NodeJS.Platform = process.platform): void {
   const value = raw.replaceAll("\\", "/").toLowerCase()
-  for (const [suffix, entry] of SENSITIVE_SUFFIXES) {
+  const entries = platform === "win32" ? [...SENSITIVE_SUFFIXES, ...WINDOWS_SENSITIVE_SUFFIXES] : SENSITIVE_SUFFIXES
+  for (const [suffix, entry] of entries) {
     if (value.endsWith(suffix)) {
       if (entry.critical) flags.critical = true
       if (entry.credential) flags.credential = true
@@ -391,9 +509,11 @@ function matchSuffix(raw: string, flags: SensitivityFlags): void {
   }
 }
 
-function isBroadScanRoot(absolute: string | undefined): boolean {
+function isBroadScanRoot(absolute: string | undefined, platform: NodeJS.Platform = process.platform): boolean {
   if (!absolute) return false
-  return absolute === "/" || /^\/mnt\/[a-z]$/i.test(absolute)
+  // A whole volume ("C:\") is the Windows equivalent of scanning "/".
+  return absolute === "/" || /^\/mnt\/[a-z]$/i.test(absolute) ||
+    (platform === "win32" && /^[a-z]:[\\/]?$/i.test(absolute))
 }
 
 const REASON_SENSITIVE_READ_ASK = "Reading a credential or sensitive system file requires review"
@@ -1222,15 +1342,24 @@ export function checkPathSensitivity(raw: string, ctx: PathContext): { parseable
 }
 
 /** A canonical runtime path is a literal name, not a shell expression. */
-export function checkResolvedPathSensitivity(absolute: string): { parseable: boolean; sensitive: boolean } {
-  if (!path.isAbsolute(absolute) || absolute.includes("\0")) return { parseable: false, sensitive: false }
-  const home = getHome()
-  const foreignHome = absolute.match(/^\/(?:home|Users)\/([^/]+)(?:\/|$)/i)
+export function checkResolvedPathSensitivity(
+  absolute: string,
+  platform: NodeJS.Platform = process.platform,
+): { parseable: boolean; sensitive: boolean } {
+  const paths = platform === "win32" ? path.win32 : path.posix
+  if (!paths.isAbsolute(absolute) || absolute.includes("\0")) return { parseable: false, sensitive: false }
+  const home = getHome(platform)
+  // Another user's profile: POSIX (/home, /Users) everywhere, plus native
+  // Windows (C:\Users) only on the Windows host. A non-Windows host keeps the
+  // original HEAD check, so backslashes stay literal filename characters.
+  const foreignHome = platform === "win32"
+    ? absolute.replaceAll("\\", "/").match(/^(?:\/(?:home|Users)|[A-Za-z]:\/Users)\/([^/]+)(?:\/|$)/i)
+    : absolute.match(/^\/(?:home|Users)\/([^/]+)(?:\/|$)/i)
   if (home && foreignHome && foreignHome[1].toLowerCase() !== homeBaseName(home).toLowerCase()) {
     return { parseable: true, sensitive: true }
   }
   const flags: SensitivityFlags = { critical: false, credential: false, systemWrite: false }
-  matchRegistry(absolute, home, flags)
+  matchRegistry(absolute, home, flags, platform)
   return { parseable: true, sensitive: flags.critical || flags.credential || flags.systemWrite }
 }
 

@@ -2,6 +2,8 @@ import { createHash } from "node:crypto"
 import { isIP } from "node:net"
 import type { EffectReviewResult } from "./effects-reviewer"
 
+export const APPROVAL_CACHE_VERSION = "authorization-bound-v2"
+
 /** Memory-only, per-session approval cache shared by the broker.
  *
  * Two layers, deliberately narrow:
@@ -15,13 +17,12 @@ import type { EffectReviewResult } from "./effects-reviewer"
  *
  * Lifetime rules:
  * - Positive entries (allow, L1 and L2) live `allowTtlMs` on a SLIDING
- *   window — every hit refreshes the timer — and are bound to the session's
- *   security snapshot only: a new user message does NOT drop them, but any
- *   security-state change clears the whole session (the caller clears
- *   explicitly, and a scope mismatch discards on the next store).
- * - Negative entries (deny, L1 only) live a fixed `denyTtlMs` and stay bound
- *   to the user-authorization digest they were adjudicated under: a new user
- *   message may authorize what was denied, so they miss afterwards.
+ *   window — every hit refreshes the timer — and are bound to both the
+ *   security snapshot and complete trusted authorization digest. A newer
+ *   user withdrawal or host instruction change must not reuse an old allow.
+ * - Negative entries (deny, L1 only) live a fixed `denyTtlMs` under that same
+ *   scope: a new authorization context may authorize what was denied, so
+ *   the prior refusal also misses afterwards.
  *
  * The cache is not a new risk analyzer: it only records decisions the caller
  * already adjudicated, never downgrades them, and never invents an approval.
@@ -30,14 +31,14 @@ import type { EffectReviewResult } from "./effects-reviewer"
 export type ApprovalCacheScope = {
   sessionID: string
   securitySnapshot: string
-  /** Binds only negative entries: a refusal is a fact about this user
-   *  message's authorization context. Positive entries ignore it. */
+  /** Binds every entry: full trusted user/question/instruction authorization
+   *  sources, not only the displayed/truncated latest user request. */
   userAuthorizationDigest: string
 }
 
 export type ApprovalCacheTarget = {
   path: string
-  domain: "linux" | "drvfs"
+  domain: "linux" | "drvfs" | "windows"
   exists: boolean
   dev?: string
   ino?: string
@@ -140,9 +141,6 @@ type L1Entry = {
   result: EffectReviewResult
   storedAt: number
   ttlMs: number
-  /** Present only on deny entries: the user-authorization digest the
-   *  refusal was adjudicated under. Positive entries carry no binding. */
-  authorization?: string
 }
 
 type L2Grant = {
@@ -165,11 +163,10 @@ function digest(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex")
 }
 
-/** Only the security snapshot keys a session's state; the raw snapshot
- *  string is never stored, and the user-authorization digest binds deny
- *  entries individually rather than the whole session state. */
+/** Both authorization and independent permission state key the session.
+ *  Neither raw instructions nor the raw security snapshot are stored. */
 function snapshotDigest(scope: ApprovalCacheScope): string {
-  return digest(scope.securitySnapshot)
+  return digest(JSON.stringify([scope.securitySnapshot, scope.userAuthorizationDigest]))
 }
 
 const SHELL_BASENAMES: ReadonlySet<string> = new Set(["bash", "sh", "dash", "zsh", "ksh", "fish"])
@@ -328,12 +325,11 @@ export function createApprovalCache(options: ApprovalCacheOptions = {}): Approva
 
   const sessions = new Map<string, SessionState>()
 
-  /** State for exactly this security snapshot, or undefined. Read paths
+  /** State for exactly this security/authorization scope, or undefined. Read paths
    *  never mutate: a caller still holding an older snapshot (an in-flight
    *  call that began before a mode change) must miss, not wipe the newer
-   *  entries. The user-authorization digest is NOT part of the state — it
-   *  binds deny entries individually, so a new user message keeps positive
-   *  approvals. */
+   *  entries. This also prevents late outcome stats under withdrawn instructions
+   *  from advancing object identities in a newer authorization scope. */
   function currentSession(scope: ApprovalCacheScope): SessionState | undefined {
     const existing = sessions.get(scope.sessionID)
     if (!existing || existing.snapshotDigest !== snapshotDigest(scope)) return undefined
@@ -341,8 +337,8 @@ export function createApprovalCache(options: ApprovalCacheOptions = {}): Approva
     return existing
   }
 
-  /** Writing under a new security snapshot discards every prior entry of the
-   *  session: stale approvals must not survive cap/lease or mode changes. */
+  /** Writing under a new scope discards every prior entry of the session:
+   *  stale approvals must not survive permission or trusted-instruction changes. */
   function sessionForStore(scope: ApprovalCacheScope): SessionState {
     const current = currentSession(scope)
     if (current) return current
@@ -395,10 +391,6 @@ export function createApprovalCache(options: ApprovalCacheOptions = {}): Approva
       if (entry) {
         if (expired(entry.storedAt, entry.ttlMs)) {
           state.l1.delete(facts.coreDigest)
-        } else if (entry.decision === "deny" && entry.authorization !== scope.userAuthorizationDigest) {
-          // A refusal stays bound to the user message it was adjudicated
-          // under: a different message misses (the new context may authorize
-          // it); an identical repeated message legitimately hits again.
         } else {
           // Positive TTL is sliding — the denial TTL stays fixed.
           if (entry.decision === "allow") entry.storedAt = now()
@@ -443,7 +435,6 @@ export function createApprovalCache(options: ApprovalCacheOptions = {}): Approva
         result: structuredClone(result),
         storedAt: now(),
         ttlMs,
-        ...(allow ? {} : { authorization: scope.userAuthorizationDigest }),
       })
       evictOldest(state.l1)
 

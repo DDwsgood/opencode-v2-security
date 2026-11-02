@@ -1,11 +1,11 @@
 import { opendir } from "node:fs/promises"
 import path from "node:path"
 import { canonicalCandidate } from "./automatic-write-roots"
-import { EFFECTS_MODEL, EffectsReviewError, requestSystemOne, type EffectsReviewOptions } from "./effects-reviewer"
+import { EFFECTS_MODEL, EffectsReviewError, REVIEW_AUTHORIZATION_CONTRACT, requestSystemOne, type EffectsReviewOptions, type TrustedReviewInstruction } from "./effects-reviewer"
 import { containsWritePath, writeRootRejection, writeTargetExempt, type WriteRootPolicy } from "./write-root-policy"
 import type { RuntimeBoundaryEvent } from "../runtime-boundary"
 
-export const L3_POLICY_VERSION = "l3-root-widen-v1"
+export const L3_POLICY_VERSION = "l3-root-widen-v2-host-instructions"
 export const L3_WINDOW_MS = 20 * 60 * 1000
 export const L3_STATE_TEXT = "A coding agent runs shell commands under a sandbox. Inside a writable root every file operation (create, modify, append, delete, rename) runs without further review, exactly like /tmp. Outside writable roots each write pauses for an individual safety review. The recent commands below each wrote inside the same directory, and every one of those writes was individually reviewed and allowed. You decide whether one directory may become an additional writable root for this session temporarily (20 minutes, ended early by the user's next message or any permission change). Granting saves future reviews; it must never expose data whose loss, alteration or disclosure would matter."
 export const L3_QUESTION_TEXT = "Choose the single directory to add as a temporary writable root, or none. Prefer the narrowest candidate that still covers the repeated writes — normally the directory the writes land in. Choose a broader ancestor only when the evidence shows the same tools routinely write across its subdirectories and nothing in it is sensitive. Choose none when a candidate that would cover the writes also holds data that should not be freely modified or deleted (credentials, tokens, keys, auth or session files, configuration that changes program or security behaviour, version-controlled source, databases, user documents); when the writes look like a task-specific action rather than a tool's routine bookkeeping (logs, caches, locks, temporary or trim files, history); or when the user's request and recent context do not support continued use of these tools."
@@ -27,6 +27,7 @@ export interface RepeatedWriteEvent {
 export interface RootWideningInput {
   user_request: string
   session_context: string[]
+  trusted_instructions?: TrustedReviewInstruction[]
   repeated_directory: string
   events: RepeatedWriteEvent[]
   candidates: RootCandidate[]
@@ -49,6 +50,7 @@ export function buildRootWideningBody(input: RootWideningInput) {
   const facts: RootWideningInput = {
     user_request: input.user_request,
     session_context: input.session_context,
+    trusted_instructions: input.trusted_instructions?.map(({ kind, source, text }) => ({ kind, source, text })) ?? [],
     repeated_directory: input.repeated_directory,
     events: input.events.map(({ command, syscall, operation, target, executable }) => ({ command, syscall, operation, target, executable })),
     candidates: input.candidates.map(({ option, path, sample_entries }) => ({ option, path, sample_entries })),
@@ -56,7 +58,7 @@ export function buildRootWideningBody(input: RootWideningInput) {
   }
   const body = {
     model: EFFECTS_MODEL,
-    state: `${L3_STATE_TEXT}\n\n<review_input>\n${stableJson(facts)}\n</review_input>\n`,
+    state: `${L3_STATE_TEXT}\n\n${REVIEW_AUTHORIZATION_CONTRACT}\n\n<review_input>\n${stableJson(facts)}\n</review_input>\n`,
     questions: { widen_root: { type: "choice", instructions: L3_QUESTION_TEXT, criteria } },
   }
   if (Buffer.byteLength(JSON.stringify(body)) > 512 * 1024) throw new Error("L3 request size")
@@ -142,6 +144,7 @@ export async function rootWideningCandidates(
 export interface RootWideningScope {
   sessionID: string
   canWrite: boolean
+  /** Full boundary authorization digest, including host-loaded instructions. */
   userMessageDigest: string
   securitySnapshot: string
 }
@@ -150,6 +153,7 @@ export interface RootWideningContext {
   scope: RootWideningScope
   user_request: string
   session_context: string[]
+  trusted_instructions?: TrustedReviewInstruction[]
 }
 
 interface RootGrant {
@@ -157,6 +161,7 @@ interface RootGrant {
   grantedAt: number
   userMessageDigest: string
   securitySnapshot: string
+  policyVersion: typeof L3_POLICY_VERSION
 }
 
 interface Repetition {
@@ -233,6 +238,7 @@ export function createRootWidening(options: {
     for (const grant of grants.get(scope.sessionID) ?? []) {
       let reason: string | undefined
       if (!scope.canWrite) reason = "readonly"
+      else if (grant.policyVersion !== L3_POLICY_VERSION) reason = "policy"
       else if (now() - grant.grantedAt >= L3_WINDOW_MS) reason = "time"
       else if (scope.userMessageDigest !== grant.userMessageDigest) reason = "user_message"
       else if (scope.securitySnapshot !== grant.securitySnapshot) reason = "security_snapshot"
@@ -263,6 +269,7 @@ export function createRootWidening(options: {
       if (!sameScope(input.scope, retained.scope)) return
       trace({ kind: "l3_root_request", ...audit })
       const payload = await options.review({ user_request: retained.user_request, session_context: retained.session_context,
+        trusted_instructions: retained.trusted_instructions,
         repeated_directory: key, events, candidates, current_write_roots: input.currentRoots })
       const choice = parseRootWideningChoice(payload, candidates)
       if (choice === "none") {
@@ -280,7 +287,8 @@ export function createRootWidening(options: {
       const finalContext = await input.context()
       if (!sameScope(input.scope, finalContext.scope) || repetitions.get(JSON.stringify([input.scope.sessionID, key])) !== repetition) return
       const active = grants.get(input.scope.sessionID) ?? []
-      active.push({ root: candidate.path, grantedAt: now(), userMessageDigest: input.scope.userMessageDigest, securitySnapshot: input.scope.securitySnapshot })
+      active.push({ root: candidate.path, grantedAt: now(), userMessageDigest: input.scope.userMessageDigest,
+        securitySnapshot: input.scope.securitySnapshot, policyVersion: L3_POLICY_VERSION })
       grants.set(input.scope.sessionID, active)
       trace({ kind: "l3_root_granted", ...audit, root: candidate.path })
     } catch {

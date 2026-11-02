@@ -256,16 +256,17 @@ describe("scope and session isolation", () => {
     expect(cache.lookup(scope(), f)).toBeUndefined()
   })
 
-  test("a new user message keeps positive approvals", () => {
+  test("a changed trusted authorization digest invalidates positive L1 approvals", () => {
     const cache = createApprovalCache()
     const f = facts({ kind: "read", targets: [] })
     cache.store(scope(), f, makeResult())
 
-    // Only the security snapshot scopes positive state: the user-message
-    // digest does not drop an allow.
-    expect(cache.lookup(scope({ userAuthorizationDigest: "auth-b" }), f)?.layer).toBe("L1")
-    cache.store(scope({ userAuthorizationDigest: "auth-b" }), facts({ kind: "read", targets: [], coreDigest: "other" }), makeResult())
+    // User withdrawals and host-loaded instruction changes both alter this
+    // digest, even when the reviewed boundary core and target are identical.
+    expect(cache.lookup(scope({ userAuthorizationDigest: "auth-b" }), f)).toBeUndefined()
     expect(cache.lookup(scope(), f)?.layer).toBe("L1")
+    cache.store(scope({ userAuthorizationDigest: "auth-b" }), facts({ kind: "read", targets: [], coreDigest: "other" }), makeResult())
+    expect(cache.lookup(scope(), f)).toBeUndefined()
   })
 
   test("a deny stays bound to its user authorization digest", () => {
@@ -524,6 +525,34 @@ describe("L2 same-object routine writes", () => {
     expect(cache.lookup(scope({ securitySnapshot: "snapshot-b" }), facts({ coreDigest: "b", targets: [target()] }))).toBeUndefined()
     cache.store(scope({ securitySnapshot: "snapshot-b" }), facts({ kind: "read", targets: [], coreDigest: "x" }), makeResult())
     expect(cache.lookup(scope(), facts({ coreDigest: "a", targets: [target()] }))).toBeUndefined()
+  })
+
+  test("authorization changes invalidate L2 and cannot inherit a withdrawn wider write grant", () => {
+    const cache = createApprovalCache()
+    const oldScope = scope()
+    const newScope = scope({ userAuthorizationDigest: "host-instructions-changed-or-user-withdrew" })
+    cache.store(oldScope, facts({ coreDigest: "old-replace", effect: "replace" }), makeResult())
+    const replacement = facts({ coreDigest: "new-replace", effect: "replace" })
+    expect(cache.lookup(newScope, replacement)).toBeUndefined()
+    // A stale lookup must not destroy the current scope, and an approval in
+    // the new scope must not retain the old scope's broader write capability.
+    cache.store(newScope, facts({ coreDigest: "new-append", effect: "append" }), makeResult())
+    expect(cache.lookup(oldScope, replacement)).toBeUndefined()
+    expect(cache.lookup(newScope, replacement)).toBeUndefined()
+    expect(cache.lookup(newScope, facts({ coreDigest: "append-again", effect: "append" }))?.layer).toBe("L2")
+  })
+
+  test("late outcome updates under an old authorization digest cannot advance a new L2 grant", () => {
+    const cache = createApprovalCache()
+    const missing = target({ exists: false, dev: undefined, ino: undefined })
+    const creation = facts({ coreDigest: "create", operation: "create", targets: [missing] })
+    const newScope = scope({ userAuthorizationDigest: "new-instructions" })
+    cache.store(scope(), creation, makeResult())
+    cache.store(newScope, creation, makeResult())
+    cache.recordTargets(scope(), creation, [target({ ino: "old-outcome" })])
+    expect(cache.lookup(newScope, facts({ coreDigest: "old-modify", targets: [target({ ino: "old-outcome" })] }))).toBeUndefined()
+    cache.recordTargets(newScope, creation, [target({ ino: "new-outcome" })])
+    expect(cache.lookup(newScope, facts({ coreDigest: "new-modify", targets: [target({ ino: "new-outcome" })] }))?.layer).toBe("L2")
   })
 
   test("a grant never widens the write effect", () => {

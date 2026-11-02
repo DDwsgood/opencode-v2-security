@@ -1,12 +1,16 @@
 import { execFile } from "node:child_process"
-import { existsSync, lstatSync, realpathSync } from "node:fs"
+import { existsSync, lstatSync, realpathSync, statSync } from "node:fs"
 import { realpath, stat } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import path from "node:path"
 
 function contains(root: string, target: string): boolean {
-  const relative = path.relative(root, target)
-  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+  return containsUnder(path, root, target)
+}
+
+function containsUnder(paths: typeof path.posix, root: string, target: string): boolean {
+  const relative = paths.relative(root, target)
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${paths.sep}`) && !paths.isAbsolute(relative))
 }
 
 /** Host-owned unconditional write roots, shared by all session modes. */
@@ -14,13 +18,61 @@ export function alwaysWritableRoots(platform: NodeJS.Platform = process.platform
   if (platform === "linux") return ["/tmp"]
   if (platform !== "win32") return []
   const temporary = env.TEMP?.trim()
-  if (!temporary || !path.win32.isAbsolute(temporary)) return []
-  const normalized = path.win32.normalize(temporary)
+  if (!temporary) return []
+  // TEMP is host-configured, not host-trusted: a redirected TMPDIR must not
+  // turn HOME, a profile/system directory or a volume root into an
+  // unconditional write grant. Validate the raw spelling first.
+  const home = env.USERPROFILE?.trim() || env.HOME?.trim() || ""
+  const normalized = windowsTempRootCandidate(temporary, home)
+  if (normalized === undefined) return []
   // Cross-platform callers can compare Windows paths without asking the local
   // filesystem to interpret a different OS's drive letters.
   if (platform !== process.platform) return [normalized]
   const canonical = canonicalCandidate(normalized)
-  return canonical === undefined ? [] : [canonical]
+  if (canonical === undefined) return []
+  // A junction/symlink TEMP must not resolve onto a rejected root either, and
+  // the grant itself has to be a directory. The canonical spelling also
+  // absorbs case differences, which Windows compares without case.
+  if (windowsTempRootCandidate(canonical, home) === undefined) return []
+  try {
+    if (!statSync(canonical).isDirectory()) return []
+  } catch {
+    return []
+  }
+  return [canonical]
+}
+
+/** The string is spelled as a Windows path: drive-letter (absolute or
+ *  drive-relative) or a UNC/device namespace. Callers use this to choose the
+ *  Windows validator without consulting the host platform. */
+export function isWindowsPath(value: string): boolean {
+  return /^[A-Za-z]:/.test(value) || value.startsWith("\\\\")
+}
+
+const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i
+
+/** Windows-only path shapes that a POSIX "absolute path" check does not see.
+ *
+ * Returns a human-readable reason, or undefined for a plain absolute drive
+ * path. Rejected: control characters, UNC/device namespaces (`\\server\share`,
+ * `\\?\…`, `\\.\…`), drive-relative spellings (`C:foo`), alternate data
+ * streams (`file:stream`), the bare volume root, `.`/`..` segments, reserved
+ * device names, characters Windows forbids, and segments ending in a space or
+ * dot (Windows aliases those to the trimmed name, so a written path would not
+ * name the object the caller validated). */
+export function windowsPathHazard(value: string): string | undefined {
+  if (/[\u0000-\u001F]/.test(value)) return "the path contains control characters"
+  const unified = value.replaceAll("/", "\\")
+  if (unified.startsWith("\\\\")) return "UNC and device-namespace paths are not supported"
+  if (!/^[A-Za-z]:\\/.test(unified)) return "the path must be an absolute drive path"
+  if (unified.slice(2).includes(":")) return "alternate data stream paths are not supported"
+  if (/[*?"<>|]/.test(unified)) return "the path contains characters Windows does not allow"
+  const segments = unified.slice(3).split("\\").filter((segment) => segment.length > 0)
+  if (segments.length === 0) return "the volume root is not supported"
+  if (segments.some((segment) => segment === "." || segment === "..")) return 'the path may not contain "." or ".." segments'
+  if (segments.some((segment) => WINDOWS_RESERVED_NAME.test(segment))) return "reserved device names are not supported"
+  if (segments.some((segment) => /[ .]$/.test(segment))) return "path segments may not end with a space or dot"
+  return undefined
 }
 
 /** Callers pass a canonical target: external symlink/junction referents do not
@@ -172,14 +224,66 @@ function wslWindowsTempDirs(): Promise<string[]> {
   })()
 }
 
+/** Windows-only rejection of a candidate temp/write root: HOME itself, an
+ *  ancestor of HOME (volume root, `C:\Users`, `C:\Windows`), and every
+ *  UNC/device/ADS/traversal spelling. Purely lexical; redirect checks follow. */
+export function windowsTempRootRejection(candidate: string, home: string): string | undefined {
+  if (!path.win32.isAbsolute(candidate)) return "the path is not absolute"
+  const hazard = windowsPathHazard(candidate)
+  if (hazard) return hazard
+  const normalized = path.win32.normalize(candidate)
+  const trimmed = normalized.replace(/\\+$/, "") || normalized
+  if (/^[A-Za-z]:$/.test(trimmed)) return "the volume root is not supported"
+  if (/^[A-Za-z]:\\(?:users|windows)$/i.test(trimmed)) return "the root is a profile or system directory"
+  if (home.trim() && path.win32.isAbsolute(home)) {
+    if (containsUnder(path.win32, trimmed, path.win32.normalize(home))) return "the root covers HOME"
+  }
+  return undefined
+}
+
+/** Lexically accepted Windows temp root, normalized; undefined when the
+ *  spelling is dangerous. Filesystem checks (redirect, kind) follow in
+ *  alwaysWritableRoots/globalTempWriteRoots on an actual Windows host. */
+export function windowsTempRootCandidate(candidate: string, home: string): string | undefined {
+  if (windowsTempRootRejection(candidate, home)) return undefined
+  const normalized = path.win32.normalize(candidate)
+  return normalized.replace(/\\+$/, "") || normalized
+}
+
+/** Windows Read only temp roots: the validated unconditional TEMP grant plus
+ *  the configured scratch. Explicit roots may be missing so mkdir can create
+ *  them; a redirected root (junction/symlink) is never adopted. */
+async function windowsTempWriteRoots(extra: readonly string[], home: string): Promise<string[]> {
+  const roots = alwaysWritableRoots("win32")
+  for (const candidate of extra) {
+    const normalized = windowsTempRootCandidate(candidate, home)
+    if (normalized === undefined || roots.includes(normalized)) continue
+    // A Windows path can only be inspected from a Windows host: resolving it
+    // through the local POSIX filesystem would prove nothing.
+    if (process.platform !== "win32") continue
+    if (canonicalCandidate(normalized) !== normalized) continue
+    const directory = await stat(normalized).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? undefined : null)
+    if (directory === null) continue
+    if (!directory || directory.isDirectory()) roots.push(normalized)
+  }
+  return roots
+}
+
 /** Global temporary directories that stay writable in Read only mode:
  *  `extra` (the configured scratch), /tmp, /var/tmp, the process temp dir and,
  *  on WSL, the Windows user's temp dir. Explicit extra roots may be missing
  *  so mkdir can create them; discovered temp dirs must already exist.
- *  A redirected TMPDIR never turns "/" or HOME into a temp root. */
-export async function globalTempWriteRoots(extra: readonly string[] = [], home = homedir()): Promise<string[]> {
-  if (process.platform === "win32") return alwaysWritableRoots()
-  if (process.platform !== "linux") return []
+ *  A redirected TMPDIR never turns "/" or HOME into a temp root. On Windows
+ *  the same rule applies to the configured scratch: a volume root, HOME or an
+ *  ancestor of HOME (profile/system directory), a redirected root, or a
+ *  UNC/device/ADS spelling never becomes a temp root. */
+export async function globalTempWriteRoots(
+  extra: readonly string[] = [],
+  home = homedir(),
+  platform: NodeJS.Platform = process.platform,
+): Promise<string[]> {
+  if (platform === "win32") return windowsTempWriteRoots(extra, home)
+  if (platform !== "linux") return []
   const roots: string[] = []
   for (const candidate of extra) {
     if (!path.isAbsolute(candidate)) continue

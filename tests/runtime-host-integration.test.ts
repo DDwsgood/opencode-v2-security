@@ -1,11 +1,12 @@
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test"
 import { execFile, spawn as spawnProcess } from "node:child_process"
-import { chmod, mkdtemp, mkdir, readFile, readdir, rename, symlink, writeFile } from "node:fs/promises"
+import { chmod, mkdtemp, mkdir, readFile, readdir, rename, symlink, unlink, writeFile } from "node:fs/promises"
 import path from "node:path"
 import * as os from "node:os"
 import * as filesystem from "node:fs/promises"
 import * as classifier from "../src/security/classifier"
 import * as cache from "../src/security/approval-cache"
+import * as windowsSandbox from "../src/windows-sandbox"
 import { DEFAULT_BOUNDARY_WATCH_HELPER } from "../src/sandbox"
 import { Cause, Effect, Exit, Option, Scope, Stream } from "effect"
 import plugin from "../src/index"
@@ -260,6 +261,13 @@ async function harness(deny = false, options: {
     },
     command: (text: string) => Effect.runPromise(commands.get("perm")({ sessionID: "acceptance", prompt: { text } })),
     newUserMessage: (text: string) => { retained.push({ type: "user", text }) },
+    loadedInstructions: (paths: string[], text: string) => {
+      retained.push({ type: "synthetic", text, metadata: { instruction: { paths } } } as any)
+    },
+    instructions: (text: string) => Effect.runPromise(hooks.get("session.context")!({
+      sessionID: "acceptance", messages: [], system: [{ type: "text", text: "host context",
+        metadata: { experimental: { instructions: [{ key: "core/instructions", text }] } } }],
+    })),
     modelContext: async () => {
       const event = { sessionID: "acceptance", messages: [] as any[] }
       await Effect.runPromise(hooks.get("session.context")!(event))
@@ -275,6 +283,33 @@ async function harness(deny = false, options: {
 }
 
 describe("real observer → broker → frozen reviewer → original process", () => {
+  test("Linux Auto, ReadOnly and Bypass never probe or launch the Windows sandbox", async () => {
+    const probeWindows = spyOn(windowsSandbox, "probeWindowsSandbox").mockRejectedValue(new Error("Windows probe reached on Linux"))
+    const launchWindows = spyOn(windowsSandbox, "buildWindowsSandboxSpawn").mockImplementation(() => {
+      throw new Error("Windows launch reached on Linux")
+    })
+    try {
+      const host = await harness()
+      const auto = await host.run("shell", { command: "printf linux-auto" })
+      expect(auto.output.output).toBe("linux-auto")
+      expect(auto.metadata.boundary.executionRoute).toBe("runtime_boundary_watch")
+      await host.command("ro")
+      const readonly = await host.run("shell", { command: "printf linux-readonly" })
+      expect(readonly.output.output).toBe("linux-readonly")
+      expect(readonly.metadata.boundary.executionRoute).toBe("runtime_boundary_watch")
+      await host.command("bypass")
+      const bypass = await host.run("shell", { command: "printf linux-bypass" })
+      expect(bypass.output.output).toBe("linux-bypass")
+      expect(bypass.metadata.boundary.source).toBe("bypass_all")
+      expect(bypass.metadata.boundary.executionRoute).toBe("host_direct_reviewed")
+      expect(probeWindows).not.toHaveBeenCalled()
+      expect(launchWindows).not.toHaveBeenCalled()
+      expect(host.calls).toHaveLength(0)
+    } finally {
+      probeWindows.mockRestore()
+      launchWindows.mockRestore()
+    }
+  })
   test("trustedCommands runtime bypass covers only trusted-only launches and keeps permission floors", async () => {
     const toolsDirectory = path.join(workspace, "trusted-bin")
     await mkdir(toolsDirectory)
@@ -592,6 +627,15 @@ describe("real observer → broker → frozen reviewer → original process", ()
     expect(result.output.exit).toBe(0)
     expect(host.calls).toHaveLength(0)
   })
+  test("Windows-only error text does not change Linux shell results", async () => {
+    const host = await harness()
+    const text = "Access is denied; UnauthorizedAccessException; 拒绝访问; opencode-windows-sandbox: fixture"
+    const result = await host.run("shell", { command: `printf '%s' ${quote(text)}; exit 7` })
+    expect(result.output.exit).toBe(7)
+    expect(result.output.output).toBe(text)
+    expect(result.metadata.boundary.executionRoute).toBe("runtime_boundary_watch")
+    expect(host.calls).toHaveLength(0)
+  })
   test("actual external write resumes the original process, without replaying earlier work", async () => {
     const host = await harness()
     const counter = path.join(workspace, "once.txt"), target = path.join(outside, "approved.txt")
@@ -679,7 +723,7 @@ describe("real observer → broker → frozen reviewer → original process", ()
     expect(host.calls).toHaveLength(1)
     expect(result.metadata.boundary.source).toBe("cache:L2")
   })
-  test("mode revocation invalidates prior grants; a new user message keeps positive ones", async () => {
+  test("mode revocation and new user instructions invalidate prior grants", async () => {
     const host = await harness()
     const target = path.join(outside, "scope-changes.txt")
     await host.run("write", { path: target, content: "first" })
@@ -688,10 +732,44 @@ describe("real observer → broker → frozen reviewer → original process", ()
     expect(host.calls).toHaveLength(2)
     host.newUserMessage("Write the named fixture again for the next task.")
     const third = await host.run("write", { path: target, content: "third" })
-    // Positive entries are bound to the security snapshot, not the message:
-    // the same write replays its cached approval instead of re-reviewing.
+    // Both user turns and trusted instructions are part of the approval's
+    // authority. A later restriction must not inherit an older positive grant.
+    expect(host.calls).toHaveLength(3)
+    expect(third.metadata.boundary.source).not.toStartWith("cache:")
+  })
+  test("host instruction snapshots reach reviews and revoke cached positive grants", async () => {
+    const host = await harness(false, { review: async (request) => report(
+      request.trusted_instructions?.some((instruction) => instruction.text === "Do not write the fixture again.") ?? false,
+    ) })
+    const target = path.join(outside, "trusted-instruction-revocation.txt")
+    await host.instructions("Write the named fixture once.")
+    await host.run("write", { path: target, content: "first" })
+    expect(host.calls[0]!.trusted_instructions).toContainEqual({ kind: "instruction", source: "core/instructions", text: "Write the named fixture once." })
+    await host.instructions("Do not write the fixture again.")
+    await host.failure("write", { path: target, content: "forbidden" })
     expect(host.calls).toHaveLength(2)
-    expect(third.metadata.boundary.source).toBe("cache:L1")
+    expect(await readFile(target, "utf8")).toBe("first")
+  })
+  test("current nested AGENTS instructions reach reviews and revoke stale cached approval", async () => {
+    const directory = path.join(workspace, "loaded-nested-instructions")
+    await mkdir(directory)
+    const instructions = path.join(directory, "AGENTS.md")
+    await writeFile(instructions, "Current nested fixture policy.")
+    const host = await harness(false, { review: async (request) => report(
+      request.trusted_instructions?.some((instruction) => instruction.text === "Do not write the fixture again.") ?? false,
+    ) })
+    await host.instructions("")
+    host.loadedInstructions([instructions], "Historical loaded policy must not authorize.")
+    const target = path.join(outside, "nested-instruction-revocation.txt")
+    await host.run("write", { path: target, content: "first" })
+    expect(host.calls[0]!.trusted_instructions?.some((instruction) => instruction.text === "Current nested fixture policy.")).toBe(true)
+    await writeFile(instructions, "Do not write the fixture again.")
+    await host.failure("write", { path: target, content: "forbidden" })
+    expect(await readFile(target, "utf8")).toBe("first")
+    await unlink(instructions)
+    await host.run("write", { path: target, content: "after-removal" })
+    expect(host.calls).toHaveLength(3)
+    expect(host.calls[2]!.trusted_instructions).toEqual([])
   })
   test("a cached denial stays bound to its user message", async () => {
     const host = await harness(true)

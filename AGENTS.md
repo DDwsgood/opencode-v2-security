@@ -38,3 +38,9 @@
 - `package.json.files` 同时打包 TS、Python、共享 `risk_heads.py` 与 native 文件；打包需排除 pycache/pyc。Python 的隔离加载与包内 sibling import 也要验证，不能只测源码目录。
 - 发布前核对 remote 与 `package.json.repository`：这个 checkout 的 `origin` 指旧 `opencode-bash-classifier` 仓库，`pub` 指 `opencode-v2-security`。两仓库历史不同，不盲推 origin，也不用 force/reset 对齐历史。
 - `RESEARCH-v1.5.0.md` 区分研究题组与正式题组；分类足迹成绩不等于联合裁决准确率，模拟宿主测试也不等于真实隔离/执行验证。
+
+## Windows 平台隔离与发布前提
+
+- 原生 Windows PowerShell 7/cmd 使用独立的 `src/windows-sandbox.ts` 与 `bin/opencode-windows-sandbox.exe`；旧 Windows Bash supervisor 不等于沙箱。Linux/WSL 仍使用现有 ptrace 观察链，不能按 Windows 路径或解释器名称切换后端。
+- Windows 支持不得改变更新前 Linux 沙箱的默认值、路径含义、分类优先级、执行路线、IPC、取消或失败输出语义。Windows 专用逻辑按实际平台分流，不夹带 Linux 行为修正；后续 Linux 沙箱修改须先确认兼容基线并运行受影响的回归。
+- 独立请求的 SystemOne AGENTS/skill 授权上下文增强属于全平台策略更新，应与 Windows 兼容承诺分开说明；模拟宿主检查不等于真实 OpenCode/SystemOne 服务验收。

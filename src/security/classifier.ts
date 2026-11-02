@@ -4,7 +4,7 @@ import { lstat, opendir, realpath, stat } from "node:fs/promises"
 import { inspectDirectory, inspectRegularTextFile, isMissingPathError } from "./inspection"
 import path from "node:path"
 import { STATIC_BYPASS_CATEGORIES, type BypassCategory } from "../categories"
-import { ruleBypassed } from "./bypass"
+import { isFloorRule, ruleBypassed } from "./bypass"
 import { alwaysWritableRoots, isAlwaysWritablePath } from "./automatic-write-roots"
 import {
   analyzeSegmentPaths,
@@ -2548,7 +2548,14 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
       /\bsocat\b[^\n]*(?:\s(?:EXEC|SYSTEM|EXEC):)/i.test(text) ||
       /\bmkfifo\b[^\n]*(?:\|\s*(?:cat|sh|bash)[^\n]*\|\s*(?:nc|ncat|netcat))/i.test(text) ||
       /\bsocket\.connect\s*\([^)]*\)[^\n]{0,200}(?:subprocess|dup2|os\.system|popen)/i.test(text) ||
-      /(?:subprocess\.(?:Popen|call|run)\s*\([^\n]*\/bin\/(?:sh|bash)|cp\.spawn\s*\(\s*["']sh["']|TCPSocket\.new\s*\([^)]*\)[^\n]{0,120}(?:IO\.popen|Kernel\.(?:system|exec))|fsockopen\s*\([^)]*\)[^\n]{0,120}(?:exec|system|popen)|TCPClient|Socket::And|exec\s*\(\s*["']\/bin\/sh[^)]*\))/i.test(
+      // Native Windows distinguishes connectivity probes from remote shells.
+      // Preserve the existing Linux classifier, including WSL interop.
+      (process.platform !== "win32" && /TCPClient/i.test(text)) ||
+      (process.platform === "win32" && /\bTCPClient\b/i.test(text) &&
+        /\.\s*GetStream\s*\(/i.test(text) &&
+        /\.\s*Read(?:Async|Line|ToEnd)?\s*\(/i.test(text) &&
+        /(?:^|[;({|])\s*(?:iex|Invoke-Expression)\b/i.test(text)) ||
+      /(?:subprocess\.(?:Popen|call|run)\s*\([^\n]*\/bin\/(?:sh|bash)|cp\.spawn\s*\(\s*["']sh["']|TCPSocket\.new\s*\([^)]*\)[^\n]{0,120}(?:IO\.popen|Kernel\.(?:system|exec))|fsockopen\s*\([^)]*\)[^\n]{0,120}(?:exec|system|popen)|Socket::And|exec\s*\(\s*["']\/bin\/sh[^)]*\))/i.test(
         text,
       ),
   },
@@ -10772,6 +10779,16 @@ async function classifySegment(
           (forcedDeletesConfined || explicitDisposableCleanup)
         ) {
           continue
+        }
+        // Windows preflight needs every terminal floor before launch. Linux
+        // retains its existing rule priority and syscall-boundary route.
+        if (process.platform === "win32") {
+          const floors = SECURITY_SIGNAL_RULES.filter((candidate) =>
+            isFloorRule(candidate.id) && candidate.test(combined))
+          if (floors.length > 0) {
+            return { verdict: "DENY", rules: [...new Set([rule.id, ...floors.map((floor) => floor.id)])],
+              reason: floors[0].reason }
+          }
         }
         return { verdict: "DENY", rules: [rule.id], reason: rule.reason }
       }

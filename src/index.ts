@@ -57,6 +57,10 @@ import { failureOrPass, SecurityCheckFailure } from "./failure-policy"
 import { BypassRpc } from "./bypass-rpc"
 import {
   BoundaryPreparationError,
+  UnsupportedNativePathError,
+  boundaryHostInstructions,
+  boundaryLoadedInstructions,
+  boundaryWorkspaceInstructions,
   boundarySessionContext,
   canonicalBoundaryPath,
   containsPath,
@@ -65,6 +69,8 @@ import {
   planFileBoundary,
   planShellBoundary,
   verifyFileBoundaryPlan,
+  verifyShellBoundaryPlan,
+  validateWindowsNativeFileInput,
   type BoundaryInvocation,
   type FileBoundaryPlan,
   type NativeBoundaryTool,
@@ -93,7 +99,7 @@ import {
   type BashClassifierOptions,
   type BypassCategory,
 } from "./config"
-import { classifyBoundaryCommand, classifyShellCommand, type StaticSecurityDecision } from "./security/classifier"
+import { classifyBoundaryCommand, classifyShellCommand, verifyScriptFingerprints, type StaticSecurityDecision } from "./security/classifier"
 import { isFloorRule } from "./security/bypass"
 import {
   adjudicateEffectAnswers,
@@ -116,6 +122,7 @@ import {
   probeLinuxSandbox,
   type SandboxProbeResult,
 } from "./sandbox"
+import { buildWindowsSandboxSpawn, probeWindowsSandbox } from "./windows-sandbox"
 import { createSessionStateNotices } from "./session-notifications"
 import {
   getSharedSecurityState,
@@ -132,7 +139,7 @@ import { isRuntimeBrokerPath, runtimeBrokerBase, writeRootRejection, writeTarget
 import { createRootWidening, reviewRootWidening, L3_POLICY_VERSION, type L3Trace, type RootWideningContext, type RootWideningInput, type RootWideningScope } from "./security/root-widening"
 import { boundaryCoreDigest, observedNetworkEndpoint, type ApprovalCacheFacts, type ApprovalCacheScope, type ApprovalCacheTarget } from "./security/approval-cache"
 import { createRuntimeBoundaryBroker, currentCacheTargets, targetIdentitiesMatch, runtimeWriteEffect, staticCrossingReview, trustedRuntimeCommand, type RuntimeBoundaryBroker, type RuntimeBoundaryEvent } from "./runtime-boundary"
-import { inspectRegularTextFileSync, inspectionErrorCode } from "./security/inspection"
+import { inspectRegularTextFileSync, inspectionErrorCode, isMissingPathError } from "./security/inspection"
 import { scan } from "./security/shell-scan"
 import { createSingleFlight } from "./security/single-flight"
 import {
@@ -272,9 +279,18 @@ function localScriptSubjects(command: string, argv?: readonly unknown[]): string
 function runtimeProtectedPaths(workspace: string): string[] {
   // A session opened in the plugin source may develop it; unrelated sessions
   // still cannot modify the installation. Never relax the live observer image.
-  return containsPath(PACKAGE_ROOT, workspace)
-    ? [DEFAULT_BOUNDARY_WATCH_HELPER, runtimeBrokerBase()]
-    : [DEFAULT_BOUNDARY_WATCH_HELPER, PACKAGE_ROOT, runtimeBrokerBase()]
+  if (process.platform !== "win32") {
+    return containsPath(PACKAGE_ROOT, workspace)
+      ? [DEFAULT_BOUNDARY_WATCH_HELPER, runtimeBrokerBase()]
+      : [DEFAULT_BOUNDARY_WATCH_HELPER, PACKAGE_ROOT, runtimeBrokerBase()]
+  }
+  const helper = path.join(PACKAGE_ROOT, "bin", "opencode-windows-sandbox.exe")
+  const protectedPaths = [helper, runtimeBrokerBase()]
+  if (process.env.LOCALAPPDATA) {
+    protectedPaths.push(path.join(process.env.LOCALAPPDATA, "opencode-windows-sandbox-state"))
+  }
+  if (!containsPath(PACKAGE_ROOT, workspace)) protectedPaths.push(PACKAGE_ROOT)
+  return protectedPaths
 }
 
 const PROMPT_VERSION = "v7-execution-scope"
@@ -651,6 +667,7 @@ export function isValidReviewResult(value: unknown, _legacyStrict = false): valu
 // services backing them stay available.
 interface EffectPluginContext {
   readonly options: unknown
+  readonly location?: { directory: string; workspaceID?: unknown; project?: { directory: string } }
   readonly tool: {
     readonly hook: (
       name: "execute.before" | "execute.after",
@@ -666,6 +683,9 @@ interface EffectPluginContext {
       name: "create.before",
       callback: (event: ShellCreateBeforeEvent) => Effect.Effect<void, never>,
     ) => Effect.Effect<unknown, never, Scope.Scope>
+  }
+  readonly skill?: {
+    readonly list: () => Effect.Effect<unknown, unknown>
   }
   readonly command: {
     readonly transform: (callback: (draft: CommandDraft) => void) => Effect.Effect<unknown, never, Scope.Scope>
@@ -703,7 +723,7 @@ interface EffectPluginContext {
       name: Name,
       callback: (event: Name extends "prompt"
         ? { readonly sessionID: string; readonly delivery?: string }
-        : { readonly sessionID: string; messages: Array<{ role: string; content: unknown[] }> }) => Effect.Effect<void, never>,
+        : { readonly sessionID: string; readonly system?: unknown; messages: Array<{ role: string; content: unknown[] }> }) => Effect.Effect<void, never>,
     ) => Effect.Effect<unknown, never, Scope.Scope>
   }
   // Event-only RPC used to push bypass state changes to the TUI companion.
@@ -825,16 +845,23 @@ async function resolveStartup(rawOptions: unknown) {
   // unavailable with a sanitized reason — the §4.3 fail mode is applied per
   // spawn, not here, so a probe failure never blocks plugin load.
   let sandboxProbe: SandboxProbeResult | undefined
-  if (process.platform === "linux" && resolved.sandbox.enabled && resolved.sandbox.mode !== "full") {
-    sandboxProbe = await probeLinuxSandbox(resolved.sandbox)
+  if ((process.platform === "linux" || process.platform === "win32") && resolved.sandbox.enabled && resolved.sandbox.mode !== "full") {
+    sandboxProbe = process.platform === "win32"
+      ? await probeWindowsSandbox(resolved.sandbox)
+      : await probeLinuxSandbox(resolved.sandbox)
     if (!sandboxProbe.available) {
+      let consequence: string
+      if (sandboxProbe.contractFailure) {
+        consequence = "security contract failed: sandbox-required calls are refused even under fail_open"
+      } else if (resolved.failPolicy === "fail_open" || resolved.sandbox.onUnavailable === "degrade") {
+        consequence = "onUnavailable=degrade: calls that still use the sandbox run classifier-only"
+      } else if (process.platform === "win32") {
+        consequence = "onUnavailable=fail_close: sandbox-required Windows calls will be denied"
+      } else {
+        consequence = "onUnavailable=fail_close: read-only calls that still require the OS sandbox will be denied; reviewed read-write calls run host-direct and are unaffected"
+      }
       console.warn(
-        `[opencode-v2-security] OS sandbox unavailable (${sandboxProbe.reason ?? "unknown reason"}) — ` +
-          (resolved.failPolicy === "fail_open" || resolved.sandbox.onUnavailable === "degrade"
-            ? "onUnavailable=degrade: calls that still use the sandbox run classifier-only"
-            : "onUnavailable=fail_close: read-only calls that still require the OS sandbox " +
-              "will be denied; reviewed read-write calls run host-direct " +
-              "and are unaffected"),
+        `[opencode-v2-security] OS sandbox unavailable (${sandboxProbe.reason ?? "unknown reason"}) — ${consequence}`,
       )
     }
   }
@@ -848,9 +875,9 @@ async function resolveStartup(rawOptions: unknown) {
 const plugin: Plugin = {
   id: "opencode-v2-security",
   effect: (ctx: EffectPluginContext) => Effect.gen(function* () {
-    // This backend is deliberately Linux-only. Do not register hooks,
-    // commands, permission tools, or Windows supervisor behavior elsewhere.
-    if (process.platform !== "linux") return
+    // Native tools have platform-specific OS boundaries. Code Mode, MCP and
+    // custom tools remain outside this captured-executor boundary.
+    if (process.platform !== "linux" && process.platform !== "win32") return
     // Capture the ambient context so `ctx.session.*` Effects (which need host
     // services despite their narrowed plugin-facing type) run with those
     // services — a bare `Effect.runPromise` would lose them. Mirrors the
@@ -902,7 +929,10 @@ const plugin: Plugin = {
       sandboxFull: resolved.sandbox.mode === "full",
     }
     const instanceLocation = ctx.location
-    const registerPolicy = (location: { directory: string; workspaceID?: unknown }) => {
+    const registerPolicy = (location: { directory: string; workspaceID?: unknown; project?: { directory: string } }) => {
+      if (location.project?.directory) {
+        shared.projectDirectories.set(securityLocationKey(location), location.project.directory)
+      }
       shared.registerLocationPolicy(securityLocationKey(location), instanceToken, instancePolicy, () => {
         console.warn("[opencode-v2-security] conflicting security policies for one location; the restrictive intersection is retained")
       })
@@ -939,6 +969,14 @@ const plugin: Plugin = {
           await sessionNotices.deliverWithPrompt(event.sessionID, event.delivery)
         }))
       yield* ctx.session.hook("context", (event) => Effect.sync(() => {
+        if (event.system !== undefined) {
+          const instructions = boundaryHostInstructions(event.system)
+          const previous = shared.trustedInstructions.get(event.sessionID)
+          shared.trustedInstructions.set(event.sessionID, instructions)
+          if (previous && JSON.stringify(previous) !== JSON.stringify(instructions)) {
+            publishSharedStateChange(event.sessionID)
+          }
+        }
         const notice = sessionNotices.forModelContext(event.sessionID)
         if (notice) event.messages.push({ role: "user", content: [{ type: "text", text: notice }] })
         const background = sessionNotices.backgroundForModelContext(event.sessionID)
@@ -1591,6 +1629,7 @@ const plugin: Plugin = {
         categories: [...activeBypass(sessionID, now)].sort(),
         custom: activeCustomBypass(sessionID, now),
         all: allBypassed(sessionID, now),
+        instructionDigest: digest(JSON.stringify(shared.trustedInstructions.get(sessionID) ?? [])),
       })
       const previous = securityBases.get(sessionID)
       if (previous !== basis) {
@@ -2018,7 +2057,7 @@ const plugin: Plugin = {
        *  runs on the host without the plugin kernel sandbox;
        *  "readonly_sandbox"/"kernel_sandbox" = a kernel-isolated route
        *  (read-only sessions still using a kernel profile). */
-      executionRoute?: "host_direct_reviewed" | "readonly_sandbox" | "kernel_sandbox" | "runtime_boundary_watch"
+      executionRoute?: "host_direct_reviewed" | "readonly_sandbox" | "kernel_sandbox" | "runtime_boundary_watch" | "windows_sandbox"
       runtimeBroker?: RuntimeBoundaryBroker
       cancelExecution?: () => void
       cacheUpdates?: Array<{ scope: ApprovalCacheScope; facts: ApprovalCacheFacts }>
@@ -2049,6 +2088,7 @@ const plugin: Plugin = {
     const sharedReviews = createSingleFlight<EffectReviewResult>()
     const digest = (value: string) => createHash("sha256").update(value).digest("hex")
     let boundaryWatchFingerprint: string | undefined
+    let windowsSandboxFingerprint: string | undefined
     let directSubagent = false
     const boundaryKey = (call: Pick<BoundaryInvocation, "sessionID" | "messageID" | "id">) =>
       JSON.stringify([call.sessionID, call.messageID, call.id])
@@ -2079,12 +2119,31 @@ const plugin: Plugin = {
         })
       },
     })
+    async function retainedBoundaryContext(sessionID: string, signal?: AbortSignal) {
+      if (!ctx.session.context) throw new SecurityCheckFailure("session_context", "the session's authorization context is unavailable")
+      const session = await run(ctx.session.get({ sessionID }), signal) as { location?: { directory?: string; workspaceID?: unknown } }
+      if (!session.location?.directory) throw new SecurityCheckFailure("session_workspace", "the session's instruction workspace is unavailable")
+      const projectDirectory = shared.projectDirectories.get(securityLocationKey({
+        directory: session.location.directory, workspaceID: session.location.workspaceID,
+      }))
+      const instructions = shared.trustedInstructions.get(sessionID)
+      const [messages, skills, workspaceInstructions] = await Promise.all([
+        run(ctx.session.context({ sessionID }), signal),
+        ctx.skill ? run(ctx.skill.list(), signal) : Promise.resolve([]),
+        instructions?.some((instruction) => instruction.source === "core/instructions")
+          ? Promise.resolve([])
+          : boundaryWorkspaceInstructions(session.location.directory, { projectDirectory }),
+      ])
+      const loadedInstructions = await boundaryLoadedInstructions(messages, session.location.directory, { projectDirectory })
+      return boundarySessionContext(messages, { instructions, workspaceInstructions, loadedInstructions, skills })
+    }
+
     async function rootWideningContext(sessionID: string): Promise<RootWideningContext> {
-      if (!ctx.session.context) throw new Error("L3 context unavailable")
-      const retained = boundarySessionContext(await run(ctx.session.context({ sessionID })))
+      const retained = await retainedBoundaryContext(sessionID)
       return { scope: { sessionID, canWrite: effectivePerm(sessionID).w,
-        userMessageDigest: digest(retained.userRequest), securitySnapshot: securitySnapshotFor(sessionID) },
-      user_request: retained.userRequest, session_context: retained.context }
+        userMessageDigest: retained.authorizationDigest, securitySnapshot: securitySnapshotFor(sessionID) },
+      user_request: retained.userRequest, session_context: retained.context,
+      trusted_instructions: retained.trustedInstructions }
     }
 
     async function callEffectsReviewer(request: EffectReviewRequest, signal: AbortSignal, readonly = false): Promise<EffectReviewResult> {
@@ -2304,12 +2363,211 @@ const plugin: Plugin = {
       // match, `cmd; false`): the objects it wrote are the approved ones.
       if (exit === undefined || authorization.runtimeBlocked || !authorization.cacheUpdates?.length) return
       for (const update of authorization.cacheUpdates) {
-        // Only the security epoch gates recording: positive entries are not
-        // bound to the user message, so a newer message does not stop this
-        // call's outcome from advancing its grants.
+        // The cache also checks the authorization digest, so an older call
+        // cannot advance object identities in a newer authority generation.
         if (securitySnapshotFor(authorization.sessionID) !== update.scope.securitySnapshot) continue
         approvalCache.recordTargets(update.scope, update.facts, await currentCacheTargets(update.facts.targets).catch(() => []))
       }
+    }
+
+    async function classifyWindowsShellLaunch(
+      ev: ShellCreateBeforeEvent,
+      marked: ReturnType<typeof extractSandboxMarker>,
+      authorization: BoundaryAuthorization,
+    ): Promise<StaticSecurityDecision> {
+      const sessionID = authorization.sessionID
+      const permission = effectivePerm(sessionID)
+      if (!permission.r) throw blockedRejection("the session's read ceiling does not permit a Windows shell", WITHIN_MODE)
+      const readOnly = marked.profile === "ro"
+      const decision = await classifyShellCommand({
+        script: marked.command, cwd: authorization.cwd, worktree: authorization.cwd, shell: ev.shell,
+        ...(ev.cwd !== authorization.cwd ? { runtimeWorkdir: ev.cwd } : {}),
+        strictness: resolved.strictness, bypassedCategories: activeBypass(sessionID),
+        permScope: readOnly ? { ...permission, w: false } : permission,
+        roWritableRoots: marked.windowsSandbox?.writeRoots ?? [],
+        sandboxDenyWrite: marked.windowsSandbox?.denyWrite ?? resolved.sandbox.denyWrite,
+        trustedCommands: resolved.trustedCommands,
+      })
+      if (decision.verdict === "DENY" && decision.rules.some((rule) =>
+        isFloorRule(rule) || readOnly && rule === "permission.write")) {
+        throw blockedRejection(`Static restriction: ${conciseReason(decision.reason, 300)}`, WITHIN_MODE)
+      }
+      return decision
+    }
+
+    /** Disabling only the OS layer does not disable Windows command review.
+     * Both routes review the actual host-selected shell before it starts. */
+    async function reviewWindowsShellLaunch(
+      ev: ShellCreateBeforeEvent,
+      marked: ReturnType<typeof extractSandboxMarker>,
+      authorization: BoundaryAuthorization,
+      signal: AbortSignal,
+      decision: StaticSecurityDecision,
+    ) {
+      const capabilities = marked.windowsSandbox
+      const sessionID = authorization.sessionID
+      const readOnly = marked.profile === "ro"
+      const cwd = await canonicalBoundaryPath(ev.cwd)
+      if (capabilities && path.relative(cwd, capabilities.cwd) !== "") {
+        throw blockedRejection("the shell working directory changed after authorization", RECHECK)
+      }
+      const bypass = activeBypass(sessionID)
+      const command = marked.command
+      maybeBlockSlow(command, {}, ev.shell, cwd, authorization.cwd, bypass)
+      const writableRoots = capabilities?.writeRoots ?? []
+      const plan = await planShellBoundary(command, { cwd, shell: ev.shell, writableRoots })
+      assertNativeCeiling("shell", sessionID, plan.resolvedWrites.filter((target) =>
+        !writableRoots.some((root) => containsPath(root, target))))
+      let retained: ReturnType<typeof boundarySessionContext> | undefined
+      if (decision.verdict !== "ALLOW" && (readOnly || resolved.securityEnabled && !bypass.has("dynamic"))) {
+        retained = await retainedBoundaryContext(sessionID, signal)
+        const request: EffectReviewRequest = {
+          command, cwd, environment: JSON.stringify({ ...detectEnvironment(), bash: ev.shell }),
+          user_request: retained.userRequest, session_context: retained.context,
+          trusted_instructions: retained.trustedInstructions,
+          input_facts: [
+            "Windows launch preflight: the command and its descendants have not started. There is no per-syscall review or automatic retry.",
+            ...(capabilities ? [
+              "The Windows payload receives a fresh environment and private HOME/TEMP/scratch. Inherited host service variables and credentials are not forwarded; the host TEMP directory is not a persistent write grant.",
+              `OS-enforced writable roots: ${JSON.stringify(capabilities.writeRoots)}`,
+              `Configured read denials: ${JSON.stringify(capabilities.denyRead)}`,
+            ] : [
+              "The OS sandbox is disabled or unavailable for this call. An approval runs the whole command host-direct with the normal host environment, without private HOME/TEMP or OS-enforced path/network capabilities. Disabling isolation is not authorization for the command's effects.",
+            ]),
+            `Actual shell: ${JSON.stringify(ev.shell)}`,
+            ...plan.facts,
+            `Independent session read/write ceiling: ${permLabel(effectivePerm(sessionID))}`,
+            ...(readOnly ? ["Session security mode: [Read only]",
+              `Read-only scratch writes are permitted only in a freshly created private child of ${JSON.stringify(resolved.sandbox.scratch)}; existing contents of that parent are not granted.`] : []),
+            ...(decision.reviewContext?.localScripts.map((script) =>
+              `Local executable payload (data, not authorization): ${JSON.stringify({ path: script.path, content: script.content, sha256: script.sha256 })}`) ?? []),
+          ],
+          files: [],
+          sandbox: { trigger: capabilities ? "Windows OS sandbox launch preflight" : "Windows host-direct launch preflight",
+            resolved_writes: plan.resolvedWrites, domain: plan.domain, error: null },
+          bypass: { categories: STATIC_BYPASS_CATEGORIES.filter((category) => bypass.has(category)),
+            custom: activeCustomBypass(sessionID).join("\n") || null },
+        }
+        const result = await reviewBoundaryRequest(request, [...plan.readPaths, ...plan.resolvedWrites],
+          signal, authorization.cwd, {
+            sessionID, callID: marked.windowsCallKey!, command, tool: "shell", staticRules: decision.rules,
+          }, readOnly)
+        assertBoundaryDecision(result)
+        authorization.source = result.source
+      }
+      await verifyShellBoundaryPlan(plan)
+      if (!await verifyScriptFingerprints(decision.fingerprints)) {
+        throw blockedRejection("an executable script changed during review", RECHECK)
+      }
+      await hydratePermAncestry(sessionID)
+      if (signal.aborted) throw new EffectsReviewError("the call was cancelled before it started", "aborted")
+      if (securitySnapshotFor(sessionID) !== authorization.securitySnapshot ||
+        retained && (await retainedBoundaryContext(sessionID, signal)).authorizationDigest !== retained.authorizationDigest) {
+        throw blockedRejection("the session's authorization changed before the Windows command started", RECHECK)
+      }
+      return plan
+    }
+
+    /** Approval retains the OS boundary for the entire Windows process tree;
+     * only an explicit OS-layer bypass or infrastructure policy can omit it. */
+    async function prepareWindowsShellSpawn(
+      ev: ShellCreateBeforeEvent,
+      marked: ReturnType<typeof extractSandboxMarker>,
+      authorization: BoundaryAuthorization,
+      signal: AbortSignal,
+      decision: StaticSecurityDecision,
+    ): Promise<void> {
+      const capabilities = marked.windowsSandbox!
+      const sessionID = authorization.sessionID
+      const readOnly = marked.profile === "ro"
+      if (sandboxProbe?.contractFailure) {
+        throw blockedRejection("the Windows sandbox failed its security acceptance checks; isolated execution is disabled", WITHIN_MODE)
+      }
+      if (!sandboxProbe?.available) {
+        const probe = await probeWindowsSandbox(resolved.sandbox)
+        if (probe.contractFailure) {
+          throw blockedRejection("the Windows sandbox failed its security acceptance checks; isolated execution is disabled", WITHIN_MODE)
+        }
+        if (!probe.available) {
+          if (readOnly) throw blockedRejection("the Windows sandbox required by [Read only] is unavailable", RETRY_LATER)
+          throw new SecurityCheckFailure("windows_sandbox_unavailable", "the Windows sandbox is unavailable")
+        }
+      }
+      const helperInfo = await lstat(resolved.sandbox.helperPath, { bigint: true })
+      if (!helperInfo.isFile()) throw new SecurityCheckFailure("windows_sandbox_unavailable", "the Windows sandbox helper is not a regular file")
+      const helperFingerprint = `${helperInfo.dev}:${helperInfo.ino}:${helperInfo.size}:${helperInfo.mtimeNs}`
+      if (windowsSandboxFingerprint !== undefined && windowsSandboxFingerprint !== helperFingerprint) {
+        throw blockedRejection("the Windows sandbox helper changed on disk; reload the plugin before running more commands", RECHECK)
+      }
+      windowsSandboxFingerprint = helperFingerprint
+      const plan = await reviewWindowsShellLaunch(ev, marked, authorization, signal, decision)
+      if (plan.unsupported.length > 0) {
+        throw blockedRejection("the Windows sandbox cannot grant this exact external target without broadening access; no command was started", WITHIN_MODE)
+      }
+      const currentHelper = await lstat(resolved.sandbox.helperPath, { bigint: true })
+      if (`${currentHelper.dev}:${currentHelper.ino}:${currentHelper.size}:${currentHelper.mtimeNs}` !== helperFingerprint) {
+        throw blockedRejection("the Windows sandbox helper changed during review", RECHECK)
+      }
+      const cwd = capabilities.cwd
+      const command = marked.command
+      const readRoots = [...new Set([...capabilities.readRoots, ...plan.readPaths,
+        ...(decision.reviewContext?.localScripts.map((script) => script.path) ?? []), path.dirname(ev.shell)])]
+      const writeRoots = readOnly ? [] : [...new Set([...capabilities.writeRoots, ...plan.writeRoots])]
+      const retainDenyPath = async (target: string): Promise<boolean> => {
+        try {
+          await lstat(target)
+          return true
+        } catch (error) {
+          if (!isMissingPathError(error)) throw error
+          // A missing denied subtree outside every writable grant cannot be
+          // created by this token. Keep missing denials under writable roots:
+          // the native backend must enforce them or refuse that policy.
+          return writeRoots.some((root) => containsPath(root, target))
+        }
+      }
+      const deniedRead = await Promise.all(capabilities.denyRead.map(async (target) =>
+        ({ target, retain: await retainDenyPath(target) })))
+      const deniedWrite = await Promise.all(capabilities.denyWrite.map(async (target) =>
+        ({ target, retain: await retainDenyPath(target) })))
+      // Start the control deadline only after potentially slow model review.
+      // A background helper must authenticate or finish, never strand a grant.
+      const broker = await createRuntimeBoundaryBroker({
+        directory: runtimeBrokerBase(), failPolicy: "fail_close",
+        onBoundary: async () => ({ action: "deny", reason: "Windows capabilities cannot be widened during execution" }),
+        onError: () => {
+          authorization.runtimeBlocked = "The Windows sandbox control channel was lost"
+          authorization.runtimeBlockDetails = { advice: RETRY_LATER }
+          authorization.cancelExecution?.()
+        },
+        onCancelFailure: () => authorization.cancelExecution?.(),
+      })
+      authorization.runtimeBroker = broker
+      if (signal.aborted || securitySnapshotFor(sessionID) !== authorization.securitySnapshot) {
+        throw blockedRejection("the session's authorization changed before the Windows command started", RECHECK)
+      }
+      let spec: ReturnType<typeof buildWindowsSandboxSpawn>
+      try {
+        // Config denials are already merged and checked above. Do not re-add
+        // nonexistent, unreachable config paths during native JSON encoding.
+        spec = buildWindowsSandboxSpawn(readOnly ? "ro" : "workspace", {
+          ...resolved.sandbox, denyRead: [], denyWrite: [],
+        }, {
+          ...capabilities, cwd, readRoots,
+          writeRoots,
+          denyRead: deniedRead.filter((item) => item.retain).map((item) => item.target),
+          denyWrite: deniedWrite.filter((item) => item.retain).map((item) => item.target),
+          network: capabilities.network || plan.networkRequested,
+          controlPipe: broker.socketPath, controlToken: broker.token,
+        })
+      } catch {
+        throw blockedRejection("the Windows sandbox cannot safely represent this call's paths or capabilities", WITHIN_MODE)
+      }
+      const realShell = ev.shell
+      ev.command = command
+      for (const [name, value] of Object.entries(spec.env)) ev.env[name] = value
+      ev.env.OPENCODE_REAL_SHELL = realShell
+      ev.shell = spec.helperPath
+      authorization.executionRoute = "windows_sandbox"
     }
 
     async function prepareRuntimeShell(
@@ -2560,7 +2818,7 @@ const plugin: Plugin = {
             return { action: "continue" }
           }
           if (!ctx.session.context) return failed("session_context")
-          const retained = boundarySessionContext(await run(ctx.session.context({ sessionID: call.sessionID }), signal))
+          const retained = await retainedBoundaryContext(call.sessionID, signal)
           const observed = await currentCacheTargets(event.targets)
           if (!targetIdentitiesMatch(event.targets, observed)) return failed("target_changed")
           if (observed.some((target) => target.inspectionError) && resolved.failPolicy === "fail_open") {
@@ -2583,6 +2841,7 @@ const plugin: Plugin = {
           const request: EffectReviewRequest = {
             command, cwd: runtimeCwd, environment: JSON.stringify(detectEnvironment()),
             user_request: retained.userRequest, session_context: retained.context,
+            trusted_instructions: retained.trustedInstructions,
             input_facts: [
               eventPhase === "exit"
                 ? "Runtime witness: the operation itself already ran at syscall exit; earlier steps may also have run."
@@ -2595,7 +2854,7 @@ const plugin: Plugin = {
                 `Read-only session: scratch writes are permitted only inside these host-listed temporary roots: ${JSON.stringify(roots)}`,
               ]),
               `Current allowed write roots: ${JSON.stringify(currentWriteRoots({
-                sessionID: call.sessionID, canWrite, securitySnapshot: authorization.securitySnapshot, userMessageDigest: digest(retained.userRequest),
+                sessionID: call.sessionID, canWrite, securitySnapshot: authorization.securitySnapshot, userMessageDigest: retained.authorizationDigest,
               }))}`,
               `Independent session read/write ceiling: ${permLabel(permission)}`,
             ],
@@ -2603,7 +2862,7 @@ const plugin: Plugin = {
             sandbox: { trigger: `runtime ${event.kind} boundary`, resolved_writes: event.kind === "write" ? observed.map((target) => target.path) : [], domain: event.kind === "interop" ? "windows-interop" : null, error: null },
             bypass: { categories: STATIC_BYPASS_CATEGORIES.filter((category) => bypass.has(category)), custom: custom.length ? custom.join("\n") : null },
           }
-          const scope: ApprovalCacheScope = { sessionID: call.sessionID, securitySnapshot: authorization.securitySnapshot, userAuthorizationDigest: digest(retained.userRequest) }
+          const scope: ApprovalCacheScope = { sessionID: call.sessionID, securitySnapshot: authorization.securitySnapshot, userAuthorizationDigest: retained.authorizationDigest }
           const reviewPolicyVersion = canWrite ? EFFECTS_POLICY_VERSION : EFFECTS_POLICY_VERSION_READONLY
           const writeEffect = runtimeWriteEffect(event)
           const networkEndpoint = event.kind === "network" ? observedNetworkEndpoint(event.details) : undefined
@@ -2639,12 +2898,14 @@ const plugin: Plugin = {
               return blocked(refusal.reason, refusal.advice, hit.result ? isReviewerDenial(hit.result) : false)
             }
             const currentTargets = await currentCacheTargets(observed)
-            // Positive cache reuse is not bound to the user message: a new
-            // message does not revoke an allowed verdict. (Deny hits already
-            // returned above, still bound to their message by the lookup.)
+            // Re-check authority after the asynchronous identity inspection;
+            // a user withdrawal must invalidate positive reuse too.
             if (preparationSignal.aborted) return recordBlock("Cancellation: the call was cancelled", undefined, CANCEL_ADVICE, true)
             if (securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot) {
               return recordBlock("Session permissions or authorization changed", undefined, RECHECK)
+            }
+            if ((await retainedBoundaryContext(call.sessionID, signal)).authorizationDigest !== retained.authorizationDigest) {
+              return recordBlock("User instructions changed during the boundary check", undefined, RECHECK)
             }
             if (currentTargets.some((target) => target.inspectionError) || !targetIdentitiesMatch(observed, currentTargets)) {
               return failed("target_changed")
@@ -2691,12 +2952,14 @@ const plugin: Plugin = {
             }
             return refusal
           }
-          // A positive verdict stands on its own: it is stored unbound to
-          // the user message, so a newer message mid-review does not block
-          // it. (Denials returned above, still bound to their message.)
+          // Bind the completed approval to the same current user turns and
+          // trusted instructions that the reviewer actually saw.
           if (preparationSignal.aborted) return recordBlock("Cancellation: the call was cancelled", undefined, CANCEL_ADVICE, true)
           if (securitySnapshotFor(call.sessionID) !== authorization.securitySnapshot) {
             return recordBlock("Session permissions or authorization changed", undefined, RECHECK)
+          }
+          if ((await retainedBoundaryContext(call.sessionID, signal)).authorizationDigest !== retained.authorizationDigest) {
+            return recordBlock("User instructions changed during the boundary check", undefined, RECHECK)
           }
           const reviewedTargets = await currentCacheTargets(observed)
           if (!targetIdentitiesMatch(observed, reviewedTargets)) return failed("target_changed")
@@ -2830,7 +3093,10 @@ const plugin: Plugin = {
       }
       const absoluteWorkspace = nativeAbsolutePath(directory, ".")
       const cwd = await canonicalBoundaryPath(absoluteWorkspace)
-      if (cwd !== absoluteWorkspace) {
+      const workspaceChanged = process.platform === "win32"
+        ? path.relative(cwd, absoluteWorkspace) !== ""
+        : cwd !== absoluteWorkspace
+      if (workspaceChanged) {
         throw new SecurityCheckFailure("workspace_noncanonical", "the session's workspace path is not canonical (for example, it goes through a symbolic link), so paths cannot be checked reliably")
       }
       if (cwd === path.parse(cwd).root) {
@@ -2843,7 +3109,10 @@ const plugin: Plugin = {
       const bypass = activeBypass(call.sessionID)
       const custom = activeCustomBypass(call.sessionID)
       const scratchRoot = await canonicalBoundaryPath(resolved.sandbox.scratch)
-      if (scratchRoot !== resolved.sandbox.scratch) {
+      const scratchChanged = process.platform === "win32"
+        ? path.relative(scratchRoot, resolved.sandbox.scratch) !== ""
+        : scratchRoot !== resolved.sandbox.scratch
+      if (scratchChanged) {
         throw new SecurityCheckFailure("scratch_noncanonical", "the plugin's configured temporary directory is not a canonical path; this is a configuration problem")
       }
       // Auto and ReadOnly share the incidental tool cache/history roots
@@ -2895,8 +3164,10 @@ const plugin: Plugin = {
         const command = commandFromArgs(raw)
         if (typeof command !== "string" || !command.trim()) throw blockedRejection("the shell command is empty")
         const launchDirectory = typeof raw.workdir === "string" ? nativeAbsolutePath(cwd, raw.workdir) : cwd
-        maybeBlockSlow(command, raw, resolveClassifierShell(configuredShell), launchDirectory, cwd, bypass)
-        if (!readOnly) {
+        if (process.platform === "linux") {
+          maybeBlockSlow(command, raw, resolveClassifierShell(configuredShell), launchDirectory, cwd, bypass)
+        }
+        if (!readOnly && process.platform === "linux") {
           const floorCheck = await classifyShellCommand({
             script: command, cwd, worktree: cwd, shell: resolveClassifierShell(configuredShell),
             strictness: resolved.strictness, bypassedCategories: bypass,
@@ -2906,6 +3177,48 @@ const plugin: Plugin = {
           if (floorCheck.verdict === "DENY" && floorCheck.rules.some(isFloorRule)) {
             throw blockedRejection(`Static restriction: ${conciseReason(floorCheck.reason, 300)}`, WITHIN_MODE)
           }
+        }
+        if (process.platform === "win32") {
+          if (!readOnly && (!resolved.sandbox.enabled || resolved.sandbox.mode === "full" || bypass.has("sandbox"))) {
+            authorization.source = "sandbox_disabled"
+            authorization.executionRoute = "host_direct_reviewed"
+            raw.command = insertSandboxMarker(sandboxMarkers, command, "full", undefined, undefined, {
+              windowsCallKey: boundaryKey(call),
+            })
+          } else {
+            const windowsReadOnly = readOnly || resolved.sandbox.mode === "ro"
+            if (!effectivePerm(call.sessionID).r) {
+              throw blockedRejection("the session's read ceiling does not permit a Windows shell", WITHIN_MODE)
+            }
+            const probe = sandboxProbe ?? await probeWindowsSandbox(resolved.sandbox)
+            if (probe.contractFailure) {
+              throw blockedRejection("the Windows sandbox failed its security acceptance checks; isolated execution is disabled", WITHIN_MODE)
+            }
+            if (!probe.available) {
+              if (windowsReadOnly) throw blockedRejection("the Windows sandbox required by [Read only] is unavailable", RETRY_LATER)
+              throw new SecurityCheckFailure("windows_sandbox_unavailable", "the Windows sandbox is unavailable")
+            }
+            const launchCwd = await canonicalBoundaryPath(launchDirectory)
+            if (typeof raw.workdir === "string") raw.workdir = launchCwd
+            let network = resolved.sandbox.workspaceNetwork === "on"
+            if (windowsReadOnly) network = resolved.sandbox.roNetwork === "on"
+            else if (resolved.sandbox.mode === "rw") network = resolved.sandbox.rwNetwork === "on"
+            const windowsWriteRoots = windowsReadOnly ? [] : [...new Set([cwd, ...configuredRoots, ...worktreePrivateRoots])]
+            raw.command = insertSandboxMarker(sandboxMarkers, command, windowsReadOnly ? "ro" : "workspace", undefined, undefined, {
+              windowsCallKey: boundaryKey(call),
+              windowsSandbox: {
+                cwd: launchCwd,
+                readRoots: [cwd],
+                writeRoots: windowsWriteRoots,
+                denyRead: [...resolved.sandbox.denyRead, ...credentialPaths],
+                denyWrite: [...resolved.sandbox.denyWrite, ...credentialPaths, ...runtimeProtectedPaths(cwd), resolved.sandbox.helperPath],
+                network,
+              },
+            })
+            authorization.executionRoute = "windows_sandbox"
+          }
+          boundaryCalls.set(boundaryKey(call), authorization)
+          return { input: raw, authorization }
         }
         if (readOnly) {
           const launchCwd = await canonicalBoundaryPath(typeof raw.workdir === "string" ? nativeAbsolutePath(cwd, raw.workdir) : cwd)
@@ -2973,13 +3286,14 @@ const plugin: Plugin = {
       // RO conformance remains independent of dynamic-review switches.
       if (needsReview && (readOnly || (resolved.securityEnabled && !bypass.has("dynamic")))) {
         if (!ctx.session.context) throw new SecurityCheckFailure("session_context", "the safety review could not read this session's context, so the command could not be approved")
-        const retained = boundarySessionContext(await run(ctx.session.context({ sessionID: call.sessionID }), signal))
+        const retained = await retainedBoundaryContext(call.sessionID, signal)
         const request: EffectReviewRequest = {
           command: operation,
           cwd,
           environment: JSON.stringify(detectEnvironment()),
           user_request: retained.userRequest,
           session_context: retained.context,
+          trusted_instructions: retained.trustedInstructions,
           input_facts: [...facts, `Workspace-write base roots: ${JSON.stringify(baseRoots)}`, `Independent session read/write ceiling: ${permLabel(effectivePerm(call.sessionID))}`,
             ...(readOnly ? [
               "Session security mode: [Read only]",
@@ -3005,10 +3319,10 @@ const plugin: Plugin = {
           staticRules: [],
         }
         const cacheScope: ApprovalCacheScope = { sessionID: call.sessionID, securitySnapshot,
-          userAuthorizationDigest: digest(retained.userRequest) }
+          userAuthorizationDigest: retained.authorizationDigest }
         const fileReviewPolicyVersion = readOnly ? EFFECTS_POLICY_VERSION_READONLY : EFFECTS_POLICY_VERSION
         const cacheTargets = await currentCacheTargets(filePlan.targets.map((target) => ({ path: target.resolved,
-          domain: /^\/mnt\/[a-z](?:\/|$)/i.test(target.resolved) ? "drvfs" : "linux", exists: target.identity !== undefined,
+          domain: process.platform === "win32" ? "windows" : /^\/mnt\/[a-z](?:\/|$)/i.test(target.resolved) ? "drvfs" : "linux", exists: target.identity !== undefined,
           ...(target.inspectionError ? { inspectionError: target.inspectionError } : {}) }))).then((targets) => targets.map((target, index) => ({
             ...target, ...(filePlan.targets[index]?.inspectionError ? { inspectionError: filePlan.targets[index]!.inspectionError } : {}),
           })))
@@ -3071,11 +3385,9 @@ const plugin: Plugin = {
           }
           assertBoundaryDecision(result, nativeActionTrigger(tool, filePlan))
         }
-        const latest = boundarySessionContext(await run(ctx.session.context({ sessionID: call.sessionID }), signal))
+        const latest = await retainedBoundaryContext(call.sessionID, signal)
         if (securitySnapshotFor(call.sessionID) !== securitySnapshot ||
-          // Positive reuse (cached or freshly reviewed) is not bound to the
-          // user message; a refusal is — a newer message re-checks it.
-          (result.decision !== "allow" && digest(latest.userRequest) !== cacheScope.userAuthorizationDigest)) {
+          latest.authorizationDigest !== cacheScope.userAuthorizationDigest) {
           throw blockedRejection("the session's authorization changed during the boundary check", RECHECK)
         }
         await verifyFileBoundaryPlan(filePlan)
@@ -3113,12 +3425,30 @@ const plugin: Plugin = {
     ): Promise<{ input: unknown; authorization: BoundaryAuthorization }> {
       const snapshot = securitySnapshotFor(call.sessionID)
       try {
+        // Unsupported Windows file syntax is a policy refusal, not an
+        // inspection failure. Reject it before any fallible session/path I/O
+        // can take the infrastructure fail-open route.
+        if (process.platform === "win32" && tool !== "shell" && effectiveMode(call.sessionID) !== "bypass") {
+          validateWindowsNativeFileInput(tool, input)
+        }
         return await runBoundaryBefore(tool, input, call, token, signal)
       } catch (error) {
         if (signal.aborted || error instanceof EffectsReviewError && error.kind === "aborted") {
           throw new EffectsReviewError("the call was cancelled before it started", "aborted")
         }
         if ((error as { _tag?: string })?._tag === "Tool.Error") throw error
+        if (error instanceof UnsupportedNativePathError) {
+          throw blockedRejection(error.agentReason, WITHIN_MODE)
+        }
+        if (process.platform === "win32" && tool === "shell" && effectiveMode(call.sessionID) !== "bypass") {
+          if (!effectivePerm(call.sessionID).w || resolved.sandbox.mode === "ro") {
+            throw blockedRejection("the Windows sandbox required by [Read only] could not be prepared", RETRY_LATER)
+          }
+          if (sandboxProbe?.contractFailure && resolved.sandbox.enabled && resolved.sandbox.mode !== "full" &&
+            !activeBypass(call.sessionID).has("sandbox")) {
+            throw blockedRejection("the Windows sandbox failed its security acceptance checks; isolated execution is disabled", WITHIN_MODE)
+          }
+        }
         if (resolved.failPolicy === "fail_close") throw error
         if (securitySnapshotFor(call.sessionID) !== snapshot) {
           throw blockedRejection("the session's security mode changed while this command was being checked", RECHECK)
@@ -3135,17 +3465,89 @@ const plugin: Plugin = {
         else if (error instanceof BoundaryPreparationError) code = error.changed ? "target_changed" : "boundary_preparation"
         if (!passFailure(code, call, authorization)) throw error
         boundaryCalls.set(boundaryKey(call), authorization)
+        if (process.platform === "win32" && tool === "shell") {
+          const fallback = structuredClone(input) as Record<string, unknown>
+          const command = commandFromArgs(fallback)
+          if (typeof command !== "string" || !command.trim()) throw blockedRejection("the shell command is empty")
+          fallback.command = insertSandboxMarker(sandboxMarkers, command, "full", undefined, undefined, {
+            windowsCallKey: boundaryKey(call),
+          })
+          return { input: fallback, authorization }
+        }
         // No marker: if the observer cannot be prepared, the original executor
         // receives the exact original input and runs unobserved, once.
         return { input, authorization }
       }
     }
 
-    // The nonce is the authority for Linux wrapping. Marker-less user shells
-    // and host-internal spawns remain untouched; Windows is outside this chain.
+    // The nonce is the authority on both platforms. Marker-less user shells
+    // and host-internal spawns remain untouched.
     yield* ctx.shell.hook("create.before", (ev: ShellCreateBeforeEvent) =>
-      Effect.sync(() => {
-        if (process.platform !== "linux") return
+      process.platform === "win32" ? Effect.promise(async (signal) => {
+        const marked = extractSandboxMarker(sandboxMarkers, ev.command)
+        const authorization = marked.windowsCallKey ? boundaryCalls.get(marked.windowsCallKey) : undefined
+        const refuse = (message: string) => {
+          if (authorization) {
+            authorization.runtimeBlocked = message
+            authorization.runtimeBlockDetails = { advice: RECHECK }
+          }
+          // No denial shell is executed: cmd AutoRun and interpreter startup
+          // hooks must not turn a refused call into an unsandboxed spawn.
+          ev.command = ""
+          ev.shell = ""
+        }
+        if (marked.invalid) {
+          refuse(blockedText("the security authorization for this call is invalid, expired or already used", RECHECK))
+          return
+        }
+        if (!marked.profile) return
+        ev.command = marked.command
+        if (marked.profile === "full" && !authorization) return
+        if (!authorization || marked.profile !== "full" && !marked.windowsSandbox) {
+          refuse(blockedText("the Windows sandbox authorization is missing", RECHECK))
+          return
+        }
+        const original = { command: marked.command, shell: ev.shell, env: { ...ev.env } }
+        try {
+          ev.shell = resolveClassifierShell(ev.shell)
+          if ((marked.profile !== "full" || authorization.source === "fail_open_pass") &&
+            !["pwsh.exe", "cmd.exe"].includes(path.basename(ev.shell).toLowerCase())) {
+            throw blockedRejection("the Windows sandbox supports PowerShell 7 (pwsh.exe) and cmd; legacy PowerShell and MSYS/Cygwin shells are refused rather than run without isolation", WITHIN_MODE)
+          }
+          // Floors remain active even when preparation failed open or the
+          // user disabled only the OS layer. A real Bypass marker has no key.
+          const decision = await classifyWindowsShellLaunch(ev, marked, authorization)
+          if (signal.aborted) throw new EffectsReviewError("the call was cancelled before it started", "aborted")
+          if (securitySnapshotFor(authorization.sessionID) !== authorization.securitySnapshot) {
+            throw blockedRejection("the session's authorization changed before the Windows command started", RECHECK)
+          }
+          if (marked.profile === "full") {
+            await reviewWindowsShellLaunch(ev, marked, authorization, signal, decision)
+            return
+          }
+          await prepareWindowsShellSpawn(ev, marked, authorization, signal, decision)
+        } catch (error) {
+          if (signal.aborted || securitySnapshotFor(authorization.sessionID) !== authorization.securitySnapshot ||
+            (error as { _tag?: string })?._tag === "Tool.Error" ||
+            error instanceof BoundaryPreparationError && error.changed || marked.profile === "ro") {
+            refuse(error instanceof Error ? error.message : blockedText("the Windows command could not be authorized", RECHECK))
+            return
+          }
+          const code = error instanceof SecurityCheckFailure ? error.code : "windows_sandbox_prepare"
+          if (!passFailure(code, undefined, authorization)) {
+            refuse(blockedText(checkUnavailableReason(code), RETRY_LATER))
+            return
+          }
+          // Only a preparation failure can degrade. A native startup failure
+          // is returned once and never causes a second, host-direct execution.
+          ev.command = original.command
+          ev.shell = original.shell
+          ev.env = original.env
+          await authorization.runtimeBroker?.close()
+          authorization.runtimeBroker = undefined
+          authorization.executionRoute = "host_direct_reviewed"
+        }
+      }) : Effect.sync(() => {
         const marked = extractSandboxMarker(sandboxMarkers, ev.command)
         const original = { command: marked.command, shell: ev.shell, env: { ...ev.env } }
         const authorization = marked.runtimeWatch
@@ -3227,13 +3629,14 @@ const plugin: Plugin = {
     }
 
     // Wrap only the captured executable definitions. No hook-name heuristic
-    // can accidentally pull a codemode/MCP/custom/Windows tool into this chain.
-    if (process.platform === "linux") {
-      if (!ctx.tool.transform && !passFailure("boundary_transform")) return yield* Effect.die(new Error("Native Linux boundaries require tool.transform"))
+    // can accidentally pull a codemode/MCP/custom tool into this chain.
+    if (process.platform === "linux" || process.platform === "win32") {
+      const nativeBoundaryName = process.platform === "win32" ? "Native Windows" : "Native Linux"
+      if (!ctx.tool.transform && !passFailure("boundary_transform")) return yield* Effect.die(new Error(`${nativeBoundaryName} boundaries require tool.transform`))
       if (ctx.tool.transform) yield* ctx.tool.transform((editor) => {
         if (!editor.list) {
           if (passFailure("boundary_transform")) return
-          throw new Error("Native Linux boundaries require ToolEditor.list")
+          throw new Error(`${nativeBoundaryName} boundaries require ToolEditor.list`)
         }
         const entries = editor.list()
         directSubagent = entries.some((entry) => entry.id === "subagent" && entry.name === "subagent" &&
@@ -3244,7 +3647,7 @@ const plugin: Plugin = {
             const original = tool.execute
             if (!original) {
               if (passFailure("boundary_executor")) return
-              throw new Error("Native Linux tool is missing its executor")
+              throw new Error(`${nativeBoundaryName} tool is missing its executor`)
             }
             const name = entry.name as NativeBoundaryTool
             tool.execute = (input, call) => {
@@ -3263,7 +3666,7 @@ const plugin: Plugin = {
                   // No trusted host-timeout flag exists on the interrupt path:
                   // an observer EOF alone must never be read as a normal
                   // deadline, so a recorded refusal still wins here.
-                  if (prepared.authorization.runtimeBlocked && Exit.hasInterrupts(exit)) {
+                  if (prepared.authorization.runtimeBlocked && (process.platform === "win32" || Exit.hasInterrupts(exit))) {
                     return Effect.fail(rejectionError(runtimeBlockedText(prepared.authorization.runtimeBlocked,
                       prepared.authorization.runtimeBlockDetails)))
                   }
@@ -3336,9 +3739,12 @@ const plugin: Plugin = {
                 // a payload's own exit 125 has an ordinary terminal frame.
                 const observerSetupError = !hostTimedOut && !runtimeRefusal && prepared.authorization.executionRoute === "runtime_boundary_watch" &&
                   output?.exit === 125 && prepared.authorization.runtimeBroker?.terminalExit === undefined
+                const accessErrorPattern = process.platform === "win32"
+                  ? /permission denied|access (?:is )?denied|access to (?:the )?path[^\r\n]*denied|UnauthorizedAccessException|拒绝访问|访问被拒绝|read-only file system|device or resource busy|cross-device link|\bEACCES\b|\bEPERM\b|sudo:|bwrap:|opencode-(?:windows-)?sandbox:/i
+                  : /permission denied|read-only file system|device or resource busy|cross-device link|\bEACCES\b|\bEPERM\b|sudo:|bwrap:|opencode-sandbox:/i
                 const accessError = !hostTimedOut && !runtimeRefusal && name === "shell" && output && output.exit !== 0 &&
                   typeof output.output === "string" && !output.output.includes("The whole command was not run.") &&
-                  /permission denied|read-only file system|device or resource busy|cross-device link|\bEACCES\b|\bEPERM\b|sudo:|bwrap:|opencode-sandbox:/i.test(output.output)
+                  accessErrorPattern.test(output.output)
                 // Post-launch OS errors keep their raw output; the appended
                 // note (agent-messages.ts) only explains that this is an OS
                 // result, not a plugin block — never a retry hint.
@@ -3389,7 +3795,7 @@ const plugin: Plugin = {
       // Admission for native boundary tools lives entirely in the wrapped
       // executor (runBoundaryBefore); this hook only carries the optional
       // subagent `permission` ceiling bookkeeping.
-      process.platform === "linux" && directSubagent && ev.tool === "subagent"
+      directSubagent && ev.tool === "subagent"
         ? Effect.tryPromise({ try: async () => {
             try { await runBefore(ev) } catch (error) {
               if ((error as { _tag?: string })?._tag === "Tool.Error" || !passFailure("tool_preflight", { sessionID: ev.sessionID, id: ev.id })) throw error
@@ -3500,7 +3906,16 @@ const plugin: Plugin = {
                 securityBases.delete(sessionID)
                 securityEpochs.delete(sessionID)
                 shared.sessionLocations.delete(sessionID)
+                shared.trustedInstructions.delete(sessionID)
                 rootWidening.clearSession(sessionID)
+                if (process.platform === "win32") {
+                  for (const authorization of boundaryCalls.values()) {
+                    if (authorization.sessionID !== sessionID) continue
+                    authorization.runtimeBlocked = "The session was deleted"
+                    if (authorization.runtimeBroker) void authorization.runtimeBroker.close()
+                    else authorization.cancelExecution?.()
+                  }
+                }
                 for (const [child, parent] of permParent) {
                   if (parent === sessionID) permParent.delete(child)
                 }
@@ -3597,12 +4012,12 @@ const plugin: Plugin = {
     // the agent gets an append-only user notice, the user an RPC event.
 
     // Only an active native wrapper may authorize a permission hook. Unknown
-    // actions, MCP, other direct tools, Code Mode and Windows stay untouched.
+    // actions, MCP, other direct tools and Code Mode stay untouched.
     // An explicit host/config deny remains final; ask is resolved without UI.
     if (ctx.permission) {
       yield* ctx.permission.hook("evaluate", (ev: PermissionEvalEvent) =>
         Effect.promise(async () => {
-          if (process.platform !== "linux" || !ev.source) return
+          if (!ev.source) return
           const authorization = boundaryCalls.get(boundaryKey({ sessionID: ev.sessionID, ...ev.source }))
           if (!authorization || ev.effect === "deny") return
           try {

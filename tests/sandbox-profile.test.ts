@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { tmpdir } from "node:os"
 import path from "node:path"
 import { resolvePluginConfig, resolveSandbox } from "../src/config"
 import {
@@ -53,7 +54,7 @@ const selection = (overrides: Partial<SandboxSelection> = {}): SandboxSelection 
 describe("sandbox config resolution", () => {
   test("defaults match the §4.2 table", () => {
     const sandbox = resolveSandbox(undefined)
-    expect(sandbox.enabled).toBe(process.platform === "linux")
+    expect(sandbox.enabled).toBe(process.platform === "linux" || process.platform === "win32")
     expect(sandbox.mode).toBe("auto")
     expect(sandbox.bwrapPath).toBe("/usr/bin/bwrap")
     expect(sandbox.helperPath.endsWith(path.join("bin", "opencode-sandbox"))).toBe(true)
@@ -169,6 +170,118 @@ describe("sandbox config resolution", () => {
 
   test("top-level whitelist still rejects unrelated keys", () => {
     expect(() => resolvePluginConfig({ sandbox2: {} } as never)).toThrow(/unknown option/)
+  })
+})
+
+describe("sandbox config resolution (Windows)", () => {
+  // The platform is injected, matching the parameter style of
+  // automatic-write-roots: production callers keep the process platform.
+  const win = (raw?: unknown) => resolveSandbox(raw, "win32")
+
+  test("defaults: enabled with the native helper, temp scratch and no Linux-only toggles", () => {
+    const sandbox = win()
+    expect(sandbox.enabled).toBe(true)
+    expect(sandbox.scratch).toBe(tmpdir())
+    expect(sandbox.bwrapPath).toBe("")
+    expect(sandbox.maskPrivilegedSockets).toEqual([])
+    expect(sandbox.maskWslInterop).toBe(false)
+    expect(sandbox.roAfUnixBlock).toBe(false)
+    expect(sandbox.mode).toBe("auto")
+    expect(sandbox.onUnavailable).toBe("fail_close")
+    // The helper is the prebuilt Windows binary next to the package.
+    expect(sandbox.helperPath.endsWith(path.join("bin", "opencode-windows-sandbox.exe"))).toBe(true)
+    expect(sandbox.helperPath).not.toBe(path.join("bin", "opencode-sandbox"))
+  })
+
+  test("enabled can be turned off; other hosts keep the sandbox disabled", () => {
+    expect(win({ enabled: false }).enabled).toBe(false)
+    expect(() => win({ enabled: "yes" })).toThrow()
+    expect(resolveSandbox(undefined, "darwin").enabled).toBe(false)
+    expect(resolveSandbox(undefined, "freebsd").enabled).toBe(false)
+    expect(resolveSandbox(undefined, "linux").enabled).toBe(true)
+  })
+
+  test("accepts drive-letter scratch and deny entries, normalizing separators", () => {
+    const sandbox = win({
+      scratch: "C:\\Temp\\opencode-scratch",
+      denyRead: ["C:\\Users\\alice\\.ssh", "c:/Users/alice/.aws"],
+      denyWrite: ["D:\\secrets\\keys\\"],
+    })
+    expect(sandbox.scratch).toBe("C:\\Temp\\opencode-scratch")
+    expect(sandbox.denyRead).toEqual(["C:\\Users\\alice\\.ssh", "c:\\Users\\alice\\.aws"])
+    expect(sandbox.denyWrite).toEqual(["D:\\secrets\\keys"])
+  })
+
+  test("helperPath overrides resolve as Windows paths", () => {
+    expect(win({ helperPath: "C:\\tools\\sbx.exe" }).helperPath).toBe("C:\\tools\\sbx.exe")
+    expect(() => win({ helperPath: 7 })).toThrow()
+  })
+
+  test("rejects device, UNC, ADS, drive-root, traversal and alias spellings", () => {
+    const invalid: Array<Record<string, unknown>> = [
+      { scratch: "C:\\" },
+      { scratch: "C:" },
+      { scratch: "C:Temp" },
+      { scratch: "\\\\server\\share" },
+      { scratch: "\\\\?\\C:\\Temp" },
+      { scratch: "\\\\.\\PhysicalDrive0" },
+      { scratch: "C:\\Temp\\..\\escape" },
+      { scratch: "C:\\Temp\\NUL" },
+      { scratch: "C:\\Temp\\bad \\sub" },
+      { scratch: "C:\\Windows" },
+      { scratch: "D:\\Users" },
+      { scratch: "relative\\path" },
+      { denyRead: ["C:\\Temp\\a:b"] },
+      { denyRead: ["\\\\server\\share\\keys"] },
+      { denyRead: ["\\\\?\\C:\\Temp"] },
+      { denyRead: ["C:\\"] },
+      { denyRead: ["C:Temp"] },
+      { denyRead: ["C:\\Temp\\..\\x"] },
+      { denyRead: ["C:\\Temp\\CON"] },
+      { denyRead: ["C:\\Temp\\bad \\sub"] },
+      { denyRead: ["/opt/keys"] },
+      { denyRead: [""] },
+      { denyWrite: ["\\\\.\\PhysicalDrive0"] },
+      { denyWrite: "C:\\Temp\\keys" },
+    ]
+    for (const sandbox of invalid) {
+      expect(() => win(sandbox)).toThrow()
+    }
+  })
+
+  test("the scratch dir may not also be denied, ignoring case", () => {
+    expect(() => win({ scratch: "C:\\Temp\\sbx", denyRead: ["c:\\temp\\SBX"] })).toThrow()
+    expect(win({ scratch: "C:\\Temp\\sbx", denyRead: ["C:\\Temp\\sbx\\keys"] }).denyRead).toEqual([
+      "C:\\Temp\\sbx\\keys",
+    ])
+  })
+
+  test("Linux validation is not relaxed for Windows-shaped input", () => {
+    expect(() => resolveSandbox({ denyRead: ["/tmp/a:b"] }, "linux")).toThrow(/colon/)
+    expect(() => resolveSandbox({ denyRead: ["/a/../b"] }, "linux")).toThrow()
+    expect(() => resolveSandbox({ denyRead: ["C:\\Users\\alice\\.ssh"] }, "linux")).toThrow()
+    expect(() => resolveSandbox({ scratch: "C:\\Temp" }, "linux")).toThrow()
+    expect(resolveSandbox({ scratch: "/tmp/sbx", denyRead: ["/opt/keys"] }, "linux").scratch).toBe("/tmp/sbx")
+  })
+
+  test.skipIf(process.platform !== "linux")("an explicit linux platform keeps the HEAD defaults and path handling", () => {
+    const linux = resolveSandbox(undefined, "linux")
+    expect(linux).toEqual(resolveSandbox(undefined))
+    expect(linux.enabled).toBe(true)
+    expect(linux.bwrapPath).toBe("/usr/bin/bwrap")
+    expect(linux.scratch).toBe("/tmp")
+    expect(linux.maskWslInterop).toBe(true)
+    expect(linux.roAfUnixBlock).toBe(true)
+    expect(linux.maskPrivilegedSockets).toEqual([
+      "/run/docker.sock",
+      "/run/podman/podman.sock",
+      "/run/containerd/containerd.sock",
+    ])
+    // denyWrite still drops the unconditional /tmp grant, and denyRead still
+    // normalizes and protects the Linux scratch dir.
+    expect(resolveSandbox({ scratch: "/var/tmp/scratch", denyWrite: ["/tmp/opencode/private.key"] }, "linux").denyWrite).toEqual([])
+    expect(() => resolveSandbox({ scratch: "/var/tmp/scratch", denyRead: ["/var/tmp/scratch"] }, "linux")).toThrow()
+    expect(resolveSandbox({ denyRead: ["/opt/keys/"] }, "linux").denyRead).toEqual(["/opt/keys"])
   })
 })
 

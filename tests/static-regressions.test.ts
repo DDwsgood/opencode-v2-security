@@ -191,11 +191,22 @@ describe("deletion floors distinguish roots from scoped descendants", () => {
       'ri -Path "C:\\*" -Recurse:$true -Force:$true',
     ]) {
       for (const [script, shell] of [[payload, "pwsh"], [`pwsh.exe -NoProfile -Command '${payload}'`, "/bin/bash"]]) {
-        const decision = await classify(script, "LOOSE", { shell, bypassedCategories: new Set(BYPASS_CATEGORIES) })
-        expect(decision.verdict).toBe("DENY")
-        expect(decision.rules.some((rule) => ["filesystem.root-delete", "filesystem.root-glob-delete"].includes(rule))).toBe(true)
+        const bypassCases = process.platform === "win32"
+          ? [undefined, new Set(BYPASS_CATEGORIES)]
+          : [new Set(BYPASS_CATEGORIES)]
+        for (const bypassedCategories of bypassCases) {
+          const decision = await classify(script, "LOOSE", { shell, bypassedCategories })
+          expect(decision.verdict).toBe("DENY")
+          expect(decision.rules.some((rule) => ["filesystem.root-delete", "filesystem.root-glob-delete"].includes(rule))).toBe(true)
+        }
       }
     }
+  })
+  test.skipIf(process.platform !== "linux")("Windows floor promotion does not change Linux finding priority", async () => {
+    // Classification only: this destructive-looking fixture is never executed.
+    const decision = await classify('Remove-Item -Path "C:\\" -Recurse -Force', "LOOSE", { shell: "pwsh" })
+    expect(decision.verdict).toBe("DENY")
+    expect(decision.rules).toEqual(["filesystem.forced-recursive-delete"])
   })
 })
 

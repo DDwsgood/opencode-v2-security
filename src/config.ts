@@ -1,10 +1,10 @@
 import { isIP } from "node:net"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { homedir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import { credentialStoreReadPaths } from "./security/paths"
 import { resolveAllowWriteRoots, runtimeBrokerBase } from "./security/write-root-policy"
-import { canonicalCandidate, isAlwaysWritablePath } from "./security/automatic-write-roots"
+import { canonicalCandidate, isAlwaysWritablePath, windowsPathHazard } from "./security/automatic-write-roots"
 import {
   reviewCommandWithAuditor,
   type CloudReviewRequest,
@@ -156,8 +156,9 @@ export type BashClassifierOptions = {
    * session (x is reserved and not enforced in this MVP). See README
    * "Session permissions". */
   permission?: PermissionOptions
-  /** OS-level sandbox (Linux only): bwrap namespace+seccomp floor plus a
-   * Landlock write-freeze for read-only profiles. See plan §4. */
+  /** OS-level sandbox (Linux and native Windows): bwrap namespace+seccomp
+   * floor plus a Landlock write-freeze for read-only profiles on Linux; a
+   * native AppContainer/ACL helper on Windows. See plan §4. */
   sandbox?: SandboxOptions
   /** Test-injection only; never wired by the plugin itself. */
   reviewCommand?: ReviewCommand
@@ -249,19 +250,23 @@ export type SandboxMode = "auto" | "ro" | "rw" | "workspace" | "full"
 export type SandboxOnUnavailable = "fail_close" | "degrade"
 
 export type SandboxOptions = {
-  /** Master switch; default true on Linux, ignored (forced off) elsewhere. */
+  /** Master switch; default true on Linux and native Windows, ignored
+   * (forced off) elsewhere. */
   enabled?: boolean
   /** "auto" derives the profile per call from effectivePerm (w=false → ro,
    * w=true → workspace); "ro"/"rw"/"workspace" force that profile — "rw" is
    * the legacy host-write profile (whole root bound writable) kept for
    * explicit opt-in — "full" disables the wrap. */
   mode?: SandboxMode
-  /** bwrap binary; absolute path or a bare name resolved by the helper. */
+  /** Linux bwrap binary; absolute path or a bare name resolved by the helper.
+   * Unused (and empty by default) outside Linux. */
   bwrapPath?: string
-  /** Prebuilt helper override; "" resolves to <package>/bin/opencode-sandbox. */
+  /** Prebuilt helper override; "" resolves to <package>/bin/opencode-sandbox
+   * on Linux and <package>/bin/opencode-windows-sandbox.exe on Windows. */
   helperPath?: string
   /** The only RO-writable hierarchy; must be an absolute, non-traversal path.
-   * Under the workspace profile it is bound writable like the worktree. */
+   * Under the workspace profile it is bound writable like the worktree.
+   * Default "/tmp" on Linux and the process temp dir on Windows. */
   scratch?: string
   /** "off" (default) = RO gets --unshare-net + Landlock TCP deny. */
   roNetwork?: "off" | "on"
@@ -273,12 +278,15 @@ export type SandboxOptions = {
    * that call only. "on" grants network to every workspace-profile call. */
   workspaceNetwork?: "on" | "off"
   /** Extra paths write-frozen (denyWrite) or read-shadowed (denyRead) on top
-   * of the profile's base rules; colon-joined into OPENCODE_SANDBOX_DENY_*
-   * envs. Entries must be absolute, contain no ":" or "..", and may not be
-   * "/" or the scratch dir. The same path may appear in both lists — the
-   * helper applies read-shadow first, then write-freeze. Under "workspace"
-   * these are the only read/write denials below the write allow-list, and
-   * they shadow write roots too. */
+   * of the profile's base rules. Entries must be absolute, contain no "..",
+   * and may not be "/" or the scratch dir. Linux entries may not contain ":"
+   * (the env encoding separator); Windows entries may carry exactly one colon
+   * for the drive letter but no device/UNC/ADS spelling or drive root. The
+   * same path may appear in both lists — the helper applies read-shadow first,
+   * then write-freeze. Under "workspace" these are the only read/write
+   * denials below the write allow-list, and they shadow write roots too.
+   * Native enforcement (AppContainer/ACL) is the helper's job: resolving these
+   * lists here validates configuration, it does not isolate anything. */
   denyWrite?: string[]
   denyRead?: string[]
   /** Additional incidental write roots, including in Read only. Unsafe roots
@@ -453,6 +461,20 @@ const DEFAULT_SUPERVISOR_PATH = path.join(
   "bash.exe",
 )
 const DEFAULT_SANDBOX_HELPER_PATH = path.join(PACKAGE_ROOT, "bin", "opencode-sandbox")
+const DEFAULT_WINDOWS_SANDBOX_HELPER_PATH = path.join(PACKAGE_ROOT, "bin", "opencode-windows-sandbox.exe")
+
+/** Windows scratch default: the process temp dir, canonicalized to the win32
+ * spelling. A volume-root TEMP (never a usable scratch) falls back to
+ * <drive>:\Temp; a non-drive (UNC or foreign spelling) is returned verbatim so
+ * the environment's own answer is not replaced by a guess. */
+function windowsScratchDefault(): string {
+  const temporary = tmpdir()
+  if (!/^[A-Za-z]:[\\/]/.test(temporary)) return temporary
+  const normalized = path.win32.normalize(temporary)
+  const trimmed = normalized.replace(/\\+$/, "")
+  if (trimmed === "" || /^[A-Za-z]:$/.test(trimmed)) return path.win32.join(normalized, "Temp")
+  return trimmed
+}
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -871,21 +893,46 @@ function resolvePermission(raw: unknown): ResolvedPermission {
 
 /** Validate a `denyWrite`/`denyRead` entry list. Paths are normalized before
  * storage so the helper receives canonical spellings. The ":" ban protects
- * the env encoding (colon-joined) and the "/" + scratch bans keep the user
- * from freezing/shadowing the entire root or the sandbox's own scratch
- * hierarchy (which would make every wrapped spawn unusable). */
-function resolveSandboxPathList(raw: unknown, field: string, scratch: string): string[] {
+ * the POSIX env encoding (colon-joined) and the "/" + scratch bans keep the
+ * user from freezing/shadowing the entire root or the sandbox's own scratch
+ * hierarchy (which would make every wrapped spawn unusable).
+ *
+ * Windows entries are validated against the Windows path shape instead: the
+ * drive letter is the only permitted colon, while device namespaces, UNC
+ * shares, alternate data streams, volume roots, traversal, reserved device
+ * names and trailing-space/dot aliases are rejected. The Linux checks are not
+ * relaxed for Windows; the two shapes are validated separately. */
+function resolveSandboxPathList(
+  raw: unknown,
+  field: string,
+  scratch: string,
+  platform: NodeJS.Platform,
+): string[] {
   if (raw === undefined) return []
   if (!Array.isArray(raw)) throw new Error(`sandbox.${field} must be an array of absolute paths`)
+  const windows = platform === "win32"
+  const paths = windows ? path.win32 : path.posix
   const list: string[] = []
   for (const entry of raw) {
-    if (typeof entry !== "string" || !entry.trim() || !path.isAbsolute(entry.trim())) {
+    if (typeof entry !== "string" || !entry.trim() || !paths.isAbsolute(entry.trim())) {
       throw new Error(`sandbox.${field} entries must be absolute path strings`)
     }
     const trimmed = entry.trim()
     if (field === "denyWrite") {
-      const canonical = canonicalCandidate(path.normalize(trimmed))
-      if (canonical !== undefined && isAlwaysWritablePath(canonical)) continue
+      const writable = platform === process.platform ? canonicalCandidate(paths.normalize(trimmed)) : undefined
+      if (writable !== undefined && isAlwaysWritablePath(writable, platform)) continue
+    }
+    if (windows) {
+      const hazard = windowsPathHazard(trimmed)
+      if (hazard) {
+        throw new Error(`sandbox.${field} entries rejected: ${hazard}: ${trimmed}`)
+      }
+      const normalized = paths.normalize(trimmed).replace(/\\+$/, "")
+      if (normalized.toLowerCase() === scratch.toLowerCase()) {
+        throw new Error(`sandbox.${field} may not contain the scratch dir: ${trimmed}`)
+      }
+      list.push(normalized)
+      continue
     }
     if (trimmed.includes(":")) {
       throw new Error(`sandbox.${field} entries may not contain ":" (colon breaks the env encoding): ${trimmed}`)
@@ -908,13 +955,21 @@ function resolveSandboxPathList(raw: unknown, field: string, scratch: string): s
   return list
 }
 
-export function resolveSandbox(raw: unknown): ResolvedSandbox {
+/**
+ * Resolve the sandbox options. `platform` is injectable for cross-platform
+ * tests; production callers keep the process platform. On Windows the defaults
+ * are the native helper, the process temp dir as scratch, and no Linux-only
+ * bwrap/socket/WSL toggles.
+ */
+export function resolveSandbox(raw: unknown, platform: NodeJS.Platform = process.platform): ResolvedSandbox {
+  const windows = platform === "win32"
+  const paths = windows ? path.win32 : path.posix
   const resolved: ResolvedSandbox = {
-    enabled: process.platform === "linux",
+    enabled: platform === "linux" || windows,
     mode: "auto",
-    bwrapPath: "/usr/bin/bwrap",
-    helperPath: DEFAULT_SANDBOX_HELPER_PATH,
-    scratch: "/tmp",
+    bwrapPath: windows ? "" : "/usr/bin/bwrap",
+    helperPath: windows ? DEFAULT_WINDOWS_SANDBOX_HELPER_PATH : DEFAULT_SANDBOX_HELPER_PATH,
+    scratch: windows ? windowsScratchDefault() : "/tmp",
     roNetwork: "off",
     rwNetwork: "on",
     workspaceNetwork: "off",
@@ -924,9 +979,11 @@ export function resolveSandbox(raw: unknown): ResolvedSandbox {
     allowWriteWarnings: [],
     allowSudo: false,
     extraArgs: [],
-    maskWslInterop: true,
-    maskPrivilegedSockets: ["/run/docker.sock", "/run/podman/podman.sock", "/run/containerd/containerd.sock"],
-    roAfUnixBlock: true,
+    maskWslInterop: !windows,
+    maskPrivilegedSockets: windows
+      ? []
+      : ["/run/docker.sock", "/run/podman/podman.sock", "/run/containerd/containerd.sock"],
+    roAfUnixBlock: !windows,
     onUnavailable: "fail_close",
   }
   if (raw === undefined) return resolved
@@ -959,34 +1016,47 @@ export function resolveSandbox(raw: unknown): ResolvedSandbox {
     const trimmed = source.bwrapPath.trim()
     // A bare name defers to PATH lookup inside the helper; anything with a
     // directory component must be absolute.
-    if (!path.isAbsolute(trimmed) && (trimmed.includes("/") || trimmed.includes("\\"))) {
+    if (!paths.isAbsolute(trimmed) && (trimmed.includes("/") || trimmed.includes("\\"))) {
       throw new Error("sandbox.bwrapPath must be an absolute path or a bare command name")
     }
     resolved.bwrapPath = trimmed
   }
   if (source.helperPath !== undefined) {
     if (typeof source.helperPath !== "string") throw new Error("sandbox.helperPath must be a string")
-    if (source.helperPath.trim()) resolved.helperPath = path.resolve(source.helperPath.trim())
+    if (source.helperPath.trim()) resolved.helperPath = paths.resolve(source.helperPath.trim())
   }
   if (source.scratch !== undefined) {
     if (typeof source.scratch !== "string" || !source.scratch.trim()) {
       throw new Error("sandbox.scratch must be a non-empty string")
     }
     const trimmed = source.scratch.trim()
-    if (!path.isAbsolute(trimmed)) throw new Error("sandbox.scratch must be an absolute path")
-    if (/[\0\r\n:]/.test(trimmed)) throw new Error("sandbox.scratch contains an unsupported path separator or control character")
-    // Reject ".." even when it would normalize away (e.g. /a/../b): the helper
-    // rejects such scratch at spawn (exit 125), so accepting it here would
-    // turn a config mistake into a runtime fail-close on every shell call.
-    if (trimmed.split(path.sep).includes("..")) {
-      throw new Error(`sandbox.scratch may not contain "..": ${trimmed}`)
+    if (!paths.isAbsolute(trimmed)) throw new Error("sandbox.scratch must be an absolute path")
+    if (windows) {
+      // A Windows scratch is a drive path: the drive colon is expected, while
+      // device/UNC/ADS spellings, volume roots, traversal and reserved names
+      // are rejected before the helper ever sees them.
+      const hazard = windowsPathHazard(trimmed)
+      if (hazard) throw new Error(`sandbox.scratch rejected: ${hazard}: ${trimmed}`)
+      const normalized = paths.normalize(trimmed).replace(/\\+$/, "")
+      if (/^[A-Za-z]:\\(?:Users|Windows)$/i.test(normalized)) {
+        throw new Error(`sandbox.scratch may not be a profile or system directory: ${trimmed}`)
+      }
+      resolved.scratch = normalized
+    } else {
+      if (/[\0\r\n:]/.test(trimmed)) throw new Error("sandbox.scratch contains an unsupported path separator or control character")
+      // Reject ".." even when it would normalize away (e.g. /a/../b): the helper
+      // rejects such scratch at spawn (exit 125), so accepting it here would
+      // turn a config mistake into a runtime fail-close on every shell call.
+      if (trimmed.split(path.sep).includes("..")) {
+        throw new Error(`sandbox.scratch may not contain "..": ${trimmed}`)
+      }
+      const normalized = path.resolve(trimmed)
+      const blocked = new Set(["/", "/home", "/root"])
+      if (blocked.has(normalized)) {
+        throw new Error(`sandbox.scratch may not be /, /home, or /root: ${trimmed}`)
+      }
+      resolved.scratch = normalized
     }
-    const normalized = path.resolve(trimmed)
-    const blocked = new Set(["/", "/home", "/root"])
-    if (blocked.has(normalized)) {
-      throw new Error(`sandbox.scratch may not be /, /home, or /root: ${trimmed}`)
-    }
-    resolved.scratch = normalized
   }
   if (source.roNetwork !== undefined) {
     if (source.roNetwork !== "off" && source.roNetwork !== "on") {
@@ -1007,10 +1077,10 @@ export function resolveSandbox(raw: unknown): ResolvedSandbox {
     resolved.workspaceNetwork = source.workspaceNetwork
   }
   if (source.denyWrite !== undefined) {
-    resolved.denyWrite = resolveSandboxPathList(source.denyWrite, "denyWrite", resolved.scratch)
+    resolved.denyWrite = resolveSandboxPathList(source.denyWrite, "denyWrite", resolved.scratch, platform)
   }
   if (source.denyRead !== undefined) {
-    resolved.denyRead = resolveSandboxPathList(source.denyRead, "denyRead", resolved.scratch)
+    resolved.denyRead = resolveSandboxPathList(source.denyRead, "denyRead", resolved.scratch, platform)
   }
   const allowWrite = resolveAllowWriteRoots(source.allowWrite, {
     home: homedir(), cwd: PACKAGE_ROOT,
@@ -1064,7 +1134,7 @@ export function resolveSandbox(raw: unknown): ResolvedSandbox {
     }
     const sockets: string[] = []
     for (const entry of source.maskPrivilegedSockets) {
-      if (typeof entry !== "string" || !path.isAbsolute(entry)) {
+      if (typeof entry !== "string" || !paths.isAbsolute(entry)) {
         throw new Error("sandbox.maskPrivilegedSockets entries must be absolute path strings")
       }
       sockets.push(entry)
@@ -1081,9 +1151,10 @@ export function resolveSandbox(raw: unknown): ResolvedSandbox {
     }
     resolved.onUnavailable = source.onUnavailable
   }
-  // The sandbox is Linux-only: a non-Linux host forces it off regardless of
-  // configuration, matching the Windows supervisor's platform gate.
-  if (process.platform !== "linux") resolved.enabled = false
+  // The sandbox has a Linux backend (bwrap/Landlock) and a native Windows
+  // backend (AppContainer/ACL helper). Any other host forces it off regardless
+  // of configuration, matching the Windows supervisor's platform gate.
+  if (platform !== "linux" && platform !== "win32") resolved.enabled = false
   return resolved
 }
 

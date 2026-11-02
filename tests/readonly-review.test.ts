@@ -50,7 +50,7 @@ function answers(conformance?: "read_only" | "writes" | "unclear", overrides: Re
 
 describe("frozen write-mode body and read-only variant", () => {
   test("write mode has ten questions and compact trusted-answer authorization", () => {
-    const facts = '{"bypass":{"categories":[],"custom":null},"command":"printf hello","cwd":"/workspace","environment":"Linux","files":[],"input_facts":[],"sandbox":{"domain":null,"error":null,"resolved_writes":[],"trigger":"none"},"session_context":[],"user_request":"Inspect"}'
+    const facts = '{"bypass":{"categories":[],"custom":null},"command":"printf hello","cwd":"/workspace","environment":"Linux","files":[],"input_facts":[],"sandbox":{"domain":null,"error":null,"resolved_writes":[],"trigger":"none"},"session_context":[],"trusted_instructions":[],"user_request":"Inspect"}'
     const body = buildEffectReviewBody(request)
     expect(body.questions).toEqual(frozen.questions)
     expect(Object.keys(body.questions)).toHaveLength(10)

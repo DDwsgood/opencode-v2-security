@@ -204,6 +204,28 @@ async function twoInstances() {
 }
 
 describe("shared security state across plugin instances", () => {
+  test("hot reload upgrades captured approval caches without resetting permission ceilings", () => {
+    resetSharedSecurityStateForTests()
+    const state = getSharedSecurityState()
+    const captured = state.approvalCache
+    state.sessionPerms.set("migration", { r: true, w: false, x: true })
+    const scope = { sessionID: "migration", securitySnapshot: "stable", userAuthorizationDigest: "original" }
+    const facts = {
+      coreDigest: "read-fixture", kind: "read" as const, operation: "open",
+      targets: [{ path: path.join(outside, "migration.txt"), domain: "linux" as const,
+        exists: true, dev: "1", ino: "2", mode: "420", parentDev: "1", parentIno: "3" }],
+    }
+    captured.store(scope, facts, report())
+    expect(captured.lookup(scope, facts)?.decision).toBe("allow")
+    Reflect.deleteProperty(state, "approvalCacheVersion")
+    expect(getSharedSecurityState()).toBe(state)
+    expect(state.approvalCache).toBe(captured)
+    expect(state.sessionPerms.get("migration")?.w).toBe(false)
+    expect(captured.lookup(scope, facts)).toBeUndefined()
+    captured.store(scope, facts, report())
+    expect(captured.lookup({ ...scope, userAuthorizationDigest: "withdrawn" }, facts)).toBeUndefined()
+  })
+
   test("loads under a host scope that keeps its first finalizer in single-entry form", async () => {
     resetSharedSecurityStateForTests()
     const instance = await startInstance(

@@ -1,7 +1,7 @@
 import { lstatSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
-import { canonicalCandidate } from "./automatic-write-roots"
+import { canonicalCandidate, isWindowsPath, windowsPathHazard } from "./automatic-write-roots"
 import { checkResolvedPathSensitivity } from "./paths"
 
 export interface WriteRootPolicy {
@@ -65,6 +65,15 @@ function protectedOverlap(target: string, policy: WriteRootPolicy): boolean {
 }
 
 export function writeRootRejection(root: string, policy: WriteRootPolicy): string | undefined {
+  // Windows spellings carry hazards a POSIX absolute-path check cannot see
+  // (UNC/device namespaces, alternate data streams, drive-relative names).
+  // Containment below uses path.relative, which already ignores case on a
+  // real Windows host. Gated on the host platform: a POSIX filename that merely
+  // looks like a drive path keeps its HEAD rejection path.
+  if (process.platform === "win32" && isWindowsPath(root)) {
+    const hazard = windowsPathHazard(root)
+    if (hazard) return hazard
+  }
   if (canonicalWriteRoot(root) !== root) return "the root is redirected or cannot be canonicalized"
   if (root === path.parse(root).root || containsWritePath(root, policy.home) ||
     containsWritePath(root, canonicalCandidate(policy.home) ?? policy.home)) return "the root covers HOME or the filesystem root"

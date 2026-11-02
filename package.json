@@ -1,6 +1,6 @@
 {
   "name": "opencode-v2-security",
-  "version": "1.9.1",
+  "version": "1.10.0",
   "description": "Autonomous execution-boundary security for OpenCode V2: scoped assessments, one-call authorization, bypass leases, and session read/write permission ceilings.",
   "type": "module",
   "repository": {
@@ -32,6 +32,8 @@
     "!src/**/*.pyc",
     "bin",
     "native/linux-sandbox",
+    "native/windows-sandbox",
+    "!native/windows-sandbox/target",
     "native/windows-bash-supervisor/README.md",
     "native/windows-bash-supervisor/Cargo.toml",
     "native/windows-bash-supervisor/Cargo.lock",

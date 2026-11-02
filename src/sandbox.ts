@@ -56,6 +56,19 @@ export type RuntimeWatchSpawn = {
   protect?: readonly string[]
 }
 
+/** Per-call Windows capabilities. The host stores these behind the same
+ * single-use nonce as Linux observer grants; command text is not authority. */
+export type WindowsSandboxOptions = {
+  cwd: string
+  readRoots: readonly string[]
+  writeRoots: readonly string[]
+  denyRead: readonly string[]
+  denyWrite: readonly string[]
+  network: boolean
+  controlPipe?: string
+  controlToken?: string
+}
+
 export type SandboxProfile = "ro" | "rw" | "workspace" | "full"
 
 /** The §3.4 sandbox route reported by `opencode-sandbox --probe`
@@ -81,6 +94,8 @@ export type SandboxMarkerOptions = {
   writeRoots?: readonly string[]
   network?: boolean
   runtimeWatch?: RuntimeWatchSpawn
+  windowsSandbox?: WindowsSandboxOptions
+  windowsCallKey?: string
 }
 
 /** Shape accepted at the wrap call sites; a bare boolean is the legacy
@@ -127,6 +142,8 @@ export type SandboxSelection = {
 export type SandboxProbeResult = {
   /** Whether the helper probe ran and reported a usable route. */
   available: boolean
+  /** A failed isolation contract is never an infrastructure fail-open case. */
+  contractFailure?: boolean
   path?: SandboxPath
   bwrap?: string
   userns?: boolean
@@ -1086,6 +1103,8 @@ export function extractSandboxMarker(
   writeRoots?: readonly string[]
   network?: boolean
   runtimeWatch?: RuntimeWatchSpawn
+  windowsSandbox?: WindowsSandboxOptions
+  windowsCallKey?: string
   /** Marker line present but unusable (unknown/stale/expired nonce): deny. */
   invalid?: boolean
 } {
@@ -1102,6 +1121,8 @@ export function extractSandboxMarker(
     writeRoots: entry.writeRoots,
     network: entry.network,
     runtimeWatch: entry.runtimeWatch,
+    windowsSandbox: entry.windowsSandbox,
+    windowsCallKey: entry.windowsCallKey,
   }
 }
 
